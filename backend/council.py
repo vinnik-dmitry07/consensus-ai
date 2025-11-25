@@ -1,28 +1,41 @@
 """3-stage LLM Council orchestration."""
 
-from typing import List, Dict, Any, Tuple
-from .openrouter import query_models_parallel, query_model
-from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
+from typing import Any, Dict, List, Tuple
+
+from .config import CHAIRMAN_MODEL, COUNCIL_MODELS, N_SAMPLES
+from .openrouter import query_model, query_models_parallel
 
 
-async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
+async def stage1_collect_responses(user_query: str, n: int = N_SAMPLES) -> List[Dict[str, Any]]:
     """
     Stage 1: Collect individual responses from all council models.
 
     Args:
         user_query: The user's question
+        n: Number of samples to collect per model (default: N_SAMPLES)
 
     Returns:
         List of dicts with 'model' and 'response' keys
     """
     messages = [{"role": "user", "content": user_query}]
 
+    # Create tasks for N samples per model
+    import asyncio
+
+    tasks = []
+    models_expanded = []
+
+    for model in COUNCIL_MODELS:
+        for _ in range(n):
+            tasks.append(query_model(model, messages))
+            models_expanded.append(model)
+
     # Query all models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    raw_responses = await asyncio.gather(*tasks)
 
     # Format results
     stage1_results = []
-    for model, response in responses.items():
+    for model, response in zip(models_expanded, raw_responses):
         if response is not None:  # Only include successful responses
             stage1_results.append({
                 "model": model,
@@ -46,8 +59,8 @@ async def stage2_collect_rankings(
     Returns:
         Tuple of (rankings list, label_to_model mapping)
     """
-    # Create anonymized labels for responses (Response A, Response B, etc.)
-    labels = [chr(65 + i) for i in range(len(stage1_results))]  # A, B, C, ...
+    # Create anonymized labels for responses (Response 1, Response 2, etc.)
+    labels = [str(i + 1) for i in range(len(stage1_results))]  # 1, 2, 3, ...
 
     # Create mapping from label to model name
     label_to_model = {
@@ -76,19 +89,19 @@ Your task:
 IMPORTANT: Your final ranking MUST be formatted EXACTLY as follows:
 - Start with the line "FINAL RANKING:" (all caps, with colon)
 - Then list the responses from best to worst as a numbered list
-- Each line should be: number, period, space, then ONLY the response label (e.g., "1. Response A")
+- Each line should be: number, period, space, then ONLY the response label (e.g., "1. Response 1")
 - Do not add any other text or explanations in the ranking section
 
 Example of the correct format for your ENTIRE response:
 
-Response A provides good detail on X but misses Y...
-Response B is accurate but lacks depth on Z...
-Response C offers the most comprehensive answer...
+Response 1 provides good detail on X but misses Y...
+Response 2 is accurate but lacks depth on Z...
+Response 3 offers the most comprehensive answer...
 
 FINAL RANKING:
-1. Response C
-2. Response A
-3. Response B
+1. Response 3
+2. Response 1
+3. Response 2
 
 Now provide your evaluation and ranking:"""
 
@@ -192,19 +205,19 @@ def parse_ranking_from_text(ranking_text: str) -> List[str]:
         parts = ranking_text.split("FINAL RANKING:")
         if len(parts) >= 2:
             ranking_section = parts[1]
-            # Try to extract numbered list format (e.g., "1. Response A")
+            # Try to extract numbered list format (e.g., "1. Response 1")
             # This pattern looks for: number, period, optional space, "Response X"
-            numbered_matches = re.findall(r'\d+\.\s*Response [A-Z]', ranking_section)
+            numbered_matches = re.findall(r'\d+\.\s*Response \d+', ranking_section)
             if numbered_matches:
                 # Extract just the "Response X" part
-                return [re.search(r'Response [A-Z]', m).group() for m in numbered_matches]
+                return [re.search(r'Response \d+', m).group() for m in numbered_matches]
 
             # Fallback: Extract all "Response X" patterns in order
-            matches = re.findall(r'Response [A-Z]', ranking_section)
+            matches = re.findall(r'Response \d+', ranking_section)
             return matches
 
     # Fallback: try to find any "Response X" patterns in order
-    matches = re.findall(r'Response [A-Z]', ranking_text)
+    matches = re.findall(r'Response \d+', ranking_text)
     return matches
 
 

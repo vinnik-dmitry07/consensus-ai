@@ -1,6 +1,7 @@
 """Configuration for the LLM Council."""
 
 import os
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -14,10 +15,17 @@ COUNCIL_MODELS = [
     "google/gemini-3-pro-preview",
     "anthropic/claude-sonnet-4.5",
     "x-ai/grok-4",
+    "openai/gpt-5.1-reasoning",
+    "google/gemini-3-pro-preview-reasoning",
+    "anthropic/claude-sonnet-4.5-reasoning",
+    "x-ai/grok-4-reasoning",
 ]
 
+# Number of response samples to collect per model in Stage 1
+N_SAMPLES = 1
+
 # Chairman model - synthesizes final response
-CHAIRMAN_MODEL = "google/gemini-3-pro-preview"
+CHAIRMAN_MODEL = "google/gemini-3-pro-preview-reasoning-high"
 
 # OpenRouter API endpoint
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"

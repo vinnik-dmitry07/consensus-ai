@@ -14,15 +14,22 @@ export default function Stage1({ responses }) {
       <h3 className="stage-title">Stage 1: Individual Responses</h3>
 
       <div className="tabs">
-        {responses.map((resp, index) => (
-          <button
-            key={index}
-            className={`tab ${activeTab === index ? 'active' : ''}`}
-            onClick={() => setActiveTab(index)}
-          >
-            {resp.model.split('/')[1] || resp.model}
-          </button>
-        ))}
+        {responses.map((resp, index) => {
+          const modelName = resp.model.split('/')[1] || resp.model;
+          const sameModelCount = responses.filter(r => r.model === resp.model).length;
+          const currentModelIndex = responses.slice(0, index + 1).filter(r => r.model === resp.model).length;
+
+          return (
+            <button
+              key={index}
+              className={`tab ${activeTab === index ? 'active' : ''}`}
+              onClick={() => setActiveTab(index)}
+            >
+              {modelName}
+              {sameModelCount > 1 && ` #${currentModelIndex}`}
+            </button>
+          );
+        })}
       </div>
 
       <div className="tab-content">
