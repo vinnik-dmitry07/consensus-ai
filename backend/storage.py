@@ -107,22 +107,28 @@ def list_conversations() -> List[Dict[str, Any]]:
     return conversations
 
 
-def add_user_message(conversation_id: str, content: str):
+def add_user_message(conversation_id: str, content: str, images: List[str] = None):
     """
     Add a user message to a conversation.
 
     Args:
         conversation_id: Conversation identifier
         content: User message content
+        images: Optional list of base64 image data URLs
     """
     conversation = get_conversation(conversation_id)
     if conversation is None:
         raise ValueError(f"Conversation {conversation_id} not found")
 
-    conversation["messages"].append({
+    message = {
         "role": "user",
         "content": content
-    })
+    }
+    
+    if images:
+        message["images"] = images
+
+    conversation["messages"].append(message)
 
     save_conversation(conversation)
 
@@ -131,7 +137,8 @@ def add_assistant_message(
     conversation_id: str,
     stage1: List[Dict[str, Any]],
     stage2: List[Dict[str, Any]],
-    stage3: Dict[str, Any]
+    stage3: Dict[str, Any],
+    metadata: Optional[Dict[str, Any]] = None
 ):
     """
     Add an assistant message with all 3 stages to a conversation.
@@ -141,17 +148,23 @@ def add_assistant_message(
         stage1: List of individual model responses
         stage2: List of model rankings
         stage3: Final synthesized response
+        metadata: Optional metadata including label_to_model and aggregate_rankings
     """
     conversation = get_conversation(conversation_id)
     if conversation is None:
         raise ValueError(f"Conversation {conversation_id} not found")
 
-    conversation["messages"].append({
+    message = {
         "role": "assistant",
         "stage1": stage1,
         "stage2": stage2,
         "stage3": stage3
-    })
+    }
+    
+    if metadata:
+        message["metadata"] = metadata
+
+    conversation["messages"].append(message)
 
     save_conversation(conversation)
 
@@ -169,4 +182,97 @@ def update_conversation_title(conversation_id: str, title: str):
         raise ValueError(f"Conversation {conversation_id} not found")
 
     conversation["title"] = title
+    save_conversation(conversation)
+
+
+def add_partial_assistant_message(
+    conversation_id: str,
+    stage1: Optional[List[Dict[str, Any]]] = None,
+    stage2: Optional[List[Dict[str, Any]]] = None,
+    stage3: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    error: Optional[Dict[str, Any]] = None
+):
+    """
+    Add a partial assistant message (when a stage fails).
+
+    Args:
+        conversation_id: Conversation identifier
+        stage1: List of individual model responses (or None if failed)
+        stage2: List of model rankings (or None if failed/not reached)
+        stage3: Final synthesized response (or None if failed/not reached)
+        metadata: Optional metadata
+        error: Error information with 'stage' and 'message' keys
+    """
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        raise ValueError(f"Conversation {conversation_id} not found")
+
+    message = {
+        "role": "assistant",
+        "stage1": stage1,
+        "stage2": stage2,
+        "stage3": stage3
+    }
+    
+    if metadata:
+        message["metadata"] = metadata
+    
+    if error:
+        message["error"] = error
+
+    conversation["messages"].append(message)
+    save_conversation(conversation)
+
+
+def update_assistant_message(
+    conversation_id: str,
+    message_index: int,
+    stage1: Optional[List[Dict[str, Any]]] = None,
+    stage2: Optional[List[Dict[str, Any]]] = None,
+    stage3: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    error: Optional[Dict[str, Any]] = None
+):
+    """
+    Update an existing assistant message (for retries).
+
+    Args:
+        conversation_id: Conversation identifier
+        message_index: Index of the message to update
+        stage1: List of individual model responses
+        stage2: List of model rankings
+        stage3: Final synthesized response
+        metadata: Optional metadata
+        error: Error information (None if no error)
+    """
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        raise ValueError(f"Conversation {conversation_id} not found")
+
+    if message_index < 0 or message_index >= len(conversation["messages"]):
+        raise ValueError(f"Invalid message index: {message_index}")
+
+    message = conversation["messages"][message_index]
+    if message.get("role") != "assistant":
+        raise ValueError(f"Message at index {message_index} is not an assistant message")
+
+    # Update fields
+    message["stage1"] = stage1
+    message["stage2"] = stage2
+    message["stage3"] = stage3
+    
+    if metadata:
+        message["metadata"] = metadata
+    elif "metadata" in message and metadata is None and stage3 is not None:
+        # Keep existing metadata if completing successfully
+        pass
+    
+    # Handle error field
+    if error:
+        message["error"] = error
+    elif "error" in message:
+        # Remove error if retry succeeded
+        del message["error"]
+
     save_conversation(conversation)

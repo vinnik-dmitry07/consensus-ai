@@ -22,7 +22,7 @@ COUNCIL_MODELS = [
 ]
 
 # Number of response samples to collect per model in Stage 1
-N_SAMPLES = 1
+N_SAMPLES = 3
 
 # Chairman model - synthesizes final response
 CHAIRMAN_MODEL = "google/gemini-3-pro-preview-reasoning-high"

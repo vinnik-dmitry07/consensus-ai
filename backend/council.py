@@ -1,17 +1,43 @@
 """3-stage LLM Council orchestration."""
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Union
 
 from .config import CHAIRMAN_MODEL, COUNCIL_MODELS, N_SAMPLES
 from .openrouter import query_model, query_models_parallel
 
 
-async def stage1_collect_responses(user_query: str, n: int = N_SAMPLES) -> List[Dict[str, Any]]:
+def build_user_message(text: str, images: List[str] = None) -> Union[str, List[Dict]]:
+    """
+    Build a user message content that can include images.
+    
+    Args:
+        text: The text content of the message
+        images: Optional list of base64 data URLs for images
+        
+    Returns:
+        Either a simple string (no images) or a list of content parts (with images)
+    """
+    if not images:
+        return text
+    
+    # Build multimodal content array
+    content = [{"type": "text", "text": text}]
+    
+    for image_url in images:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": image_url}
+        })
+    
+    return content
+
+
+async def stage1_collect_responses(user_query: Union[str, List[Dict]], n: int = N_SAMPLES) -> List[Dict[str, Any]]:
     """
     Stage 1: Collect individual responses from all council models.
 
     Args:
-        user_query: The user's question
+        user_query: The user's question (string or multimodal content list)
         n: Number of samples to collect per model (default: N_SAMPLES)
 
     Returns:
