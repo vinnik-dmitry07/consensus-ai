@@ -191,6 +191,7 @@ export default function ChatInterface({
   onSendMessage,
   onRetryStage,
   isLoading,
+  settingsVersion = 0,
 }) {
   const [input, setInput] = useState('');
   const [attachedImages, setAttachedImages] = useState([]);
@@ -198,7 +199,7 @@ export default function ChatInterface({
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
 
-  // Fetch pricing data on mount
+  // Fetch pricing data on mount and when settings change
   useEffect(() => {
     const fetchPricing = async () => {
       try {
@@ -209,7 +210,7 @@ export default function ChatInterface({
       }
     };
     fetchPricing();
-  }, []);
+  }, [settingsVersion]);
 
   // Calculate estimated cost when input or images change
   const estimatedCost = useMemo(() => {

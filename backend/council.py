@@ -2,8 +2,8 @@
 
 from typing import Any, Dict, List, Tuple, Union
 
-from .config import CHAIRMAN_MODEL, COUNCIL_MODELS, N_SAMPLES
 from .openrouter import query_model, query_models_parallel
+from .settings import settings
 
 
 def build_user_message(text: str, images: List[str] = None) -> Union[str, List[Dict]]:
@@ -32,17 +32,20 @@ def build_user_message(text: str, images: List[str] = None) -> Union[str, List[D
     return content
 
 
-async def stage1_collect_responses(user_query: Union[str, List[Dict]], n: int = N_SAMPLES) -> List[Dict[str, Any]]:
+async def stage1_collect_responses(user_query: Union[str, List[Dict]], n: int = None) -> List[Dict[str, Any]]:
     """
     Stage 1: Collect individual responses from all council models.
 
     Args:
         user_query: The user's question (string or multimodal content list)
-        n: Number of samples to collect per model (default: N_SAMPLES)
+        n: Number of samples to collect per model (default: settings.n_samples)
 
     Returns:
         List of dicts with 'model' and 'response' keys
     """
+    if n is None:
+        n = settings.n_samples
+
     messages = [{"role": "user", "content": user_query}]
 
     # Create tasks for N samples per model
@@ -51,7 +54,7 @@ async def stage1_collect_responses(user_query: Union[str, List[Dict]], n: int = 
     tasks = []
     models_expanded = []
 
-    for model in COUNCIL_MODELS:
+    for model in settings.council_models:
         for _ in range(n):
             tasks.append(query_model(model, messages))
             models_expanded.append(model)
@@ -135,7 +138,7 @@ Now provide your evaluation and ranking:"""
     messages = [{"role": "user", "content": ranking_prompt}]
 
     # Get rankings from all council models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    responses = await query_models_parallel(settings.council_models, messages)
 
     # Format results
     stage2_results = []
@@ -200,20 +203,16 @@ Provide a clear, well-reasoned final answer that represents the council's collec
     messages = [{"role": "user", "content": chairman_prompt}]
 
     # Query the chairman model
-    response = await query_model(CHAIRMAN_MODEL, messages)
+    response = await query_model(settings.chairman_model, messages)
 
     if response is None:
         # Fallback if chairman fails
-        return {
-            "model": CHAIRMAN_MODEL,
-            "response": "Error: Unable to generate final synthesis.",
-            "usage": {}
-        }
+        return {'model': settings.chairman_model, 'response': 'Error: Unable to generate final synthesis.', 'usage': {}}
 
     return {
-        "model": CHAIRMAN_MODEL,
-        "response": response.get('content', ''),
-        "usage": response.get('usage', {})
+        'model': settings.chairman_model,
+        'response': response.get('content', ''),
+        'usage': response.get('usage', {}),
     }
 
 

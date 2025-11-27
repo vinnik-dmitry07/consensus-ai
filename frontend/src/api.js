@@ -28,6 +28,62 @@ export const api = {
   },
 
   /**
+   * Get all available models from OpenRouter.
+   */
+  async getAvailableModels() {
+    const response = await fetch(`${API_BASE}/api/models`);
+    if (!response.ok) {
+      throw new Error('Failed to fetch models');
+    }
+    return response.json();
+  },
+
+  /**
+   * Get current council settings.
+   */
+  async getSettings() {
+    const response = await fetch(`${API_BASE}/api/settings`);
+    if (!response.ok) {
+      throw new Error('Failed to fetch settings');
+    }
+    return response.json();
+  },
+
+  /**
+   * Update council settings.
+   * @param {Object} settings - Settings to update
+   * @param {string[]} [settings.council_models] - List of model IDs
+   * @param {number} [settings.n_samples] - Number of samples per model
+   * @param {string} [settings.chairman_model] - Chairman model ID
+   */
+  async updateSettings(settings) {
+    const response = await fetch(`${API_BASE}/api/settings`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(settings),
+    });
+    if (!response.ok) {
+      throw new Error('Failed to update settings');
+    }
+    return response.json();
+  },
+
+  /**
+   * Reset council settings to defaults.
+   */
+  async resetSettings() {
+    const response = await fetch(`${API_BASE}/api/settings/reset`, {
+      method: 'POST',
+    });
+    if (!response.ok) {
+      throw new Error('Failed to reset settings');
+    }
+    return response.json();
+  },
+
+  /**
    * List all conversations.
    */
   async listConversations() {

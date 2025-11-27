@@ -12,7 +12,7 @@ import asyncio
 from . import storage
 from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings, build_user_message
 from .openrouter import get_credits, get_models_pricing
-from .config import COUNCIL_MODELS, CHAIRMAN_MODEL, N_SAMPLES
+from .settings import settings
 
 app = FastAPI(title="LLM Council API")
 
@@ -77,6 +77,62 @@ async def get_openrouter_credits():
     }
 
 
+@app.get("/api/models")
+async def list_available_models():
+    """List all available models from OpenRouter."""
+    models_data = await get_models_pricing()
+    
+    # Return models sorted by name
+    models_list = [
+        {
+            "id": model_id,
+            "name": info.get("name", model_id),
+            "pricing": info.get("pricing", {})
+        }
+        for model_id, info in models_data.items()
+    ]
+    
+    # Sort by name
+    models_list.sort(key=lambda x: x["name"].lower())
+    
+    return {"models": models_list}
+
+
+class UpdateSettingsRequest(BaseModel):
+    """Request to update council settings."""
+    council_models: Optional[List[str]] = None
+    n_samples: Optional[int] = None
+    chairman_model: Optional[str] = None
+
+
+@app.get("/api/settings")
+async def get_settings():
+    """Get current council settings."""
+    return settings.to_dict()
+
+
+@app.put("/api/settings")
+async def update_settings(request: UpdateSettingsRequest):
+    """Update council settings."""
+    update_data = {}
+    if request.council_models is not None:
+        update_data["council_models"] = request.council_models
+    if request.n_samples is not None:
+        update_data["n_samples"] = request.n_samples
+    if request.chairman_model is not None:
+        update_data["chairman_model"] = request.chairman_model
+    
+    settings.update_from_dict(update_data)
+    return settings.to_dict()
+
+
+@app.post("/api/settings/reset")
+async def reset_settings():
+    """Reset council settings to defaults."""
+    settings.reset_to_defaults()
+    return settings.to_dict()
+
+
 @app.get("/api/pricing")
 async def get_council_pricing():
     """Get pricing information for all council models."""
@@ -84,12 +140,12 @@ async def get_council_pricing():
     
     # Get all models we use (council + chairman)
     all_models = set()
-    for model in COUNCIL_MODELS:
+    for model in settings.council_models:
         # Strip reasoning suffixes to get base model
         base_model = model.replace('-reasoning-high', '').replace('-reasoning', '')
         all_models.add(base_model)
     
-    chairman_base = CHAIRMAN_MODEL.replace('-reasoning-high', '').replace('-reasoning', '')
+    chairman_base = settings.chairman_model.replace('-reasoning-high', '').replace('-reasoning', '')
     all_models.add(chairman_base)
     
     # Build response with pricing for each model
@@ -100,9 +156,9 @@ async def get_council_pricing():
     
     # Also return the council structure
     return {
-        "council_models": COUNCIL_MODELS,
-        "chairman_model": CHAIRMAN_MODEL,
-        "n_samples": N_SAMPLES,
+        "council_models": settings.council_models,
+        "chairman_model": settings.chairman_model,
+        "n_samples": settings.n_samples,
         "pricing": pricing_data
     }
 
