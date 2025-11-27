@@ -11,6 +11,8 @@ import asyncio
 
 from . import storage
 from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings, build_user_message
+from .openrouter import get_credits, get_models_pricing
+from .config import COUNCIL_MODELS, CHAIRMAN_MODEL, N_SAMPLES
 
 app = FastAPI(title="LLM Council API")
 
@@ -55,6 +57,54 @@ class Conversation(BaseModel):
 async def root():
     """Health check endpoint."""
     return {"status": "ok", "service": "LLM Council API"}
+
+
+@app.get("/api/credits")
+async def get_openrouter_credits():
+    """Get OpenRouter credits balance."""
+    credits_data = await get_credits()
+    if credits_data is None:
+        raise HTTPException(status_code=500, detail="Failed to fetch credits")
+    
+    total = credits_data.get('total_credits', 0)
+    used = credits_data.get('total_usage', 0)
+    remaining = total - used
+    
+    return {
+        "total": total,
+        "used": used,
+        "remaining": remaining
+    }
+
+
+@app.get("/api/pricing")
+async def get_council_pricing():
+    """Get pricing information for all council models."""
+    models_pricing = await get_models_pricing()
+    
+    # Get all models we use (council + chairman)
+    all_models = set()
+    for model in COUNCIL_MODELS:
+        # Strip reasoning suffixes to get base model
+        base_model = model.replace('-reasoning-high', '').replace('-reasoning', '')
+        all_models.add(base_model)
+    
+    chairman_base = CHAIRMAN_MODEL.replace('-reasoning-high', '').replace('-reasoning', '')
+    all_models.add(chairman_base)
+    
+    # Build response with pricing for each model
+    pricing_data = {}
+    for model_id in all_models:
+        if model_id in models_pricing:
+            pricing_data[model_id] = models_pricing[model_id]
+    
+    # Also return the council structure
+    return {
+        "council_models": COUNCIL_MODELS,
+        "chairman_model": CHAIRMAN_MODEL,
+        "n_samples": N_SAMPLES,
+        "pricing": pricing_data
+    }
 
 
 @app.get("/api/conversations", response_model=List[ConversationMetadata])

@@ -6,6 +6,71 @@ import httpx
 
 from .config import OPENROUTER_API_KEY, OPENROUTER_API_URL
 
+OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+
+# Cache for model pricing data
+_models_cache: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+async def get_models_pricing() -> Dict[str, Dict[str, Any]]:
+    """
+    Fetch and cache model pricing data from OpenRouter.
+    
+    Returns:
+        Dict mapping model ID to pricing info
+    """
+    global _models_cache
+    
+    if _models_cache is not None:
+        return _models_cache
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(OPENROUTER_MODELS_URL)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Build cache: model_id -> pricing info
+            _models_cache = {}
+            for model in data.get('data', []):
+                model_id = model.get('id')
+                if model_id:
+                    _models_cache[model_id] = {
+                        'name': model.get('name'),
+                        'pricing': model.get('pricing', {})
+                    }
+            
+            return _models_cache
+    except Exception as e:
+        print(f"Error fetching models: {e}")
+        return {}
+
+
+async def get_credits() -> Optional[Dict[str, Any]]:
+    """
+    Get OpenRouter credits information.
+    
+    Returns:
+        Dict with 'total_credits' and 'total_usage', or None if failed
+    """
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                OPENROUTER_CREDITS_URL,
+                headers=headers
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get('data')
+    except Exception as e:
+        print(f"Error fetching credits: {e}")
+        return None
+
 
 async def query_model(
     model: str,
@@ -48,10 +113,16 @@ async def query_model(
 
             data = response.json()
             message = data['choices'][0]['message']
+            usage = data.get('usage', {})
 
             return {
                 'content': message.get('content'),
-                'reasoning_details': message.get('reasoning_details')
+                'reasoning_details': message.get('reasoning_details'),
+                'usage': {
+                    'prompt_tokens': usage.get('prompt_tokens', 0),
+                    'completion_tokens': usage.get('completion_tokens', 0),
+                    'total_tokens': usage.get('total_tokens', 0),
+                }
             }
 
     except Exception as e:

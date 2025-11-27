@@ -6,6 +6,28 @@ const API_BASE = 'http://localhost:8001';
 
 export const api = {
   /**
+   * Get OpenRouter credits balance.
+   */
+  async getCredits() {
+    const response = await fetch(`${API_BASE}/api/credits`);
+    if (!response.ok) {
+      throw new Error('Failed to fetch credits');
+    }
+    return response.json();
+  },
+
+  /**
+   * Get pricing information for council models.
+   */
+  async getPricing() {
+    const response = await fetch(`${API_BASE}/api/pricing`);
+    if (!response.ok) {
+      throw new Error('Failed to fetch pricing');
+    }
+    return response.json();
+  },
+
+  /**
    * List all conversations.
    */
   async listConversations() {
@@ -130,23 +152,45 @@ export const api = {
   async _processSSEStream(response, onEvent) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
+    let buffer = '';
 
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
 
-      const chunk = decoder.decode(value);
-      const lines = chunk.split('\n');
+      // Append new chunk to buffer
+      buffer += decoder.decode(value, { stream: true });
+      
+      // Process complete lines from buffer
+      const lines = buffer.split('\n');
+      
+      // Keep the last potentially incomplete line in the buffer
+      buffer = lines.pop() || '';
 
       for (const line of lines) {
         if (line.startsWith('data: ')) {
           const data = line.slice(6);
-          try {
-            const event = JSON.parse(data);
-            onEvent(event.type, event);
-          } catch (e) {
-            console.error('Failed to parse SSE event:', e);
+          if (data.trim()) {
+            try {
+              const event = JSON.parse(data);
+              onEvent(event.type, event);
+            } catch (e) {
+              console.error('Failed to parse SSE event:', e, 'Data:', data.substring(0, 100));
+            }
           }
+        }
+      }
+    }
+    
+    // Process any remaining data in the buffer
+    if (buffer.startsWith('data: ')) {
+      const data = buffer.slice(6);
+      if (data.trim()) {
+        try {
+          const event = JSON.parse(data);
+          onEvent(event.type, event);
+        } catch (e) {
+          console.error('Failed to parse final SSE event:', e);
         }
       }
     }

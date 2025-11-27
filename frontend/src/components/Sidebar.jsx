@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { api } from '../api';
 import './Sidebar.css';
 
 export default function Sidebar({
@@ -7,6 +8,24 @@ export default function Sidebar({
   onSelectConversation,
   onNewConversation,
 }) {
+  const [credits, setCredits] = useState(null);
+
+  useEffect(() => {
+    const fetchCredits = async () => {
+      try {
+        const data = await api.getCredits();
+        setCredits(data);
+      } catch (error) {
+        console.error('Failed to fetch credits:', error);
+      }
+    };
+
+    fetchCredits();
+    // Refresh credits every 30 seconds
+    const interval = setInterval(fetchCredits, 30000);
+    return () => clearInterval(interval);
+  }, []);
+
   return (
     <div className="sidebar">
       <div className="sidebar-header">
@@ -38,6 +57,16 @@ export default function Sidebar({
           ))
         )}
       </div>
+
+      {credits && (
+        <div className="credits-display">
+          <div className="credits-icon">💳</div>
+          <div className="credits-info">
+            <span className="credits-label">Credits</span>
+            <span className="credits-value">${credits.remaining.toFixed(2)}</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
