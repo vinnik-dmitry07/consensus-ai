@@ -4,10 +4,16 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from .config import OPENROUTER_API_KEY, OPENROUTER_API_URL
+from .config import OPENROUTER_API_URL
+from .settings import settings
 
 OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+
+
+def get_api_key() -> Optional[str]:
+    """Get the current API key from settings."""
+    return settings.api_key
 
 # Cache for model pricing data
 _models_cache: Optional[Dict[str, Dict[str, Any]]] = None
@@ -54,8 +60,13 @@ async def get_credits() -> Optional[Dict[str, Any]]:
     Returns:
         Dict with 'total_credits' and 'total_usage', or None if failed
     """
+    api_key = get_api_key()
+    if not api_key:
+        print("Error fetching credits: No API key configured")
+        return None
+    
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
     }
     
     try:
@@ -88,8 +99,13 @@ async def query_model(
     Returns:
         Response dict with 'content' and optional 'reasoning_details', or None if failed
     """
+    api_key = get_api_key()
+    if not api_key:
+        print(f"Error querying model {model}: No API key configured")
+        return None
+    
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
 

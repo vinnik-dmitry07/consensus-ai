@@ -43,17 +43,10 @@ function App() {
     }
   };
 
-  const handleNewConversation = async () => {
-    try {
-      const newConv = await api.createConversation();
-      setConversations([
-        { id: newConv.id, created_at: newConv.created_at, message_count: 0 },
-        ...conversations,
-      ]);
-      setCurrentConversationId(newConv.id);
-    } catch (error) {
-      console.error('Failed to create conversation:', error);
-    }
+  const handleNewConversation = () => {
+    // Don't create on backend yet - wait for first message
+    setCurrentConversationId(null);
+    setCurrentConversation({ id: null, messages: [], title: 'New Conversation' });
   };
 
   const handleSelectConversation = (id) => {
@@ -181,10 +174,23 @@ function App() {
   };
 
   const handleSendMessage = async (content, images = []) => {
-    if (!currentConversationId) return;
+    if (!currentConversation) return;
 
     setIsLoading(true);
     try {
+      // Create conversation on backend if this is a new conversation
+      let convId = currentConversationId;
+      if (!convId) {
+        const newConv = await api.createConversation();
+        convId = newConv.id;
+        setCurrentConversationId(convId);
+        setConversations((prev) => [
+          { id: newConv.id, created_at: newConv.created_at, title: 'New Conversation', message_count: 0 },
+          ...prev,
+        ]);
+        setCurrentConversation((prev) => ({ ...prev, id: convId }));
+      }
+
       // Optimistically add user message to UI
       const userMessage = { role: 'user', content, images: images.length > 0 ? images : undefined };
       setCurrentConversation((prev) => ({
@@ -214,7 +220,7 @@ function App() {
       }));
 
       // Send message with streaming
-      await api.sendMessageStream(currentConversationId, content, images, (eventType, event) => {
+      await api.sendMessageStream(convId, content, images, (eventType, event) => {
         handleStreamEvent(eventType, event);
       });
     } catch (error) {

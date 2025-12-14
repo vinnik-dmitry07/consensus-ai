@@ -206,8 +206,8 @@ Provide a clear, well-reasoned final answer that represents the council's collec
     response = await query_model(settings.chairman_model, messages)
 
     if response is None:
-        # Fallback if chairman fails
-        return {'model': settings.chairman_model, 'response': 'Error: Unable to generate final synthesis.', 'usage': {}}
+        # Raise exception so the retry mechanism can handle it
+        raise Exception(f'Chairman model ({settings.chairman_model}) failed to generate response')
 
     return {
         'model': settings.chairman_model,

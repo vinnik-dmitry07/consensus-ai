@@ -103,6 +103,7 @@ class UpdateSettingsRequest(BaseModel):
     council_models: Optional[List[str]] = None
     n_samples: Optional[int] = None
     chairman_model: Optional[str] = None
+    api_key: Optional[str] = None
 
 
 @app.get("/api/settings")
@@ -121,6 +122,8 @@ async def update_settings(request: UpdateSettingsRequest):
         update_data["n_samples"] = request.n_samples
     if request.chairman_model is not None:
         update_data["chairman_model"] = request.chairman_model
+    if request.api_key is not None:
+        update_data["api_key"] = request.api_key
     
     settings.update_from_dict(update_data)
     return settings.to_dict()

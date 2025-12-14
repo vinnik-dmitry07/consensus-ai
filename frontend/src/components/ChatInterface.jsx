@@ -388,14 +388,16 @@ export default function ChatInterface({
                       <span>Running Stage 3: Final synthesis...</span>
                     </div>
                   )}
-                  {msg.stage3 && <Stage3 finalResponse={msg.stage3} />}
-                  {msg.error?.stage === 3 && (
+                  {msg.stage3 && !msg.stage3.response?.startsWith('Error:') && (
+                    <Stage3 finalResponse={msg.stage3} />
+                  )}
+                  {(msg.error?.stage === 3 || msg.stage3?.response?.startsWith('Error:')) && (
                     <div className="stage-error">
                       <div className="error-content">
                         <span className="error-icon">⚠️</span>
                         <div className="error-details">
                           <strong>Stage 3 Failed</strong>
-                          <p>{msg.error.message}</p>
+                          <p>{msg.error?.message || msg.stage3?.response || 'Unable to generate final synthesis'}</p>
                         </div>
                       </div>
                       <button 
@@ -409,7 +411,7 @@ export default function ChatInterface({
                   )}
 
                   {/* Debug: Actual Usage Stats */}
-                  {msg.stage3 && (() => {
+                  {msg.stage3 && !msg.stage3.response?.startsWith('Error:') && (() => {
                     const actualUsage = calculateActualUsage(msg);
                     if (!actualUsage) return null;
                     return (
