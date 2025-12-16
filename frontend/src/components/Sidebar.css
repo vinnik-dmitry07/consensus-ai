@@ -100,6 +100,32 @@
   background: var(--bg-hover);
 }
 
+.conversation-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.remove-btn {
+  opacity: 0;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+  transition: opacity 0.2s, color 0.2s;
+}
+
+.conversation-item:hover .remove-btn {
+  opacity: 1;
+}
+
+.remove-btn:hover {
+  color: var(--error, #ef4444);
+}
+
 .conversation-item.active {
   background: var(--bg-active);
   border: 1px solid var(--accent);

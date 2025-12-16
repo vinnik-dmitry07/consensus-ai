@@ -125,6 +125,20 @@ export const api = {
   },
 
   /**
+   * Remove a conversation (soft delete).
+   */
+  async removeConversation(conversationId) {
+    const response = await fetch(
+      `${API_BASE}/api/conversations/${conversationId}`,
+      { method: 'DELETE' }
+    );
+    if (!response.ok) {
+      throw new Error('Failed to remove conversation');
+    }
+    return response.json();
+  },
+
+  /**
    * Send a message in a conversation.
    * @param {string} conversationId - The conversation ID
    * @param {string} content - The message content

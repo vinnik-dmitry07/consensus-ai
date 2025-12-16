@@ -35,7 +35,8 @@ def create_conversation(conversation_id: str) -> Dict[str, Any]:
         "id": conversation_id,
         "created_at": datetime.utcnow().isoformat(),
         "title": "New Conversation",
-        "messages": []
+        "messages": [],
+        "removed": False
     }
 
     # Save to file
@@ -94,6 +95,9 @@ def list_conversations() -> List[Dict[str, Any]]:
             path = os.path.join(DATA_DIR, filename)
             with open(path, 'r') as f:
                 data = json.load(f)
+                # Skip removed conversations
+                if data.get("removed", False):
+                    continue
                 # Return metadata only
                 conversations.append({
                     "id": data["id"],
@@ -183,6 +187,16 @@ def update_conversation_title(conversation_id: str, title: str):
         raise ValueError(f"Conversation {conversation_id} not found")
 
     conversation["title"] = title
+    save_conversation(conversation)
+
+
+def remove_conversation(conversation_id: str):
+    """Flag a conversation as removed (soft delete)."""
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        raise ValueError(f"Conversation {conversation_id} not found")
+
+    conversation["removed"] = True
     save_conversation(conversation)
 
 

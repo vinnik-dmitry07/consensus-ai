@@ -93,6 +93,18 @@ function App() {
     setCurrentConversationId(id);
   };
 
+  const handleRemoveConversation = async (id) => {
+    try {
+      await api.removeConversation(id);
+      setConversations((prev) => prev.filter((c) => c.id !== id));
+      if (currentConversationId === id) {
+        handleNewConversation();
+      }
+    } catch (error) {
+      console.error('Failed to remove conversation:', error);
+    }
+  };
+
   // Handle streaming events for both new messages and retries
   const handleStreamEvent = (eventType, event, messageIndex = null) => {
     // Helper to get the message to update
@@ -321,6 +333,7 @@ function App() {
         currentConversationId={currentConversationId}
         onSelectConversation={handleSelectConversation}
         onNewConversation={handleNewConversation}
+        onRemoveConversation={handleRemoveConversation}
         onOpenSettings={() => setIsSettingsOpen(true)}
         darkMode={darkMode}
         onToggleDarkMode={() => setDarkMode(!darkMode)}

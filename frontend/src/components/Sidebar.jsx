@@ -7,6 +7,7 @@ export default function Sidebar({
   currentConversationId,
   onSelectConversation,
   onNewConversation,
+  onRemoveConversation,
   onOpenSettings,
   darkMode,
   onToggleDarkMode,
@@ -58,8 +59,22 @@ export default function Sidebar({
               }`}
               onClick={() => onSelectConversation(conv.id)}
             >
-              <div className="conversation-title">
-                {conv.title || 'New Conversation'}
+              <div className="conversation-header">
+                <div className="conversation-title">
+                  {conv.title || 'New Conversation'}
+                </div>
+                <button
+                  className="remove-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (confirm('Remove this conversation?')) {
+                      onRemoveConversation(conv.id);
+                    }
+                  }}
+                  title="Remove conversation"
+                >
+                  ×
+                </button>
               </div>
               <div className="conversation-meta">
                 {conv.message_count} messages

@@ -199,6 +199,16 @@ async def get_conversation(conversation_id: str):
     return conversation
 
 
+@app.delete("/api/conversations/{conversation_id}")
+async def remove_conversation(conversation_id: str):
+    """Remove a conversation (soft delete)."""
+    try:
+        storage.remove_conversation(conversation_id)
+        return {"status": "ok"}
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+
 @app.post("/api/conversations/{conversation_id}/message")
 async def send_message(conversation_id: str, request: SendMessageRequest):
     """
