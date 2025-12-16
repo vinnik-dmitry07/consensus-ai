@@ -499,3 +499,32 @@
 .markdown-content pre {
   overflow-x: auto;
 }
+
+/* Table styles for GFM tables */
+.markdown-content table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 16px 0;
+  font-size: 14px;
+}
+
+.markdown-content th,
+.markdown-content td {
+  border: 1px solid var(--border-color);
+  padding: 10px 12px;
+  text-align: left;
+}
+
+.markdown-content th {
+  background: var(--bg-secondary);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.markdown-content tr:nth-child(even) {
+  background: var(--bg-tertiary);
+}
+
+.markdown-content tr:hover {
+  background: var(--bg-hover);
+}
