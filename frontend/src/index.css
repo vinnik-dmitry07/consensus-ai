@@ -7,6 +7,49 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+
+  /* Light mode (default) */
+  --bg-primary: #ffffff;
+  --bg-secondary: #f8f8f8;
+  --bg-tertiary: #f5f5f5;
+  --bg-hover: #f0f0f0;
+  --bg-active: #e8f0fe;
+  --border-color: #e0e0e0;
+  --text-primary: #333;
+  --text-secondary: #555;
+  --text-muted: #999;
+  --accent: #4a90e2;
+  --accent-hover: #357abd;
+  
+  /* Settings modal (light) */
+  --modal-bg: #ffffff;
+  --modal-border: rgba(0, 0, 0, 0.1);
+  --modal-input-bg: rgba(0, 0, 0, 0.03);
+  --modal-input-border: rgba(0, 0, 0, 0.15);
+  --modal-text: #333;
+  --modal-text-secondary: #666;
+}
+
+[data-theme="dark"] {
+  --bg-primary: #0f0f1a;
+  --bg-secondary: #16162a;
+  --bg-tertiary: #1a1a2e;
+  --bg-hover: #252540;
+  --bg-active: rgba(99, 102, 241, 0.2);
+  --border-color: rgba(255, 255, 255, 0.1);
+  --text-primary: #f0f0f0;
+  --text-secondary: #e0e0e0;
+  --text-muted: #888;
+  --accent: #6366f1;
+  --accent-hover: #8b5cf6;
+  
+  /* Settings modal (dark) */
+  --modal-bg: #1a1a2e;
+  --modal-border: rgba(255, 255, 255, 0.1);
+  --modal-input-bg: rgba(255, 255, 255, 0.05);
+  --modal-input-border: rgba(255, 255, 255, 0.15);
+  --modal-text: #f0f0f0;
+  --modal-text-secondary: #888;
 }
 
 * {
@@ -19,7 +62,7 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background: #f5f5f5;
+  background: var(--bg-tertiary);
 }
 
 #root {
@@ -70,7 +113,7 @@ body {
 }
 
 .markdown-content pre {
-  background: #f5f5f5;
+  background: var(--bg-tertiary);
   padding: 12px;
   border-radius: 4px;
   overflow-x: auto;
@@ -78,11 +121,12 @@ body {
 }
 
 .markdown-content code {
-  background: #f5f5f5;
+  background: var(--bg-tertiary);
   padding: 2px 6px;
   border-radius: 3px;
   font-family: monospace;
   font-size: 0.9em;
+  color: var(--text-primary);
 }
 
 .markdown-content pre code {
@@ -93,6 +137,6 @@ body {
 .markdown-content blockquote {
   margin: 0 0 12px 0;
   padding-left: 16px;
-  border-left: 4px solid #ddd;
-  color: #666;
+  border-left: 4px solid var(--border-color);
+  color: var(--text-muted);
 }

@@ -1,4 +1,6 @@
 """OpenRouter API client for making LLM requests."""
+import asyncio
+import time
 import traceback
 from typing import Any, Dict, List, Optional
 
@@ -15,8 +17,10 @@ def get_api_key() -> Optional[str]:
     """Get the current API key from settings."""
     return settings.api_key
 
-# Cache for model pricing data
+# Cache for model pricing data with TTL
 _models_cache: Optional[Dict[str, Dict[str, Any]]] = None
+_models_cache_time: float = 0
+_CACHE_TTL = 300  # 5 minutes
 
 
 async def get_models_pricing() -> Dict[str, Dict[str, Any]]:
@@ -26,9 +30,9 @@ async def get_models_pricing() -> Dict[str, Dict[str, Any]]:
     Returns:
         Dict mapping model ID to pricing info
     """
-    global _models_cache
-    
-    if _models_cache is not None:
+    global _models_cache, _models_cache_time
+
+    if _models_cache is not None and (time.time() - _models_cache_time) < _CACHE_TTL:
         return _models_cache
     
     try:
@@ -36,15 +40,17 @@ async def get_models_pricing() -> Dict[str, Dict[str, Any]]:
             response = await client.get(OPENROUTER_MODELS_URL)
             response.raise_for_status()
             data = response.json()
-            
-            # Build cache: model_id -> pricing info
+
+            # Build cache: model_id -> model info
             _models_cache = {}
+            _models_cache_time = time.time()
             for model in data.get('data', []):
                 model_id = model.get('id')
                 if model_id:
                     _models_cache[model_id] = {
                         'name': model.get('name'),
-                        'pricing': model.get('pricing', {})
+                        'pricing': model.get('pricing', {}),
+                        'description': model.get('description', ''),
                     }
             
             return _models_cache
@@ -118,56 +124,82 @@ async def query_model(
     elif 'reasoning' in model:
         payload['reasoning'] = {'effort': 'medium'}
 
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                OPENROUTER_API_URL,
-                headers=headers,
-                json=payload
-            )
-            response.raise_for_status()
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(OPENROUTER_API_URL, headers=headers, json=payload)
+                response.raise_for_status()
 
-            data = response.json()
-            message = data['choices'][0]['message']
-            usage = data.get('usage', {})
+                data = response.json()
+                message = data['choices'][0]['message']
+                usage = data.get('usage', {})
 
-            return {
-                'content': message.get('content'),
-                'reasoning_details': message.get('reasoning_details'),
-                'usage': {
-                    'prompt_tokens': usage.get('prompt_tokens', 0),
-                    'completion_tokens': usage.get('completion_tokens', 0),
-                    'total_tokens': usage.get('total_tokens', 0),
+                return {
+                    'content': message.get('content'),
+                    'reasoning_details': message.get('reasoning_details'),
+                    'usage': {
+                        'prompt_tokens': usage.get('prompt_tokens', 0),
+                        'completion_tokens': usage.get('completion_tokens', 0),
+                        'total_tokens': usage.get('total_tokens', 0),
+                    },
                 }
-            }
 
-    except Exception as e:
-        traceback.print_exc()
-        print(f"Error querying model {model}: {e}")
-        return None
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429 and attempt < max_retries - 1:
+                wait = int(e.response.headers.get('Retry-After', 2**attempt))
+                print(f'Rate limited for {model}, retrying in {wait}s...')
+                await asyncio.sleep(wait)
+                continue
+            elif e.response.status_code == 404:
+                print(f'Model {model} not found (404)')
+                return None
+            traceback.print_exc()
+            print(f'Error querying model {model}: {e}')
+            return None
+        except Exception as e:
+            traceback.print_exc()
+            print(f'Error querying model {model}: {e}')
+            return None
+    return None
 
 
 async def query_models_parallel(
-    models: List[str],
-    messages: List[Dict[str, str]]
+    models: List[str], messages: List[Dict[str, str]], max_concurrent: int = 5
 ) -> Dict[str, Optional[Dict[str, Any]]]:
     """
-    Query multiple models in parallel.
+    Query multiple models in parallel with rate limiting.
 
     Args:
         models: List of OpenRouter model identifiers
         messages: List of message dicts to send to each model
+        max_concurrent: Max concurrent requests to avoid rate limits
 
     Returns:
         Dict mapping model identifier to response dict (or None if failed)
     """
-    import asyncio
+    # Filter out non-existent models first
+    available = await get_models_pricing()
+    valid_models = []
+    for m in models:
+        base_model = m.replace('-reasoning-high', '').replace('-reasoning', '')
+        if base_model in available:
+            valid_models.append(m)
+        else:
+            print(f'Model {m} not available - skipping')
 
-    # Create tasks for all models
-    tasks = [query_model(model, messages) for model in models]
+    semaphore = asyncio.Semaphore(max_concurrent)
 
-    # Wait for all to complete
+    async def limited_query(model: str):
+        async with semaphore:
+            return await query_model(model, messages)
+
+    tasks = [limited_query(model) for model in valid_models]
     responses = await asyncio.gather(*tasks)
 
-    # Map models to their responses
-    return {model: response for model, response in zip(models, responses)}
+    result = {model: response for model, response in zip(valid_models, responses)}
+    # Add None for skipped models
+    for m in models:
+        if m not in result:
+            result[m] = None
+    return result

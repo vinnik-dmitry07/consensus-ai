@@ -243,6 +243,24 @@ export default function ChatInterface({
     }
   };
 
+  const handlePaste = (e) => {
+    const text = e.clipboardData.getData('text');
+    const lines = text.split('\n');
+    // Detect code: 3+ lines with 30%+ indented
+    if (lines.length >= 3) {
+      const indentedLines = lines.filter(l => /^[ \t]{2,}/.test(l) && l.trim());
+      if (indentedLines.length >= lines.length * 0.3) {
+        e.preventDefault();
+        const lang = /^\s*(def |class |import |from )/.test(text) ? 'python' : '';
+        const wrapped = `\`\`\`${lang}\n${text}\n\`\`\``;
+        const el = e.target;
+        const start = el.selectionStart;
+        const end = el.selectionEnd;
+        setInput(input.slice(0, start) + wrapped + input.slice(end));
+      }
+    }
+  };
+
   const handleImageSelect = (e) => {
     const files = Array.from(e.target.files);
     if (files.length === 0) return;
@@ -533,6 +551,7 @@ export default function ChatInterface({
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}
+                onPaste={handlePaste}
                 disabled={isLoading}
                 rows={3}
               />

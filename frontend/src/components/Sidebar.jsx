@@ -8,6 +8,8 @@ export default function Sidebar({
   onSelectConversation,
   onNewConversation,
   onOpenSettings,
+  darkMode,
+  onToggleDarkMode,
 }) {
   const [credits, setCredits] = useState(null);
 
@@ -30,7 +32,12 @@ export default function Sidebar({
   return (
     <div className="sidebar">
       <div className="sidebar-header">
-        <h1>LLM Council</h1>
+        <div className="header-row">
+          <h1>LLM Council</h1>
+          <button className="theme-toggle" onClick={onToggleDarkMode} title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}>
+            {darkMode ? '☀️' : '🌙'}
+          </button>
+        </div>
         <button className="new-conversation-btn" onClick={onNewConversation}>
           + New Conversation
         </button>

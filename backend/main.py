@@ -1,16 +1,25 @@
 """FastAPI backend for LLM Council."""
 
+import asyncio
+import json
+import uuid
+from typing import Any, Dict, List, Optional
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
-import uuid
-import json
-import asyncio
 
 from . import storage
-from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings, build_user_message
+from .council import (
+    build_user_message,
+    calculate_aggregate_rankings,
+    generate_conversation_title,
+    run_full_council,
+    stage1_collect_responses,
+    stage2_collect_rankings,
+    stage3_synthesize_final,
+)
 from .openrouter import get_credits, get_models_pricing
 from .settings import settings
 
@@ -85,9 +94,10 @@ async def list_available_models():
     # Return models sorted by name
     models_list = [
         {
-            "id": model_id,
-            "name": info.get("name", model_id),
-            "pricing": info.get("pricing", {})
+            'id': model_id,
+            'name': info.get('name', model_id),
+            'pricing': info.get('pricing', {}),
+            'description': info.get('description', ''),
         }
         for model_id, info in models_data.items()
     ]
@@ -343,7 +353,7 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                     title = await title_task
                     storage.update_conversation_title(conversation_id, title)
                     yield f"data: {json.dumps({'type': 'title_complete', 'data': {'title': title}})}\n\n"
-                except Exception as e:
+                except Exception:
                     # Title generation failed, but continue - not critical
                     pass
 
