@@ -7,7 +7,10 @@ import './App.css';
 
 function App() {
   const [conversations, setConversations] = useState([]);
-  const [currentConversationId, setCurrentConversationId] = useState(null);
+  const [currentConversationId, setCurrentConversationId] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('c');
+  });
   const [currentConversation, setCurrentConversation] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
@@ -18,6 +21,27 @@ function App() {
     document.documentElement.setAttribute('data-theme', darkMode ? 'dark' : 'light');
     localStorage.setItem('theme', darkMode ? 'dark' : 'light');
   }, [darkMode]);
+
+  // Sync URL with conversation ID
+  useEffect(() => {
+    const url = new URL(window.location);
+    if (currentConversationId) {
+      url.searchParams.set('c', currentConversationId);
+    } else {
+      url.searchParams.delete('c');
+    }
+    window.history.replaceState({}, '', url);
+  }, [currentConversationId]);
+
+  // Handle browser back/forward
+  useEffect(() => {
+    const handlePopState = () => {
+      const params = new URLSearchParams(window.location.search);
+      setCurrentConversationId(params.get('c'));
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
 
   // Load conversations on mount
   useEffect(() => {
@@ -51,11 +75,21 @@ function App() {
 
   const handleNewConversation = () => {
     // Don't create on backend yet - wait for first message
+    const url = new URL(window.location);
+    url.searchParams.delete('c');
+    window.history.pushState({}, '', url);
     setCurrentConversationId(null);
     setCurrentConversation({ id: null, messages: [], title: 'New Conversation' });
   };
 
   const handleSelectConversation = (id) => {
+    const url = new URL(window.location);
+    if (id) {
+      url.searchParams.set('c', id);
+    } else {
+      url.searchParams.delete('c');
+    }
+    window.history.pushState({}, '', url);
     setCurrentConversationId(id);
   };
 

@@ -33,7 +33,10 @@ export default function Sidebar({
     <div className="sidebar">
       <div className="sidebar-header">
         <div className="header-row">
-          <h1>LLM Council</h1>
+          <div className="brand">
+            <h1>consensus.ai</h1>
+            <span className="slogan">Search Wide</span>
+          </div>
           <button className="theme-toggle" onClick={onToggleDarkMode} title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}>
             {darkMode ? '☀️' : '🌙'}
           </button>

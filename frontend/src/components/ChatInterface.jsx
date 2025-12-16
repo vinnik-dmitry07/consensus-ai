@@ -218,13 +218,34 @@ export default function ChatInterface({
     return calculateEstimatedCost(input, attachedImages.length, pricingData);
   }, [input, attachedImages.length, pricingData]);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  const [showScrollBtn, setShowScrollBtn] = useState(false);
+  const [scrollDirection, setScrollDirection] = useState('down');
+  const containerRef = useRef(null);
+  const lastScrollTop = useRef(0);
+
+  const scrollTo = () => {
+    if (scrollDirection === 'down') {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    } else {
+      containerRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+    }
   };
 
-  useEffect(() => {
-    scrollToBottom();
-  }, [conversation]);
+  const handleScroll = () => {
+    if (!containerRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = containerRef.current;
+    const atBottom = scrollHeight - scrollTop - clientHeight < 100;
+    const atTop = scrollTop < 100;
+    
+    if (scrollTop > lastScrollTop.current) {
+      setScrollDirection('down');
+      setShowScrollBtn(!atBottom);
+    } else if (scrollTop < lastScrollTop.current) {
+      setScrollDirection('up');
+      setShowScrollBtn(!atTop);
+    }
+    lastScrollTop.current = scrollTop;
+  };
 
   const handleSubmit = (e) => {
     e.preventDefault();
@@ -305,7 +326,7 @@ export default function ChatInterface({
 
   return (
     <div className="chat-interface">
-      <div className="messages-container">
+      <div className="messages-container" ref={containerRef} onScroll={handleScroll}>
         {conversation.messages.length === 0 ? (
           <div className="empty-state">
             <h2>Start a conversation</h2>
@@ -470,6 +491,13 @@ export default function ChatInterface({
         )}
 
         <div ref={messagesEndRef} />
+        {showScrollBtn && (
+          <button className="scroll-to-bottom-btn" onClick={scrollTo} title={scrollDirection === 'down' ? 'Scroll to bottom' : 'Scroll to top'}>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ transform: scrollDirection === 'up' ? 'rotate(180deg)' : 'none' }}>
+              <polyline points="6 9 12 15 18 9"/>
+            </svg>
+          </button>
+        )}
       </div>
 
       {conversation.messages.length === 0 && (
