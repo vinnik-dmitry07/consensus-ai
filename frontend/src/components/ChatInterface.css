@@ -5,6 +5,7 @@
   height: 100vh;
   background: var(--bg-primary);
   overflow: hidden;
+  position: relative;
 }
 
 .messages-container {
@@ -16,10 +17,9 @@
 }
 
 .scroll-to-bottom-btn {
-  position: sticky;
+  position: absolute;
   bottom: 20px;
-  left: 100%;
-  margin-right: 20px;
+  right: 20px;
   width: 40px;
   height: 40px;
   border-radius: 50%;
@@ -30,6 +30,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
+  transition: opacity 0.2s;
 }
 
 .scroll-to-bottom-btn:hover {
@@ -62,10 +63,10 @@
   margin-bottom: 32px;
 }
 
-.user-message,
-.assistant-message {
-  margin-bottom: 16px;
+.message-group:has(+ [data-scroll-anchor]) {
+  margin-bottom: 0;
 }
+
 
 .message-label {
   font-size: 12px;
@@ -368,6 +369,72 @@
 .retry-button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* Stage interrupted styles */
+.stage-interrupted {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px;
+  margin: 12px 0;
+  background: #fffbeb;
+  border-radius: 8px;
+  border: 1px solid #fcd34d;
+  max-width: 80%;
+}
+
+.interrupted-content {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  flex: 1;
+}
+
+.interrupted-icon {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.interrupted-details {
+  flex: 1;
+}
+
+.interrupted-details strong {
+  display: block;
+  color: #92400e;
+  font-size: 14px;
+  margin-bottom: 4px;
+}
+
+.interrupted-details p {
+  margin: 0;
+  color: #a16207;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.stage-interrupted .retry-button {
+  background: #f59e0b;
+}
+
+.stage-interrupted .retry-button:hover:not(:disabled) {
+  background: #d97706;
+}
+
+.interrupted-buttons {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.retry-button.secondary {
+  background: #6b7280;
+}
+
+.retry-button.secondary:hover:not(:disabled) {
+  background: #4b5563;
 }
 
 /* Cost Estimate Styles */

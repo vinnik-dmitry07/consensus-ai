@@ -223,6 +223,8 @@ export default function ChatInterface({
   const [scrollDirection, setScrollDirection] = useState('down');
   const containerRef = useRef(null);
   const lastScrollTop = useRef(0);
+  const scrollBtnRef = useRef(false);
+  const scrollDirRef = useRef('down');
 
   const scrollTo = () => {
     if (scrollDirection === 'down') {
@@ -238,14 +240,35 @@ export default function ChatInterface({
     const atBottom = scrollHeight - scrollTop - clientHeight < 100;
     const atTop = scrollTop < 100;
     
-    if (scrollTop > lastScrollTop.current) {
-      setScrollDirection('down');
-      setShowScrollBtn(!atBottom);
-    } else if (scrollTop < lastScrollTop.current) {
-      setScrollDirection('up');
-      setShowScrollBtn(!atTop);
-    }
+    const delta = scrollTop - lastScrollTop.current;
     lastScrollTop.current = scrollTop;
+    
+    // Only update if scroll delta is significant (prevents micro-adjustments)
+    if (Math.abs(delta) < 5) return;
+    
+    if (delta > 0) {
+      // Scrolling down
+      const shouldShow = !atBottom;
+      if (scrollDirRef.current !== 'down') {
+        scrollDirRef.current = 'down';
+        setScrollDirection('down');
+      }
+      if (scrollBtnRef.current !== shouldShow) {
+        scrollBtnRef.current = shouldShow;
+        setShowScrollBtn(shouldShow);
+      }
+    } else {
+      // Scrolling up
+      const shouldShow = !atTop;
+      if (scrollDirRef.current !== 'up') {
+        scrollDirRef.current = 'up';
+        setScrollDirection('up');
+      }
+      if (scrollBtnRef.current !== shouldShow) {
+        scrollBtnRef.current = shouldShow;
+        setShowScrollBtn(shouldShow);
+      }
+    }
   };
 
   const handleSubmit = (e) => {
@@ -362,13 +385,66 @@ export default function ChatInterface({
                   <div className="message-label">LLM Council</div>
 
                   {/* Stage 1 */}
-                  {msg.loading?.stage1 && (
+                  {msg.loading?.stage1 && !msg.stage1Progress && (
                     <div className="stage-loading">
                       <div className="spinner"></div>
                       <span>Running Stage 1: Collecting individual responses...</span>
                     </div>
                   )}
-                  {msg.stage1 && <Stage1 responses={msg.stage1} />}
+                  {msg.stage1Progress && (
+                    <Stage1 
+                      responses={msg.stage1Progress.results} 
+                      progress={msg.stage1Progress}
+                    />
+                  )}
+                  {msg.stage1 && !msg.stage1Progress && <Stage1 responses={msg.stage1} />}
+                  {/* Interrupted during Stage 1 - partial results collected */}
+                  {msg.streaming && !msg.loading?.stage1 && !msg.stage1Progress && !msg.stage2 && !msg.error && (!msg.stage1 || msg.stage1.length === 0) && (
+                    <div className="stage-interrupted">
+                      <div className="interrupted-content">
+                        <span className="interrupted-icon">⏸️</span>
+                        <div className="interrupted-details">
+                          <strong>Processing Interrupted</strong>
+                          <p>No responses collected yet</p>
+                        </div>
+                      </div>
+                      <button 
+                        className="retry-button"
+                        onClick={() => onRetryStage(index, 1)}
+                        disabled={isLoading}
+                      >
+                        Resume from Stage 1
+                      </button>
+                    </div>
+                  )}
+                  {/* Interrupted during Stage 1 - some results collected but not complete */}
+                  {msg.streaming && !msg.loading?.stage1 && !msg.stage1Progress && !msg.stage2 && !msg.error && msg.stage1?.length > 0 && (
+                    <div className="stage-interrupted">
+                      <div className="interrupted-content">
+                        <span className="interrupted-icon">⏸️</span>
+                        <div className="interrupted-details">
+                          <strong>Processing Interrupted</strong>
+                          <p>{msg.stage1.length} response(s) collected. Resume to continue or restart.</p>
+                        </div>
+                      </div>
+                      <div className="interrupted-buttons">
+                        <button 
+                          className="retry-button"
+                          onClick={() => onRetryStage(index, 1)}
+                          disabled={isLoading}
+                        >
+                          Resume Stage 1
+                        </button>
+                        <button 
+                          className="retry-button secondary"
+                          onClick={() => onRetryStage(index, 2)}
+                          disabled={isLoading}
+                        >
+                          Skip to Stage 2
+                        </button>
+                      </div>
+                    </div>
+                  )}
                   {msg.error?.stage === 1 && (
                     <div className="stage-error">
                       <div className="error-content">
@@ -420,7 +496,6 @@ export default function ChatInterface({
                       </button>
                     </div>
                   )}
-
                   {/* Stage 3 */}
                   {msg.loading?.stage3 && (
                     <div className="stage-loading">
@@ -446,6 +521,25 @@ export default function ChatInterface({
                         disabled={isLoading}
                       >
                         Retry Stage 3
+                      </button>
+                    </div>
+                  )}
+                  {/* Interrupted after Stage 2 complete, before Stage 3 */}
+                  {msg.streaming && !msg.loading?.stage3 && msg.stage2 && !msg.stage3 && !msg.error && (
+                    <div className="stage-interrupted">
+                      <div className="interrupted-content">
+                        <span className="interrupted-icon">⏸️</span>
+                        <div className="interrupted-details">
+                          <strong>Processing Interrupted</strong>
+                          <p>Rankings complete. Ready for final synthesis.</p>
+                        </div>
+                      </div>
+                      <button 
+                        className="retry-button"
+                        onClick={() => onRetryStage(index, 3)}
+                        disabled={isLoading}
+                      >
+                        Resume from Stage 3
                       </button>
                     </div>
                   )}
@@ -484,22 +578,19 @@ export default function ChatInterface({
           ))
         )}
 
-        {isLoading && (
-          <div className="loading-indicator">
-            <div className="spinner"></div>
-            <span>Consulting the council...</span>
-          </div>
-        )}
-
-        <div ref={messagesEndRef} />
-        {showScrollBtn && (
-          <button className="scroll-to-bottom-btn" onClick={scrollTo} title={scrollDirection === 'down' ? 'Scroll to bottom' : 'Scroll to top'}>
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ transform: scrollDirection === 'up' ? 'rotate(180deg)' : 'none' }}>
-              <polyline points="6 9 12 15 18 9"/>
-            </svg>
-          </button>
-        )}
+        <div ref={messagesEndRef} data-scroll-anchor />
       </div>
+
+      <button 
+        className={`scroll-to-bottom-btn ${showScrollBtn ? 'visible' : ''}`} 
+        onClick={scrollTo} 
+        title={scrollDirection === 'down' ? 'Scroll to bottom' : 'Scroll to top'}
+        style={{ opacity: showScrollBtn ? 1 : 0, pointerEvents: showScrollBtn ? 'auto' : 'none' }}
+      >
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ transform: scrollDirection === 'up' ? 'rotate(180deg)' : 'none' }}>
+          <polyline points="6 9 12 15 18 9"/>
+        </svg>
+      </button>
 
       {conversation.messages.length === 0 && (
         <form className="input-form" onSubmit={handleSubmit}>

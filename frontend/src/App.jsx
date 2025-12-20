@@ -48,12 +48,12 @@ function App() {
     loadConversations();
   }, []);
 
-  // Load conversation details when selected
+  // Load conversation details when selected (but not while streaming)
   useEffect(() => {
-    if (currentConversationId) {
+    if (currentConversationId && !isLoading) {
       loadConversation(currentConversationId);
     }
-  }, [currentConversationId]);
+  }, [currentConversationId, isLoading]);
 
   const loadConversations = async () => {
     try {
@@ -117,7 +117,49 @@ function App() {
         setCurrentConversation((prev) => {
           const messages = [...prev.messages];
           const idx = getTargetMsgIndex(prev);
-          messages[idx] = { ...messages[idx], loading: { ...messages[idx].loading, stage1: true }, error: null };
+          messages[idx] = { 
+            ...messages[idx], 
+            loading: { ...messages[idx].loading, stage1: true }, 
+            stage1Progress: null,
+            error: null 
+          };
+          return { ...prev, messages };
+        });
+        break;
+
+      case 'stage1_init':
+        setCurrentConversation((prev) => {
+          const messages = [...prev.messages];
+          const idx = getTargetMsgIndex(prev);
+          messages[idx] = {
+            ...messages[idx],
+            stage1Progress: { 
+              total: event.data.total, 
+              completed: event.data.completed || 0, 
+              results: [] 
+            }
+          };
+          return { ...prev, messages };
+        });
+        break;
+
+      case 'stage1_model_complete':
+        setCurrentConversation((prev) => {
+          const messages = [...prev.messages];
+          const idx = getTargetMsgIndex(prev);
+          const progress = messages[idx].stage1Progress;
+          if (progress) {
+            // Only increment completed for NEW results, not existing ones being replayed
+            const isExisting = event.data.existing;
+            messages[idx] = {
+              ...messages[idx],
+              stage1Progress: {
+                ...progress,
+                completed: isExisting ? progress.completed : progress.completed + 1,
+                results: [...progress.results, event.data.result]
+              }
+            };
+          }
           return { ...prev, messages };
         });
         break;
@@ -126,7 +168,12 @@ function App() {
         setCurrentConversation((prev) => {
           const messages = [...prev.messages];
           const idx = getTargetMsgIndex(prev);
-          messages[idx] = { ...messages[idx], stage1: event.data, loading: { ...messages[idx].loading, stage1: false } };
+          messages[idx] = { 
+            ...messages[idx], 
+            stage1: event.data, 
+            stage1Progress: null,
+            loading: { ...messages[idx].loading, stage1: false } 
+          };
           return { ...prev, messages };
         });
         break;
@@ -135,7 +182,12 @@ function App() {
         setCurrentConversation((prev) => {
           const messages = [...prev.messages];
           const idx = getTargetMsgIndex(prev);
-          messages[idx] = { ...messages[idx], loading: { ...messages[idx].loading, stage1: false }, error: { stage: 1, message: event.message } };
+          messages[idx] = { 
+            ...messages[idx], 
+            loading: { ...messages[idx].loading, stage1: false }, 
+            stage1Progress: null,
+            error: { stage: 1, message: event.message } 
+          };
           return { ...prev, messages };
         });
         setIsLoading(false);
@@ -259,7 +311,7 @@ function App() {
         metadata: null,
         error: null,
         loading: {
-          stage1: false,
+          stage1: true,  // Start with stage1 loading
           stage2: false,
           stage3: false,
         },

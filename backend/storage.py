@@ -240,6 +240,75 @@ def add_partial_assistant_message(
     save_conversation(conversation)
 
 
+def create_streaming_assistant_message(conversation_id: str) -> int:
+    """
+    Create an empty assistant message for streaming.
+    Returns the message index.
+    """
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        raise ValueError(f"Conversation {conversation_id} not found")
+
+    message = {
+        "role": "assistant",
+        "stage1": [],
+        "stage2": None,
+        "stage3": None,
+        "streaming": True  # Mark as in-progress
+    }
+    conversation["messages"].append(message)
+    save_conversation(conversation)
+    return len(conversation["messages"]) - 1
+
+
+def append_stage1_result(conversation_id: str, message_index: int, result: Dict[str, Any]):
+    """
+    Append a single stage1 result to an assistant message.
+    """
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        raise ValueError(f"Conversation {conversation_id} not found")
+
+    message = conversation["messages"][message_index]
+    if message.get("stage1") is None:
+        message["stage1"] = []
+    message["stage1"].append(result)
+    save_conversation(conversation)
+
+
+def update_streaming_message(
+    conversation_id: str,
+    message_index: int,
+    stage2: Optional[List[Dict[str, Any]]] = None,
+    stage3: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    error: Optional[Dict[str, Any]] = None,
+    streaming: bool = True
+):
+    """
+    Update a streaming assistant message with stage2/stage3 results.
+    """
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        raise ValueError(f"Conversation {conversation_id} not found")
+
+    message = conversation["messages"][message_index]
+    
+    if stage2 is not None:
+        message["stage2"] = stage2
+    if stage3 is not None:
+        message["stage3"] = stage3
+    if metadata is not None:
+        message["metadata"] = metadata
+    if error is not None:
+        message["error"] = error
+    elif "error" in message:
+        del message["error"]
+    
+    message["streaming"] = streaming
+    save_conversation(conversation)
+
+
 def update_assistant_message(
     conversation_id: str,
     message_index: int,

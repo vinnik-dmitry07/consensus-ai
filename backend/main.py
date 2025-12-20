@@ -17,6 +17,7 @@ from .council import (
     generate_conversation_title,
     run_full_council,
     stage1_collect_responses,
+    stage1_collect_responses_streaming,
     stage2_collect_rankings,
     stage3_synthesize_final,
 )
@@ -278,10 +279,14 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
         label_to_model = None
         aggregate_rankings = None
         current_stage = None
+        msg_index = None
 
         try:
             # Add user message
             storage.add_user_message(conversation_id, request.content, request.images)
+
+            # Create empty assistant message for streaming (saved to disk immediately)
+            msg_index = storage.create_streaming_assistant_message(conversation_id)
 
             # Build the message content for the API
             user_message = build_user_message(request.content, request.images)
@@ -291,23 +296,30 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             if is_first_message:
                 title_task = asyncio.create_task(generate_conversation_title(request.content))
 
-            # Stage 1: Collect responses
+            # Stage 1: Collect responses with streaming progress
             current_stage = 1
             yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
             try:
-                stage1_results = await stage1_collect_responses(user_message)
+                stage1_results = []
+                async for event_type, event_data in stage1_collect_responses_streaming(user_message):
+                    if event_type == 'init':
+                        yield f"data: {json.dumps({'type': 'stage1_init', 'data': event_data})}\n\n"
+                    elif event_type == 'model_complete':
+                        # Save each result to disk as it completes
+                        storage.append_stage1_result(conversation_id, msg_index, event_data['result'])
+                        yield f"data: {json.dumps({'type': 'stage1_model_complete', 'data': event_data})}\n\n"
+                    elif event_type == 'all_complete':
+                        stage1_results = event_data['results']
+                
                 if not stage1_results:
                     raise Exception("All models failed to respond in Stage 1")
                 yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
             except Exception as e:
-                # Save partial message with error
-                storage.add_partial_assistant_message(
-                    conversation_id,
-                    stage1=None,
-                    stage2=None,
-                    stage3=None,
-                    metadata=None,
-                    error={'stage': 1, 'message': str(e)}
+                # Update message with error
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    error={'stage': 1, 'message': str(e)},
+                    streaming=False
                 )
                 yield f"data: {json.dumps({'type': 'stage1_error', 'stage': 1, 'message': str(e)})}\n\n"
                 return
@@ -320,16 +332,18 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                 if not stage2_results:
                     raise Exception("All models failed to respond in Stage 2")
                 aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
+                # Save stage2 results
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    stage2=stage2_results,
+                    metadata={'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}
+                )
                 yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
             except Exception as e:
-                # Save partial message with stage 1 complete but stage 2 errored
-                storage.add_partial_assistant_message(
-                    conversation_id,
-                    stage1=stage1_results,
-                    stage2=None,
-                    stage3=None,
-                    metadata=None,
-                    error={'stage': 2, 'message': str(e)}
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    error={'stage': 2, 'message': str(e)},
+                    streaming=False
                 )
                 yield f"data: {json.dumps({'type': 'stage2_error', 'stage': 2, 'message': str(e)})}\n\n"
                 return
@@ -339,20 +353,18 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             try:
                 stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
+                # Save stage3 and mark streaming complete
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    stage3=stage3_result,
+                    streaming=False
+                )
                 yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
             except Exception as e:
-                # Save partial message with stage 1 and 2 complete but stage 3 errored
-                metadata = {
-                    'label_to_model': label_to_model,
-                    'aggregate_rankings': aggregate_rankings
-                }
-                storage.add_partial_assistant_message(
-                    conversation_id,
-                    stage1=stage1_results,
-                    stage2=stage2_results,
-                    stage3=None,
-                    metadata=metadata,
-                    error={'stage': 3, 'message': str(e)}
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    error={'stage': 3, 'message': str(e)},
+                    streaming=False
                 )
                 yield f"data: {json.dumps({'type': 'stage3_error', 'stage': 3, 'message': str(e)})}\n\n"
                 return
@@ -366,19 +378,6 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                 except Exception:
                     # Title generation failed, but continue - not critical
                     pass
-
-            # Save complete assistant message with metadata
-            metadata = {
-                'label_to_model': label_to_model,
-                'aggregate_rankings': aggregate_rankings
-            }
-            storage.add_assistant_message(
-                conversation_id,
-                stage1_results,
-                stage2_results,
-                stage3_result,
-                metadata
-            )
 
             # Send completion event
             yield f"data: {json.dumps({'type': 'complete'})}\n\n"
@@ -425,6 +424,11 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
     user_images = messages[user_msg_index].get("images", [])
     user_message = build_user_message(user_message_content, user_images)
 
+    msg_index = request.message_index
+    
+    # Get existing stage1 results for resume
+    existing_stage1 = messages[msg_index].get("stage1") or []
+
     async def event_generator():
         stage1_results = None
         stage2_results = None
@@ -433,18 +437,35 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
         aggregate_rankings = None
 
         try:
-            # Stage 1: Collect responses
+            # Mark as streaming, clear stage2/stage3 but keep stage1 for resume
+            storage.update_streaming_message(
+                conversation_id, msg_index,
+                stage2=None, stage3=None, streaming=True
+            )
+
+            # Stage 1: Collect responses with streaming progress (resume from existing)
             yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
             try:
-                stage1_results = await stage1_collect_responses(user_message)
+                stage1_results = []
+                async for event_type, event_data in stage1_collect_responses_streaming(user_message, existing_results=existing_stage1):
+                    if event_type == 'init':
+                        yield f"data: {json.dumps({'type': 'stage1_init', 'data': event_data})}\n\n"
+                    elif event_type == 'model_complete':
+                        # Only save NEW results (not existing ones being replayed)
+                        if not event_data.get('existing'):
+                            storage.append_stage1_result(conversation_id, msg_index, event_data['result'])
+                        yield f"data: {json.dumps({'type': 'stage1_model_complete', 'data': event_data})}\n\n"
+                    elif event_type == 'all_complete':
+                        stage1_results = event_data['results']
+                
                 if not stage1_results:
                     raise Exception("All models failed to respond in Stage 1")
                 yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
             except Exception as e:
-                storage.update_assistant_message(
-                    conversation_id, request.message_index,
-                    stage1=None, stage2=None, stage3=None, metadata=None,
-                    error={'stage': 1, 'message': str(e)}
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    error={'stage': 1, 'message': str(e)},
+                    streaming=False
                 )
                 yield f"data: {json.dumps({'type': 'stage1_error', 'stage': 1, 'message': str(e)})}\n\n"
                 return
@@ -456,12 +477,17 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
                 if not stage2_results:
                     raise Exception("All models failed to respond in Stage 2")
                 aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    stage2=stage2_results,
+                    metadata={'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}
+                )
                 yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
             except Exception as e:
-                storage.update_assistant_message(
-                    conversation_id, request.message_index,
-                    stage1=stage1_results, stage2=None, stage3=None, metadata=None,
-                    error={'stage': 2, 'message': str(e)}
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    error={'stage': 2, 'message': str(e)},
+                    streaming=False
                 )
                 yield f"data: {json.dumps({'type': 'stage2_error', 'stage': 2, 'message': str(e)})}\n\n"
                 return
@@ -470,24 +496,22 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             try:
                 stage3_result = await stage3_synthesize_final(user_message_content, stage1_results, stage2_results)
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    stage3=stage3_result,
+                    streaming=False
+                )
                 yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
             except Exception as e:
-                metadata = {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}
-                storage.update_assistant_message(
-                    conversation_id, request.message_index,
-                    stage1=stage1_results, stage2=stage2_results, stage3=None, metadata=metadata,
-                    error={'stage': 3, 'message': str(e)}
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    error={'stage': 3, 'message': str(e)},
+                    streaming=False
                 )
                 yield f"data: {json.dumps({'type': 'stage3_error', 'stage': 3, 'message': str(e)})}\n\n"
                 return
 
-            # Save complete assistant message
-            metadata = {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}
-            storage.update_assistant_message(
-                conversation_id, request.message_index,
-                stage1=stage1_results, stage2=stage2_results, stage3=stage3_result, metadata=metadata,
-                error=None
-            )
+            # Send completion event
             yield f"data: {json.dumps({'type': 'complete'})}\n\n"
 
         except Exception as e:
@@ -527,6 +551,7 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
         raise HTTPException(status_code=400, detail="Could not find corresponding user message")
 
     user_message_content = messages[user_msg_index].get("content", "")
+    msg_index = request.message_index
 
     async def event_generator():
         stage2_results = None
@@ -535,6 +560,9 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
         aggregate_rankings = None
 
         try:
+            # Mark as streaming
+            storage.update_streaming_message(conversation_id, msg_index, streaming=True)
+
             # Stage 2: Collect rankings
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
             try:
@@ -542,12 +570,17 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
                 if not stage2_results:
                     raise Exception("All models failed to respond in Stage 2")
                 aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    stage2=stage2_results,
+                    metadata={'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}
+                )
                 yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
             except Exception as e:
-                storage.update_assistant_message(
-                    conversation_id, request.message_index,
-                    stage1=stage1_results, stage2=None, stage3=None, metadata=None,
-                    error={'stage': 2, 'message': str(e)}
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    error={'stage': 2, 'message': str(e)},
+                    streaming=False
                 )
                 yield f"data: {json.dumps({'type': 'stage2_error', 'stage': 2, 'message': str(e)})}\n\n"
                 return
@@ -556,24 +589,21 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             try:
                 stage3_result = await stage3_synthesize_final(user_message_content, stage1_results, stage2_results)
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    stage3=stage3_result,
+                    streaming=False
+                )
                 yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
             except Exception as e:
-                metadata = {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}
-                storage.update_assistant_message(
-                    conversation_id, request.message_index,
-                    stage1=stage1_results, stage2=stage2_results, stage3=None, metadata=metadata,
-                    error={'stage': 3, 'message': str(e)}
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    error={'stage': 3, 'message': str(e)},
+                    streaming=False
                 )
                 yield f"data: {json.dumps({'type': 'stage3_error', 'stage': 3, 'message': str(e)})}\n\n"
                 return
 
-            # Save complete assistant message
-            metadata = {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}
-            storage.update_assistant_message(
-                conversation_id, request.message_index,
-                stage1=stage1_results, stage2=stage2_results, stage3=stage3_result, metadata=metadata,
-                error=None
-            )
             yield f"data: {json.dumps({'type': 'complete'})}\n\n"
 
         except Exception as e:
@@ -618,29 +648,31 @@ async def retry_stage3_stream(conversation_id: str, request: RetryStageRequest):
         raise HTTPException(status_code=400, detail="Could not find corresponding user message")
 
     user_message_content = messages[user_msg_index].get("content", "")
+    msg_index = request.message_index
 
     async def event_generator():
         try:
+            # Mark as streaming
+            storage.update_streaming_message(conversation_id, msg_index, streaming=True)
+
             # Stage 3: Synthesize final answer
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             try:
                 stage3_result = await stage3_synthesize_final(user_message_content, stage1_results, stage2_results)
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    stage3=stage3_result,
+                    streaming=False
+                )
                 yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
             except Exception as e:
-                storage.update_assistant_message(
-                    conversation_id, request.message_index,
-                    stage1=stage1_results, stage2=stage2_results, stage3=None, metadata=metadata,
-                    error={'stage': 3, 'message': str(e)}
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    error={'stage': 3, 'message': str(e)},
+                    streaming=False
                 )
                 yield f"data: {json.dumps({'type': 'stage3_error', 'stage': 3, 'message': str(e)})}\n\n"
                 return
-
-            # Save complete assistant message
-            storage.update_assistant_message(
-                conversation_id, request.message_index,
-                stage1=stage1_results, stage2=stage2_results, stage3=stage3_result, metadata=metadata,
-                error=None
-            )
             yield f"data: {json.dumps({'type': 'complete'})}\n\n"
 
         except Exception as e:

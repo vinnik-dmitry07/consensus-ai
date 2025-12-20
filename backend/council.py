@@ -75,6 +75,75 @@ async def stage1_collect_responses(user_query: Union[str, List[Dict]], n: int = 
     return stage1_results
 
 
+async def stage1_collect_responses_streaming(user_query: Union[str, List[Dict]], n: int = None, existing_results: List[Dict] = None):
+    """
+    Stage 1 with streaming: Collect responses and yield progress events.
+
+    Args:
+        user_query: The user's question (string or multimodal content list)
+        n: Number of samples to collect per model (default: settings.n_samples)
+        existing_results: Optional list of existing results to resume from
+
+    Yields:
+        Tuples of (event_type, event_data)
+    """
+    import asyncio
+
+    if n is None:
+        n = settings.n_samples
+
+    messages = [{"role": "user", "content": user_query}]
+
+    # Build list of expected models
+    models_expanded = []
+    for model in settings.council_models:
+        for _ in range(n):
+            models_expanded.append(model)
+
+    # Determine which models already have results
+    existing_models = set()
+    all_results = []
+    if existing_results:
+        for result in existing_results:
+            existing_models.add(result['model'])
+            all_results.append(result)
+
+    # Filter out models that already have results
+    pending_models = [m for m in models_expanded if m not in existing_models]
+
+    # Send init event
+    yield ('init', {
+        'total_models': len(models_expanded),
+        'pending_models': len(pending_models),
+        'existing_count': len(all_results)
+    })
+
+    # Replay existing results
+    for result in all_results:
+        yield ('model_complete', {'result': result, 'existing': True})
+
+    # Query pending models
+    if pending_models:
+        async def query_with_model(model):
+            response = await query_model(model, messages)
+            return model, response
+
+        tasks = [query_with_model(model) for model in pending_models]
+
+        for coro in asyncio.as_completed(tasks):
+            model, response = await coro
+            if response is not None:
+                result = {
+                    "model": model,
+                    "response": response.get('content', ''),
+                    "usage": response.get('usage', {})
+                }
+                all_results.append(result)
+                yield ('model_complete', {'result': result, 'existing': False})
+
+    yield ('all_complete', {'results': all_results})
+
+
 async def stage2_collect_rankings(
     user_query: str,
     stage1_results: List[Dict[str, Any]]
