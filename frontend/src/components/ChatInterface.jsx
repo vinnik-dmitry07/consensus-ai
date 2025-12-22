@@ -418,7 +418,7 @@ export default function ChatInterface({
                     </div>
                   )}
                   {/* Interrupted during Stage 1 - some results collected but not complete */}
-                  {msg.streaming && !msg.loading?.stage1 && !msg.stage1Progress && !msg.stage2 && !msg.error && msg.stage1?.length > 0 && (
+                  {msg.streaming && !msg.loading?.stage1 && !msg.stage1Progress && !msg.stage2 && !msg.error && msg.stage1?.length > 0 && !msg.stage1_complete && (
                     <div className="stage-interrupted">
                       <div className="interrupted-content">
                         <span className="interrupted-icon">⏸️</span>
@@ -445,6 +445,25 @@ export default function ChatInterface({
                       </div>
                     </div>
                   )}
+                  {/* Stage 1 complete but Stage 2 was interrupted */}
+                  {msg.streaming && !msg.loading?.stage2 && msg.stage1_complete && !msg.stage2 && !msg.error && (
+                    <div className="stage-interrupted">
+                      <div className="interrupted-content">
+                        <span className="interrupted-icon">⏸️</span>
+                        <div className="interrupted-details">
+                          <strong>Processing Interrupted</strong>
+                          <p>Stage 1 complete. Ready for peer rankings.</p>
+                        </div>
+                      </div>
+                      <button 
+                        className="retry-button"
+                        onClick={() => onRetryStage(index, 2)}
+                        disabled={isLoading}
+                      >
+                        Resume from Stage 2
+                      </button>
+                    </div>
+                  )}
                   {msg.error?.stage === 1 && (
                     <div className="stage-error">
                       <div className="error-content">
@@ -469,6 +488,11 @@ export default function ChatInterface({
                     <div className="stage-loading">
                       <div className="spinner"></div>
                       <span>Running Stage 2: Peer rankings...</span>
+                      {msg.stage2Progress && (
+                        <span className="progress-count">
+                          {msg.stage2Progress.completed}/{msg.stage2Progress.total}
+                        </span>
+                      )}
                     </div>
                   )}
                   {msg.stage2 && (

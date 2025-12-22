@@ -19,6 +19,7 @@ from .council import (
     stage1_collect_responses,
     stage1_collect_responses_streaming,
     stage2_collect_rankings,
+    stage2_collect_rankings_streaming,
     stage3_synthesize_final,
 )
 from .openrouter import get_credits, get_models_pricing
@@ -313,6 +314,11 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                 
                 if not stage1_results:
                     raise Exception("All models failed to respond in Stage 1")
+                # Mark stage1 as complete
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    stage1_complete=True
+                )
                 yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
             except Exception as e:
                 # Update message with error
@@ -324,11 +330,21 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                 yield f"data: {json.dumps({'type': 'stage1_error', 'stage': 1, 'message': str(e)})}\n\n"
                 return
 
-            # Stage 2: Collect rankings (text only - rankings don't need images)
+            # Stage 2: Collect rankings with streaming progress
             current_stage = 2
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
             try:
-                stage2_results, label_to_model = await stage2_collect_rankings(request.content, stage1_results)
+                stage2_results = []
+                label_to_model = {}
+                async for event_type, event_data in stage2_collect_rankings_streaming(request.content, stage1_results):
+                    if event_type == 'init':
+                        yield f"data: {json.dumps({'type': 'stage2_init', 'data': event_data})}\n\n"
+                    elif event_type == 'model_complete':
+                        yield f"data: {json.dumps({'type': 'stage2_model_complete', 'data': event_data})}\n\n"
+                    elif event_type == 'all_complete':
+                        stage2_results = event_data['results']
+                        label_to_model = event_data['label_to_model']
+
                 if not stage2_results:
                     raise Exception("All models failed to respond in Stage 2")
                 aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
@@ -460,6 +476,11 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
                 
                 if not stage1_results:
                     raise Exception("All models failed to respond in Stage 1")
+                # Mark stage1 as complete
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    stage1_complete=True
+                )
                 yield f"data: {json.dumps({'type': 'stage1_complete', 'data': stage1_results})}\n\n"
             except Exception as e:
                 storage.update_streaming_message(
@@ -563,10 +584,18 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
             # Mark as streaming
             storage.update_streaming_message(conversation_id, msg_index, streaming=True)
 
-            # Stage 2: Collect rankings
+            # Stage 2: Collect rankings with streaming progress
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
             try:
-                stage2_results, label_to_model = await stage2_collect_rankings(user_message_content, stage1_results)
+                async for event_type, event_data in stage2_collect_rankings_streaming(user_message_content, stage1_results):
+                    if event_type == 'init':
+                        yield f"data: {json.dumps({'type': 'stage2_init', 'data': event_data})}\n\n"
+                    elif event_type == 'model_complete':
+                        yield f"data: {json.dumps({'type': 'stage2_model_complete', 'data': event_data})}\n\n"
+                    elif event_type == 'all_complete':
+                        stage2_results = event_data['results']
+                        label_to_model = event_data['label_to_model']
+
                 if not stage2_results:
                     raise Exception("All models failed to respond in Stage 2")
                 aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)

@@ -225,6 +225,103 @@ Now provide your evaluation and ranking:"""
     return stage2_results, label_to_model
 
 
+async def stage2_collect_rankings_streaming(
+    user_query: str,
+    stage1_results: List[Dict[str, Any]]
+):
+    """
+    Stage 2 with streaming: Collect rankings and yield progress events.
+
+    Args:
+        user_query: The original user query
+        stage1_results: Results from Stage 1
+
+    Yields:
+        Tuples of (event_type, event_data)
+    """
+    import asyncio
+
+    # Create anonymized labels for responses (Response 1, Response 2, etc.)
+    labels = [str(i + 1) for i in range(len(stage1_results))]
+
+    # Create mapping from label to model name
+    label_to_model = {
+        f"Response {label}": result['model']
+        for label, result in zip(labels, stage1_results)
+    }
+
+    # Build the ranking prompt
+    responses_text = "\n\n".join([
+        f"Response {label}:\n{result['response']}"
+        for label, result in zip(labels, stage1_results)
+    ])
+
+    ranking_prompt = f"""You are evaluating different responses to the following question:
+
+Question: {user_query}
+
+Here are the responses from different models (anonymized):
+
+{responses_text}
+
+Your task:
+1. First, evaluate each response individually. For each response, explain what it does well and what it does poorly.
+2. Then, at the very end of your response, provide a final ranking.
+
+IMPORTANT: Your final ranking MUST be formatted EXACTLY as follows:
+- Start with the line "FINAL RANKING:" (all caps, with colon)
+- Then list the responses from best to worst as a numbered list
+- Each line should be: number, period, space, then ONLY the response label (e.g., "1. Response 1")
+- Do not add any other text or explanations in the ranking section
+
+Example of the correct format for your ENTIRE response:
+
+Response 1 provides good detail on X but misses Y...
+Response 2 is accurate but lacks depth on Z...
+Response 3 offers the most comprehensive answer...
+
+FINAL RANKING:
+1. Response 3
+2. Response 1
+3. Response 2
+
+Now provide your evaluation and ranking:"""
+
+    messages = [{"role": "user", "content": ranking_prompt}]
+    models = settings.council_models
+
+    # Send init event
+    yield ('init', {
+        'total_models': len(models),
+        'completed': 0
+    })
+
+    # Query models and yield progress
+    stage2_results = []
+
+    async def query_with_model(model):
+        response = await query_model(model, messages)
+        return model, response
+
+    tasks = [query_with_model(model) for model in models]
+
+    for coro in asyncio.as_completed(tasks):
+        model, response = await coro
+        if response is not None:
+            full_text = response.get('content', '')
+            parsed = parse_ranking_from_text(full_text)
+            result = {
+                "model": model,
+                "ranking": full_text,
+                "parsed_ranking": parsed,
+                "usage": response.get('usage', {})
+            }
+            stage2_results.append(result)
+            yield ('model_complete', {'result': result})
+
+    yield ('all_complete', {'results': stage2_results, 'label_to_model': label_to_model})
+
+
 async def stage3_synthesize_final(
     user_query: str,
     stage1_results: List[Dict[str, Any]],

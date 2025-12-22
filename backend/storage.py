@@ -283,7 +283,8 @@ def update_streaming_message(
     stage3: Optional[Dict[str, Any]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     error: Optional[Dict[str, Any]] = None,
-    streaming: bool = True
+    streaming: bool = True,
+    stage1_complete: bool = None
 ):
     """
     Update a streaming assistant message with stage2/stage3 results.
@@ -294,6 +295,8 @@ def update_streaming_message(
 
     message = conversation["messages"][message_index]
     
+    if stage1_complete is not None:
+        message["stage1_complete"] = stage1_complete
     if stage2 is not None:
         message["stage2"] = stage2
     if stage3 is not None:

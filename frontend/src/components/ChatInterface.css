@@ -127,6 +127,13 @@
   }
 }
 
+.progress-count {
+  margin-left: auto;
+  font-weight: 600;
+  font-style: normal;
+  color: var(--accent);
+}
+
 .input-form {
   display: flex;
   flex-direction: column;
