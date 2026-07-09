@@ -6,29 +6,58 @@ from .openrouter import query_model, query_models_parallel
 from .settings import settings
 
 
-def build_user_message(text: str, images: List[str] = None) -> Union[str, List[Dict]]:
+def format_files_for_prompt(files: List[Dict[str, str]]) -> str:
+    """Format attached text files for inclusion in LLM prompts."""
+    if not files:
+        return ''
+
+    parts = []
+    for file_info in files:
+        name = file_info.get('name', 'file')
+        content = file_info.get('content', '')
+        parts.append(f'--- Attached file: {name} ---\n{content}\n--- End of {name} ---')
+    return '\n\n'.join(parts)
+
+
+def get_effective_text(text: str, files: List[Dict[str, str]] = None) -> str:
+    """Combine user text with attached file contents for text-only stages."""
+    file_section = format_files_for_prompt(files or [])
+    if text.strip() and file_section:
+        return f'{text}\n\n{file_section}'
+    if file_section:
+        return file_section
+    return text
+
+
+def build_user_message(
+    text: str,
+    images: List[str] = None,
+    files: List[Dict[str, str]] = None,
+) -> Union[str, List[Dict]]:
     """
-    Build a user message content that can include images.
-    
+    Build a user message content that can include images and text files.
+
     Args:
         text: The text content of the message
         images: Optional list of base64 data URLs for images
-        
+        files: Optional list of dicts with 'name' and 'content' keys
+
     Returns:
         Either a simple string (no images) or a list of content parts (with images)
     """
+    effective_text = get_effective_text(text, files)
+
     if not images:
-        return text
-    
-    # Build multimodal content array
-    content = [{"type": "text", "text": text}]
-    
+        return effective_text
+
+    content = [{"type": "text", "text": effective_text}]
+
     for image_url in images:
         content.append({
             "type": "image_url",
             "image_url": {"url": image_url}
         })
-    
+
     return content
 
 

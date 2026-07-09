@@ -345,7 +345,7 @@ function App() {
     }
   };
 
-  const handleSendMessage = async (content, images = []) => {
+  const handleSendMessage = async (content, images = [], files = []) => {
     if (!currentConversation) return;
 
     setIsLoading(true);
@@ -366,7 +366,12 @@ function App() {
       }
 
       // Optimistically add user message to UI
-      const userMessage = { role: 'user', content, images: images.length > 0 ? images : undefined };
+      const userMessage = {
+        role: 'user',
+        content,
+        images: images.length > 0 ? images : undefined,
+        files: files.length > 0 ? files : undefined,
+      };
       setCurrentConversation((prev) => ({
         ...prev,
         messages: [...prev.messages, userMessage],
@@ -395,7 +400,7 @@ function App() {
 
       // Send message with streaming
       streamingConvIdRef.current = convId;
-      await api.sendMessageStream(convId, content, images, (eventType, event) => {
+      await api.sendMessageStream(convId, content, images, files, (eventType, event) => {
         handleStreamEvent(eventType, event);
       });
     } catch (error) {

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import { markdownComponents, remarkGfmPlugin } from '../markdownComponents';
 import './Stage2.css';
 
 function getLabelToDisplayName(labelToModel) {
@@ -81,7 +81,7 @@ export default function Stage2({ rankings, labelToModel, aggregateRankings }) {
           {rankings[activeTab].model}
         </div>
         <div className="ranking-content markdown-content">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>
+          <ReactMarkdown remarkPlugins={[remarkGfmPlugin]} components={markdownComponents}>
             {deAnonymizeText(rankings[activeTab].ranking, labelToDisplayName)}
           </ReactMarkdown>
         </div>

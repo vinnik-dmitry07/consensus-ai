@@ -15,6 +15,7 @@ from .council import (
     build_user_message,
     calculate_aggregate_rankings,
     generate_conversation_title,
+    get_effective_text,
     run_full_council,
     stage1_collect_responses,
     stage1_collect_responses_streaming,
@@ -42,10 +43,17 @@ class CreateConversationRequest(BaseModel):
     pass
 
 
+class FileAttachment(BaseModel):
+    """A text file attached to a message."""
+    name: str
+    content: str
+
+
 class SendMessageRequest(BaseModel):
     """Request to send a message in a conversation."""
     content: str
     images: List[str] = []  # List of base64 data URLs (e.g., "data:image/jpeg;base64,...")
+    files: List[FileAttachment] = []
 
 
 class ConversationMetadata(BaseModel):
@@ -62,6 +70,10 @@ class Conversation(BaseModel):
     created_at: str
     title: str
     messages: List[Dict[str, Any]]
+
+
+def _files_to_dicts(files: List[FileAttachment]) -> List[Dict[str, str]]:
+    return [{"name": f.name, "content": f.content} for f in files]
 
 
 @app.get("/")
@@ -226,14 +238,16 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
     is_first_message = len(conversation["messages"]) == 0
 
     # Add user message
-    storage.add_user_message(conversation_id, request.content, request.images)
+    files = _files_to_dicts(request.files)
+    storage.add_user_message(conversation_id, request.content, request.images, files)
 
     # Build the message content for the API
-    user_message = build_user_message(request.content, request.images)
+    user_message = build_user_message(request.content, request.images, files)
+    query_text = get_effective_text(request.content, files)
 
     # If this is the first message, generate a title
     if is_first_message:
-        title = await generate_conversation_title(request.content)
+        title = await generate_conversation_title(query_text)
         storage.update_conversation_title(conversation_id, title)
 
     # Run the 3-stage council process
@@ -284,18 +298,20 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
 
         try:
             # Add user message
-            storage.add_user_message(conversation_id, request.content, request.images)
+            files = _files_to_dicts(request.files)
+            storage.add_user_message(conversation_id, request.content, request.images, files)
 
             # Create empty assistant message for streaming (saved to disk immediately)
             msg_index = storage.create_streaming_assistant_message(conversation_id)
 
             # Build the message content for the API
-            user_message = build_user_message(request.content, request.images)
+            user_message = build_user_message(request.content, request.images, files)
+            query_text = get_effective_text(request.content, files)
 
             # Start title generation in parallel (don't await yet)
             title_task = None
             if is_first_message:
-                title_task = asyncio.create_task(generate_conversation_title(request.content))
+                title_task = asyncio.create_task(generate_conversation_title(query_text))
 
             # Stage 1: Collect responses with streaming progress
             current_stage = 1
@@ -336,7 +352,7 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             try:
                 stage2_results = []
                 label_to_model = {}
-                async for event_type, event_data in stage2_collect_rankings_streaming(request.content, stage1_results):
+                async for event_type, event_data in stage2_collect_rankings_streaming(query_text, stage1_results):
                     if event_type == 'init':
                         yield f"data: {json.dumps({'type': 'stage2_init', 'data': event_data})}\n\n"
                     elif event_type == 'model_complete':
@@ -368,7 +384,7 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             current_stage = 3
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             try:
-                stage3_result = await stage3_synthesize_final(request.content, stage1_results, stage2_results)
+                stage3_result = await stage3_synthesize_final(query_text, stage1_results, stage2_results)
                 # Save stage3 and mark streaming complete
                 storage.update_streaming_message(
                     conversation_id, msg_index,
@@ -438,7 +454,9 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
 
     user_message_content = messages[user_msg_index].get("content", "")
     user_images = messages[user_msg_index].get("images", [])
-    user_message = build_user_message(user_message_content, user_images)
+    user_files = messages[user_msg_index].get("files", [])
+    user_message = build_user_message(user_message_content, user_images, user_files)
+    query_text = get_effective_text(user_message_content, user_files)
 
     msg_index = request.message_index
     
@@ -494,7 +512,7 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
             # Stage 2: Collect rankings
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
             try:
-                stage2_results, label_to_model = await stage2_collect_rankings(user_message_content, stage1_results)
+                stage2_results, label_to_model = await stage2_collect_rankings(query_text, stage1_results)
                 if not stage2_results:
                     raise Exception("All models failed to respond in Stage 2")
                 aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
@@ -516,7 +534,7 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
             # Stage 3: Synthesize final answer
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             try:
-                stage3_result = await stage3_synthesize_final(user_message_content, stage1_results, stage2_results)
+                stage3_result = await stage3_synthesize_final(query_text, stage1_results, stage2_results)
                 storage.update_streaming_message(
                     conversation_id, msg_index,
                     stage3=stage3_result,
@@ -572,6 +590,8 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
         raise HTTPException(status_code=400, detail="Could not find corresponding user message")
 
     user_message_content = messages[user_msg_index].get("content", "")
+    user_files = messages[user_msg_index].get("files", [])
+    query_text = get_effective_text(user_message_content, user_files)
     msg_index = request.message_index
 
     async def event_generator():
@@ -587,7 +607,7 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
             # Stage 2: Collect rankings with streaming progress
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
             try:
-                async for event_type, event_data in stage2_collect_rankings_streaming(user_message_content, stage1_results):
+                async for event_type, event_data in stage2_collect_rankings_streaming(query_text, stage1_results):
                     if event_type == 'init':
                         yield f"data: {json.dumps({'type': 'stage2_init', 'data': event_data})}\n\n"
                     elif event_type == 'model_complete':
@@ -617,7 +637,7 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
             # Stage 3: Synthesize final answer
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             try:
-                stage3_result = await stage3_synthesize_final(user_message_content, stage1_results, stage2_results)
+                stage3_result = await stage3_synthesize_final(query_text, stage1_results, stage2_results)
                 storage.update_streaming_message(
                     conversation_id, msg_index,
                     stage3=stage3_result,
@@ -677,6 +697,8 @@ async def retry_stage3_stream(conversation_id: str, request: RetryStageRequest):
         raise HTTPException(status_code=400, detail="Could not find corresponding user message")
 
     user_message_content = messages[user_msg_index].get("content", "")
+    user_files = messages[user_msg_index].get("files", [])
+    query_text = get_effective_text(user_message_content, user_files)
     msg_index = request.message_index
 
     async def event_generator():
@@ -687,7 +709,7 @@ async def retry_stage3_stream(conversation_id: str, request: RetryStageRequest):
             # Stage 3: Synthesize final answer
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             try:
-                stage3_result = await stage3_synthesize_final(user_message_content, stage1_results, stage2_results)
+                stage3_result = await stage3_synthesize_final(query_text, stage1_results, stage2_results)
                 storage.update_streaming_message(
                     conversation_id, msg_index,
                     stage3=stage3_result,

@@ -112,7 +112,12 @@ def list_conversations() -> List[Dict[str, Any]]:
     return conversations
 
 
-def add_user_message(conversation_id: str, content: str, images: List[str] = None):
+def add_user_message(
+    conversation_id: str,
+    content: str,
+    images: List[str] = None,
+    files: List[Dict[str, str]] = None,
+):
     """
     Add a user message to a conversation.
 
@@ -120,6 +125,7 @@ def add_user_message(conversation_id: str, content: str, images: List[str] = Non
         conversation_id: Conversation identifier
         content: User message content
         images: Optional list of base64 image data URLs
+        files: Optional list of attached text files with name and content
     """
     conversation = get_conversation(conversation_id)
     if conversation is None:
@@ -129,9 +135,12 @@ def add_user_message(conversation_id: str, content: str, images: List[str] = Non
         "role": "user",
         "content": content
     }
-    
+
     if images:
         message["images"] = images
+
+    if files:
+        message["files"] = files
 
     conversation["messages"].append(message)
 

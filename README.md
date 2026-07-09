@@ -1,38 +1,76 @@
-# LLM Council
+# consensus.ai
 
-![llmcouncil](header.jpg)
+**Search Wide** — a local web app where multiple LLMs answer your question, anonymously rank each other's work, and a Chairman model synthesizes the final response.
 
-The idea of this repo is that instead of asking a question to your favorite LLM provider (e.g. OpenAI GPT 5.1, Google Gemini 3.0 Pro, Anthropic Claude Sonnet 4.5, xAI Grok 4, eg.c), you can group them into your "LLM Council". This repo is a simple, local web app that essentially looks like ChatGPT except it uses OpenRouter to send your query to multiple LLMs, it then asks them to review and rank each other's work, and finally a Chairman LLM produces the final response.
+Fork of [karpathy/llm-council](https://github.com/karpathy/llm-council) with a settings UI, streaming progress, reasoning modes, cost estimates, and OpenRouter credits in the sidebar.
 
-In a bit more detail, here is what happens when you submit a query:
+## How it works
 
-1. **Stage 1: First opinions**. The user query is given to all LLMs individually, and the responses are collected. The individual responses are shown in a "tab view", so that the user can inspect them all one by one.
-2. **Stage 2: Review**. Each individual LLM is given the responses of the other LLMs. Under the hood, the LLM identities are anonymized so that the LLM can't play favorites when judging their outputs. The LLM is asked to rank them in accuracy and insight.
-3. **Stage 3: Final response**. The designated Chairman of the LLM Council takes all of the model's responses and compiles them into a single final answer that is presented to the user.
+1. **Stage 1: First opinions** — Your query goes to every council model in parallel. With `N_SAMPLES > 1`, each model can produce multiple independent answers. Responses appear in a tab view.
+2. **Stage 2: Peer review** — Each model evaluates anonymized responses (`Response A`, `Response B`, …) and ranks them. The UI shows raw evaluations, parsed rankings, and aggregate scores.
+3. **Stage 3: Final answer** — The Chairman reads all responses and rankings, then produces a synthesized answer.
 
-## Vibe Code Alert
+## Screenshots
 
-This project was 99% vibe coded as a fun Saturday hack because I wanted to explore and evaluate a number of LLMs side by side in the process of [reading books together with LLMs](https://x.com/karpathy/status/1990577951671509438). It's nice and useful to see multiple responses side by side, and also the cross-opinions of all LLMs on each other's outputs. I'm not going to support it in any way, it's provided here as is for other people's inspiration and I don't intend to improve it. Code is ephemeral now and libraries are over, ask your LLM to change it in whatever way you like.
+### 1. Ask a question
+![Ask a question](assets/1.png)
+
+### 2. Stage 1 — individual model responses
+![Stage 1 individual responses](assets/2.png)
+
+### 3. Stage 2 — raw peer evaluations
+![Stage 2 raw evaluations](assets/3.png)
+
+### 4. Stage 2 — extracted and aggregate rankings
+![Stage 2 aggregate rankings](assets/4.png)
+
+### 5. Stage 3 — final council answer
+![Stage 3 final answer](assets/5.png)
+
+### 6. Settings — council models
+![Settings council models](assets/6.png)
+
+### 7. Settings — chairman model
+![Settings chairman model](assets/7.png)
+
+### 8. Token usage breakdown
+![Token usage breakdown](assets/8.png)
+
+## Features
+
+- **Settings UI** — Pick council models, chairman, samples per model, and API key without editing code
+- **Reasoning modes** — Each model supports **Base**, **R** (medium reasoning), and **R+** (high reasoning) via `-reasoning` / `-reasoning-high` suffixes
+- **Quick presets** — Top 10 Free and Top 8 Paid model shortcuts in Settings
+- **Streaming** — Live progress during Stage 1–3; resume interrupted runs from where they stopped
+- **Cost estimate** — Estimated OpenRouter cost shown before you send (based on council + chairman pricing)
+- **Credits display** — OpenRouter balance in the sidebar
+- **Attachments** — Paste or attach images and small text files with your prompt
+- **Dark mode** — Toggle in the sidebar
 
 ## Setup
 
-### 1. Install Dependencies
+### 1. Install dependencies
 
-The project uses [uv](https://docs.astral.sh/uv/) for project management.
+**Backend** (Python 3.10+):
 
-**Backend:**
 ```bash
+# Option A: uv
 uv sync
+
+# Option B: local venv
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install "fastapi>=0.115.0" "uvicorn[standard]>=0.32.0" "python-dotenv>=1.0.0" "httpx>=0.27.0" "pydantic>=2.9.0"
 ```
 
 **Frontend:**
+
 ```bash
 cd frontend
 npm install
 cd ..
 ```
 
-### 2. Configure API Key
+### 2. Configure API key
 
 Create a `.env` file in the project root:
 
@@ -40,48 +78,59 @@ Create a `.env` file in the project root:
 OPENROUTER_API_KEY=sk-or-v1-...
 ```
 
-Get your API key at [openrouter.ai](https://openrouter.ai/). Make sure to purchase the credits you need, or sign up for automatic top up.
+Get your key at [openrouter.ai](https://openrouter.ai/). You can also set or update the key in **Settings** at runtime (stored in memory until the backend restarts).
 
-### 3. Configure Models (Optional)
+### 3. Configure models (optional)
 
-Edit `backend/config.py` to customize the council:
+Defaults live in `backend/config.py`. You can also change everything in the Settings UI without restarting.
 
 ```python
 COUNCIL_MODELS = [
-    "openai/gpt-5.1",
-    "google/gemini-3-pro-preview",
-    "anthropic/claude-sonnet-4.5",
-    "x-ai/grok-4",
+    "openai/gpt-5.5",
+    "google/gemini-3.1-pro-preview",
+    "anthropic/claude-opus-4.8",
+    "x-ai/grok-4.5",
+    "openai/gpt-5.5-reasoning",
+    "google/gemini-3.1-pro-preview-reasoning",
+    "anthropic/claude-opus-4.8-reasoning",
+    "x-ai/grok-4.5-reasoning",
 ]
 
-CHAIRMAN_MODEL = "google/gemini-3-pro-preview"
+N_SAMPLES = 3
+
+CHAIRMAN_MODEL = "anthropic/claude-fable-5-reasoning-high"
 ```
 
-## Running the Application
+## Running the application
 
-**Option 1: Use the start script**
+**Terminal 1 — backend** (port **8001**, run from project root):
+
 ```bash
-./start.sh
-```
-
-**Option 2: Run manually**
-
-Terminal 1 (Backend):
-```bash
+# uv
 uv run python -m backend.main
+
+# or local venv
+.\.venv\Scripts\python.exe -m backend.main
 ```
 
-Terminal 2 (Frontend):
+**Terminal 2 — frontend** (port **5173**):
+
 ```bash
 cd frontend
 npm run dev
 ```
 
-Then open http://localhost:5173 in your browser.
+Open **http://localhost:5173** in your browser.
 
-## Tech Stack
+On Linux/macOS you can also use `./start.sh` (requires `uv` and `npm` on PATH).
 
-- **Backend:** FastAPI (Python 3.10+), async httpx, OpenRouter API
-- **Frontend:** React + Vite, react-markdown for rendering
+## Tech stack
+
+- **Backend:** FastAPI, async httpx, OpenRouter API (port 8001)
+- **Frontend:** React + Vite, react-markdown + GFM tables
 - **Storage:** JSON files in `data/conversations/`
-- **Package Management:** uv for Python, npm for JavaScript
+- **Package management:** uv or pip + `.venv` for Python, npm for JavaScript
+
+## Credits
+
+Based on [LLM Council](https://github.com/karpathy/llm-council) by Andrej Karpathy.

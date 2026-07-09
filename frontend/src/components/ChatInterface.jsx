@@ -1,11 +1,54 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import { markdownComponents, remarkGfmPlugin } from '../markdownComponents';
 import { api } from '../api';
 import Stage1 from './Stage1';
 import Stage2 from './Stage2';
 import Stage3 from './Stage3';
 import './ChatInterface.css';
+
+const MAX_FILE_SIZE = 100 * 1024;
+const MAX_ATTACHMENTS = 10;
+
+const TEXT_EXTENSIONS = new Set([
+  'txt', 'md', 'json', 'csv', 'py', 'js', 'jsx', 'ts', 'tsx',
+  'html', 'css', 'xml', 'yaml', 'yml', 'log', 'sh', 'bat',
+  'rs', 'go', 'java', 'c', 'cpp', 'h', 'sql', 'toml', 'ini',
+  'rb', 'php', 'swift', 'kt', 'r', 'lua', 'vue', 'svelte', 'env',
+  'tex', 'bib', 'sty', 'cls',
+]);
+
+const TEXT_MIME_TYPES = new Set([
+  'application/json',
+  'application/xml',
+  'application/x-tex',
+  'application/x-latex',
+  'text/x-tex',
+  'text/x-latex',
+]);
+
+const FILE_ACCEPT = [
+  'image/*',
+  ...[...TEXT_EXTENSIONS].map((ext) => `.${ext}`),
+].join(',');
+
+function isImageFile(file) {
+  return file.type.startsWith('image/');
+}
+
+function isTextFile(file) {
+  if (file.type.startsWith('text/')) return true;
+  if (TEXT_MIME_TYPES.has(file.type)) return true;
+  const ext = file.name.split('.').pop()?.toLowerCase();
+  return TEXT_EXTENSIONS.has(ext);
+}
+
+function getAttachmentText(attachments) {
+  return attachments
+    .filter((item) => item.kind === 'file')
+    .map((item) => item.content)
+    .join('');
+}
 
 // Estimate tokens from text (rough: ~4 chars per token)
 function estimateTokens(text) {
@@ -195,7 +238,7 @@ export default function ChatInterface({
   settingsVersion = 0,
 }) {
   const [input, setInput] = useState('');
-  const [attachedImages, setAttachedImages] = useState([]);
+  const [attachments, setAttachments] = useState([]);
   const [pricingData, setPricingData] = useState(null);
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -213,11 +256,13 @@ export default function ChatInterface({
     fetchPricing();
   }, [settingsVersion]);
 
-  // Calculate estimated cost when input or images change
+  // Calculate estimated cost when input or attachments change
   const estimatedCost = useMemo(() => {
-    if (!input.trim() && attachedImages.length === 0) return null;
-    return calculateEstimatedCost(input, attachedImages.length, pricingData);
-  }, [input, attachedImages.length, pricingData]);
+    if (!input.trim() && attachments.length === 0) return null;
+    const textForCost = input + getAttachmentText(attachments);
+    const numImages = attachments.filter((item) => item.kind === 'image').length;
+    return calculateEstimatedCost(textForCost, numImages, pricingData);
+  }, [input, attachments, pricingData]);
 
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const [scrollDirection, setScrollDirection] = useState('down');
@@ -273,10 +318,16 @@ export default function ChatInterface({
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    if ((input.trim() || attachedImages.length > 0) && !isLoading) {
-      onSendMessage(input, attachedImages);
+    if ((input.trim() || attachments.length > 0) && !isLoading) {
+      const images = attachments
+        .filter((item) => item.kind === 'image')
+        .map((item) => item.data);
+      const files = attachments
+        .filter((item) => item.kind === 'file')
+        .map((item) => ({ name: item.name, content: item.content }));
+      onSendMessage(input, images, files);
       setInput('');
-      setAttachedImages([]);
+      setAttachments([]);
     }
   };
 
@@ -306,31 +357,54 @@ export default function ChatInterface({
     }
   };
 
-  const handleImageSelect = (e) => {
-    const files = Array.from(e.target.files);
-    if (files.length === 0) return;
-  
-    // Read all files and preserve order
-    Promise.all(
-      files
-        .filter((file) => file.type.startsWith('image/'))
-        .map((file) => {
-          return new Promise((resolve) => {
-            const reader = new FileReader();
-            reader.onload = (event) => resolve(event.target.result);
-            reader.readAsDataURL(file);
-          });
-        })
-    ).then((results) => {
-      setAttachedImages((prev) => [...prev, ...results]);
-    });
-  
-    // Clear the input so the same file can be selected again
+  const handleFileSelect = async (e) => {
+    const selectedFiles = Array.from(e.target.files);
+    if (selectedFiles.length === 0) return;
+
+    const remainingSlots = MAX_ATTACHMENTS - attachments.length;
+    if (remainingSlots <= 0) {
+      alert(`Maximum ${MAX_ATTACHMENTS} attachments allowed.`);
+      e.target.value = '';
+      return;
+    }
+
+    const newAttachments = [];
+
+    for (const file of selectedFiles.slice(0, remainingSlots)) {
+      if (file.size > MAX_FILE_SIZE) {
+        alert(`"${file.name}" is too large. Maximum size is 100 KB.`);
+        continue;
+      }
+
+      if (isImageFile(file)) {
+        const data = await new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onload = (event) => resolve(event.target.result);
+          reader.readAsDataURL(file);
+        });
+        newAttachments.push({ kind: 'image', data });
+      } else if (isTextFile(file)) {
+        const content = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = (event) => resolve(event.target.result);
+          reader.onerror = () => reject(new Error(`Failed to read ${file.name}`));
+          reader.readAsText(file);
+        });
+        newAttachments.push({ kind: 'file', name: file.name, content });
+      } else {
+        alert(`"${file.name}" is not a supported file type.`);
+      }
+    }
+
+    if (newAttachments.length > 0) {
+      setAttachments((prev) => [...prev, ...newAttachments]);
+    }
+
     e.target.value = '';
   };
 
-  const removeImage = (index) => {
-    setAttachedImages((prev) => prev.filter((_, i) => i !== index));
+  const removeAttachment = (index) => {
+    setAttachments((prev) => prev.filter((_, i) => i !== index));
   };
 
   const triggerFileInput = () => {
@@ -375,8 +449,17 @@ export default function ChatInterface({
                         ))}
                       </div>
                     )}
+                    {msg.files && msg.files.length > 0 && (
+                      <div className="message-files">
+                        {msg.files.map((file, fileIndex) => (
+                          <span key={fileIndex} className="message-file-chip">
+                            📄 {file.name}
+                          </span>
+                        ))}
+                      </div>
+                    )}
                     <div className="markdown-content">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+                      <ReactMarkdown remarkPlugins={[remarkGfmPlugin]} components={markdownComponents}>{msg.content}</ReactMarkdown>
                     </div>
                   </div>
                 </div>
@@ -648,9 +731,16 @@ export default function ChatInterface({
                 <div className="cost-stage-tokens">
                   Est. tokens: {estimatedCost.estimatedTokens.stage3.prompt.toLocaleString()} prompt + {estimatedCost.estimatedTokens.stage3.completion.toLocaleString()} completion
                 </div>
-                {attachedImages.length > 0 && (
+                {attachments.filter((item) => item.kind === 'image').length > 0 && (
                   <div className="cost-note">
-                    📷 {attachedImages.length} image{attachedImages.length > 1 ? 's' : ''} included in cost
+                    📷 {attachments.filter((item) => item.kind === 'image').length} image
+                    {attachments.filter((item) => item.kind === 'image').length > 1 ? 's' : ''} included in cost
+                  </div>
+                )}
+                {attachments.filter((item) => item.kind === 'file').length > 0 && (
+                  <div className="cost-note">
+                    📄 {attachments.filter((item) => item.kind === 'file').length} file
+                    {attachments.filter((item) => item.kind === 'file').length > 1 ? 's' : ''} included in token estimate
                   </div>
                 )}
               </div>
@@ -658,16 +748,23 @@ export default function ChatInterface({
           )}
 
           <div className="input-container">
-            {attachedImages.length > 0 && (
-              <div className="attached-images-preview">
-                {attachedImages.map((img, index) => (
-                  <div key={index} className="preview-image-container">
-                    <img src={img} alt={`Preview ${index + 1}`} className="preview-image" />
+            {attachments.length > 0 && (
+              <div className="attached-files-preview">
+                {attachments.map((item, index) => (
+                  <div key={index} className="preview-attachment">
+                    {item.kind === 'image' ? (
+                      <img src={item.data} alt={`Preview ${index + 1}`} className="preview-image" />
+                    ) : (
+                      <div className="preview-file-chip" title={item.name}>
+                        <span className="preview-file-icon">📄</span>
+                        <span className="preview-file-name">{item.name}</span>
+                      </div>
+                    )}
                     <button
                       type="button"
-                      className="remove-image-btn"
-                      onClick={() => removeImage(index)}
-                      aria-label="Remove image"
+                      className="remove-attachment-btn"
+                      onClick={() => removeAttachment(index)}
+                      aria-label="Remove attachment"
                     >
                       ×
                     </button>
@@ -681,12 +778,10 @@ export default function ChatInterface({
                 className="attach-button"
                 onClick={triggerFileInput}
                 disabled={isLoading}
-                title="Attach images"
+                title="Attach images or text files (.tex, .md, code, etc.)"
               >
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-                  <circle cx="8.5" cy="8.5" r="1.5"/>
-                  <polyline points="21 15 16 10 5 21"/>
+                  <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
                 </svg>
               </button>
               <textarea
@@ -702,7 +797,7 @@ export default function ChatInterface({
               <button
                 type="submit"
                 className="send-button"
-                disabled={(!input.trim() && attachedImages.length === 0) || isLoading}
+                disabled={(!input.trim() && attachments.length === 0) || isLoading}
               >
                 Send
               </button>
@@ -711,9 +806,9 @@ export default function ChatInterface({
           <input
             ref={fileInputRef}
             type="file"
-            accept="image/*"
+            accept={FILE_ACCEPT}
             multiple
-            onChange={handleImageSelect}
+            onChange={handleFileSelect}
             className="hidden-file-input"
           />
         </form>

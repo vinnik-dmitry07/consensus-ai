@@ -94,11 +94,11 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
     "openai/gpt-5.2",
     "google/gemini-3-pro-preview",
     "anthropic/claude-sonnet-4.5",
-    "x-ai/grok-4",
+    "x-ai/grok-4.5",
     "openai/gpt-5.2-reasoning",
     "google/gemini-3-pro-preview-reasoning",
     "anthropic/claude-sonnet-4.5-reasoning",
-    "x-ai/grok-4-reasoning",
+    "x-ai/grok-4.5-reasoning",
   ];
 
   // Select top 10 free general-purpose models - largest of each family
@@ -135,8 +135,8 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
   // Select top 8 paid models
   const selectTopPaidModels = () => {
     setCouncilModels(TOP_8_PAID);
-    // Set chairman to GPT 5.2 with reasoning+
-    setChairmanModel('openai/gpt-5.2-reasoning-high');
+    // Set chairman to Fable 5 with reasoning+
+    setChairmanModel('anthropic/claude-fable-5-reasoning-high');
   };
 
   // Group models by provider
