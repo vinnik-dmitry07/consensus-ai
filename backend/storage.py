@@ -117,6 +117,7 @@ def add_user_message(
     content: str,
     images: List[str] = None,
     files: List[Dict[str, str]] = None,
+    follow_up_to: Optional[int] = None,
 ):
     """
     Add a user message to a conversation.
@@ -141,6 +142,9 @@ def add_user_message(
 
     if files:
         message["files"] = files
+
+    if follow_up_to is not None:
+        message["follow_up_to"] = follow_up_to
 
     conversation["messages"].append(message)
 

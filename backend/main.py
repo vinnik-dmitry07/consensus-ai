@@ -14,6 +14,7 @@ from . import storage
 from .council import (
     build_user_message,
     calculate_aggregate_rankings,
+    compose_follow_up_query,
     generate_conversation_title,
     get_effective_text,
     run_full_council,
@@ -54,6 +55,62 @@ class SendMessageRequest(BaseModel):
     content: str
     images: List[str] = []  # List of base64 data URLs (e.g., "data:image/jpeg;base64,...")
     files: List[FileAttachment] = []
+    follow_up_to_message_index: Optional[int] = None
+
+
+def _get_prior_final_answer(conversation: Dict[str, Any], message_index: int) -> str:
+    """Return the Stage 3 response to follow up on."""
+    messages = conversation.get('messages', [])
+    if message_index < 0 or message_index >= len(messages):
+        raise HTTPException(status_code=400, detail='Invalid follow-up message index')
+
+    message = messages[message_index]
+    if message.get('role') != 'assistant':
+        raise HTTPException(status_code=400, detail='Follow-up must target an assistant message')
+
+    stage3 = message.get('stage3') or {}
+    prior_answer = stage3.get('response')
+    if not prior_answer or prior_answer.startswith('Error:'):
+        raise HTTPException(status_code=400, detail='No final council answer to follow up on')
+
+    return prior_answer
+
+
+def _find_latest_follow_up_target(conversation: Dict[str, Any]) -> Optional[int]:
+    """Index of the most recent assistant message with a usable Stage 3 answer."""
+    messages = conversation.get('messages', [])
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if message.get('role') != 'assistant':
+            continue
+        stage3 = message.get('stage3') or {}
+        prior_answer = stage3.get('response')
+        if prior_answer and not prior_answer.startswith('Error:'):
+            return index
+    return None
+
+
+def _prepare_council_query(
+    conversation: Dict[str, Any],
+    content: str,
+    images: List[str],
+    files: List[Dict[str, str]],
+    follow_up_to: Optional[int],
+):
+    """Build council inputs; continuing a thread uses prior final answer + question."""
+    target = follow_up_to
+    if target is None and not images:
+        target = _find_latest_follow_up_target(conversation)
+
+    if target is not None:
+        prior_answer = _get_prior_final_answer(conversation, target)
+        follow_up_text = get_effective_text(content, files)
+        composed = compose_follow_up_query(prior_answer, follow_up_text)
+        return composed, composed, target
+
+    user_message = build_user_message(content, images, files)
+    query_text = get_effective_text(content, files)
+    return user_message, query_text, None
 
 
 class ConversationMetadata(BaseModel):
@@ -237,16 +294,26 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
     # Check if this is the first message
     is_first_message = len(conversation["messages"]) == 0
 
-    # Add user message
     files = _files_to_dicts(request.files)
-    storage.add_user_message(conversation_id, request.content, request.images, files)
+    user_message, query_text, follow_up_to = _prepare_council_query(
+        conversation,
+        request.content,
+        request.images,
+        files,
+        request.follow_up_to_message_index,
+    )
 
-    # Build the message content for the API
-    user_message = build_user_message(request.content, request.images, files)
-    query_text = get_effective_text(request.content, files)
+    # Add user message
+    storage.add_user_message(
+        conversation_id,
+        request.content,
+        request.images,
+        files,
+        follow_up_to=follow_up_to,
+    )
 
     # If this is the first message, generate a title
-    if is_first_message:
+    if is_first_message and follow_up_to is None:
         title = await generate_conversation_title(query_text)
         storage.update_conversation_title(conversation_id, title)
 
@@ -297,20 +364,30 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
         msg_index = None
 
         try:
-            # Add user message
             files = _files_to_dicts(request.files)
-            storage.add_user_message(conversation_id, request.content, request.images, files)
+            user_message, query_text, follow_up_to = _prepare_council_query(
+                conversation,
+                request.content,
+                request.images,
+                files,
+                request.follow_up_to_message_index,
+            )
+
+            # Add user message
+            storage.add_user_message(
+                conversation_id,
+                request.content,
+                request.images,
+                files,
+                follow_up_to=follow_up_to,
+            )
 
             # Create empty assistant message for streaming (saved to disk immediately)
             msg_index = storage.create_streaming_assistant_message(conversation_id)
 
-            # Build the message content for the API
-            user_message = build_user_message(request.content, request.images, files)
-            query_text = get_effective_text(request.content, files)
-
             # Start title generation in parallel (don't await yet)
             title_task = None
-            if is_first_message:
+            if is_first_message and follow_up_to is None:
                 title_task = asyncio.create_task(generate_conversation_title(query_text))
 
             # Stage 1: Collect responses with streaming progress

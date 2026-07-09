@@ -256,6 +256,11 @@ export default function ChatInterface({
     fetchPricing();
   }, [settingsVersion]);
 
+  useEffect(() => {
+    setInput('');
+    setAttachments([]);
+  }, [conversation?.id]);
+
   // Calculate estimated cost when input or attachments change
   const estimatedCost = useMemo(() => {
     if (!input.trim() && attachments.length === 0) return null;
@@ -272,10 +277,10 @@ export default function ChatInterface({
   const scrollDirRef = useRef('down');
 
   const scrollTo = () => {
-    if (scrollDirection === 'down') {
-      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    } else {
+    if (scrollDirRef.current === 'up') {
       containerRef.current?.scrollTo({ top: 0, behavior: 'smooth' });
+    } else {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }
   };
 
@@ -424,6 +429,7 @@ export default function ChatInterface({
 
   return (
     <div className="chat-interface">
+      <div className="messages-area">
       <div className="messages-container" ref={containerRef} onScroll={handleScroll}>
         {conversation.messages.length === 0 ? (
           <div className="empty-state">
@@ -688,19 +694,20 @@ export default function ChatInterface({
         <div ref={messagesEndRef} data-scroll-anchor />
       </div>
 
-      <button 
-        className={`scroll-to-bottom-btn ${showScrollBtn ? 'visible' : ''}`} 
-        onClick={scrollTo} 
-        title={scrollDirection === 'down' ? 'Scroll to bottom' : 'Scroll to top'}
-        style={{ opacity: showScrollBtn ? 1 : 0, pointerEvents: showScrollBtn ? 'auto' : 'none' }}
-      >
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ transform: scrollDirection === 'up' ? 'rotate(180deg)' : 'none' }}>
-          <polyline points="6 9 12 15 18 9"/>
-        </svg>
-      </button>
+        <button
+          type="button"
+          className={`scroll-to-bottom-btn ${showScrollBtn ? 'visible' : ''}`}
+          onClick={scrollTo}
+          title={scrollDirection === 'down' ? 'Scroll to bottom' : 'Scroll to top'}
+          style={{ opacity: showScrollBtn ? 1 : 0, pointerEvents: showScrollBtn ? 'auto' : 'none' }}
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ transform: scrollDirection === 'up' ? 'rotate(180deg)' : 'none' }}>
+            <polyline points="6 9 12 15 18 9"/>
+          </svg>
+        </button>
+      </div>
 
-      {conversation.messages.length === 0 && (
-        <form className="input-form" onSubmit={handleSubmit}>
+      <form className="input-form" onSubmit={handleSubmit}>
           {/* Cost Estimate Display */}
           {estimatedCost && (
             <div className="cost-estimate">
@@ -812,7 +819,6 @@ export default function ChatInterface({
             className="hidden-file-input"
           />
         </form>
-      )}
     </div>
   );
 }

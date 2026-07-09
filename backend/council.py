@@ -29,6 +29,14 @@ def get_effective_text(text: str, files: List[Dict[str, str]] = None) -> str:
     return text
 
 
+def compose_follow_up_query(prior_answer: str, follow_up: str) -> str:
+    """Build council input when continuing an existing thread."""
+    return (
+        f'Previous council answer:\n\n{prior_answer}\n\n'
+        f'User message:\n\n{follow_up}'
+    )
+
+
 def build_user_message(
     text: str,
     images: List[str] = None,

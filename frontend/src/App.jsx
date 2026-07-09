@@ -345,7 +345,11 @@ function App() {
     }
   };
 
-  const handleSendMessage = async (content, images = [], files = []) => {
+  const handleSendMessage = async (
+    content,
+    images = [],
+    files = [],
+  ) => {
     if (!currentConversation) return;
 
     setIsLoading(true);
@@ -400,9 +404,15 @@ function App() {
 
       // Send message with streaming
       streamingConvIdRef.current = convId;
-      await api.sendMessageStream(convId, content, images, files, (eventType, event) => {
-        handleStreamEvent(eventType, event);
-      });
+      await api.sendMessageStream(
+        convId,
+        content,
+        images,
+        files,
+        (eventType, event) => {
+          handleStreamEvent(eventType, event);
+        },
+      );
     } catch (error) {
       console.error('Failed to send message:', error);
       // Remove optimistic messages on error

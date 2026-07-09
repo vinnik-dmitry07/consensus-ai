@@ -91,14 +91,14 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
 
   // Top 8 paid models (from config.py defaults)
   const TOP_8_PAID = [
-    "openai/gpt-5.2",
-    "google/gemini-3-pro-preview",
-    "anthropic/claude-sonnet-4.5",
-    "x-ai/grok-4.5",
-    "openai/gpt-5.2-reasoning",
-    "google/gemini-3-pro-preview-reasoning",
-    "anthropic/claude-sonnet-4.5-reasoning",
-    "x-ai/grok-4.5-reasoning",
+    'openai/gpt-5.5',
+    'google/gemini-3.1-pro-preview',
+    'anthropic/claude-opus-4.8',
+    'x-ai/grok-4.5',
+    'openai/gpt-5.5-reasoning',
+    'google/gemini-3.1-pro-preview-reasoning',
+    'anthropic/claude-opus-4.8-reasoning',
+    'x-ai/grok-4.5-reasoning',
   ];
 
   // Select top 10 free general-purpose models - largest of each family
@@ -135,7 +135,7 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
   // Select top 8 paid models
   const selectTopPaidModels = () => {
     setCouncilModels(TOP_8_PAID);
-    // Set chairman to Fable 5 with reasoning+
+    setNSamples(3);
     setChairmanModel('anthropic/claude-fable-5-reasoning-high');
   };
 
