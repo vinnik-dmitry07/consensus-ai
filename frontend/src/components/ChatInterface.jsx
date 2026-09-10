@@ -5,6 +5,7 @@ import { api } from '../api';
 import Stage1 from './Stage1';
 import Stage2 from './Stage2';
 import Stage3 from './Stage3';
+import CopyButton from './CopyButton';
 import './ChatInterface.css';
 
 const MAX_FILE_SIZE = 100 * 1024;
@@ -60,11 +61,20 @@ function estimateTokens(text) {
 function calculateEstimatedCost(inputText, numImages, pricingData) {
   if (!pricingData || !pricingData.pricing) return null;
 
-  const { council_models, chairman_model, pricing, n_samples = 1 } = pricingData;
+  const {
+    council_models,
+    chairman_model,
+    pricing,
+    n_samples = 1,
+    top_k = 3,
+    self_exclusion = true,
+    red_team_model,
+  } = pricingData;
   
   const inputTokens = estimateTokens(inputText);
   const numModels = council_models.length;
   const totalStage1Responses = n_samples * numModels;
+  const topK = Math.max(1, Math.min(top_k, totalStage1Responses || 1));
   
   // Estimation constants - calibrated from actual usage data
   const avgResponseTokens = 2500;       // Average Stage 1 response length (actual ~2550)
@@ -73,21 +83,27 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
   const avgRankingTokens = 3000;        // Stage 2 output per model (actual ~2930)
   const stage3SystemTokens = 500;       // Chairman prompt template overhead
   const stage3OutputTokens = 2500;      // Chairman response length (actual ~2270)
+  const redTeamSystemTokens = 400;
+  const redTeamOutputTokens = 1500;
   
   // Stage 1 prompt: just user input
   const stage1PromptTokens = inputTokens;
   
-  // Stage 2 prompt: template + question + ALL Stage 1 responses (N_SAMPLES × MODELS)
-  const stage2PromptTokens = stage2SystemTokens + inputTokens + (totalStage1Responses * avgResponseTokens);
+  // Stage 2: each judge typically excludes its own family's samples
+  const othersPerJudge = self_exclusion
+    ? Math.max(1, totalStage1Responses - n_samples)
+    : totalStage1Responses;
+  const stage2PromptTokens = stage2SystemTokens + inputTokens + (othersPerJudge * avgResponseTokens);
   
-  // Stage 3 prompt: template + question + all Stage 1 responses + all Stage 2 rankings
-  const stage3PromptTokens = stage3SystemTokens + inputTokens + 
-    (totalStage1Responses * avgResponseTokens) + (numModels * avgRankingTokens);
+  // Stage 3: top-K answers + consensus/red-team overhead
+  const stage3PromptTokens = stage3SystemTokens + inputTokens + (topK * avgResponseTokens) + 800;
+  const redTeamPromptTokens = redTeamSystemTokens + inputTokens + avgResponseTokens;
   
   let totalCost = 0;
   const breakdown = {
     stage1: { models: [], total: 0, callCount: 0 },
     stage2: { models: [], total: 0, callCount: 0 },
+    redteam: { model: null, total: 0 },
     stage3: { model: null, total: 0 },
   };
 
@@ -163,6 +179,23 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
   breakdown.stage3.isReasoning = isChairmanReasoning;
   totalCost += stage3Cost;
 
+  const redTeamId = red_team_model || chairman_model;
+  const redTeamBase = redTeamId.replace('-reasoning-high', '').replace('-reasoning', '');
+  const isRedTeamReasoning = redTeamId.includes('reasoning');
+  const redTeamPricing = pricing[redTeamBase]?.pricing || {};
+  const redPromptPrice = parseFloat(redTeamPricing.prompt || '0');
+  const redCompletionPrice = parseFloat(redTeamPricing.completion || '0');
+  const redReasoningPrice = parseFloat(redTeamPricing.internal_reasoning || '0');
+  let redTeamCost = redTeamPromptTokens * redPromptPrice;
+  redTeamCost += redTeamOutputTokens * redCompletionPrice;
+  if (isRedTeamReasoning) {
+    redTeamCost += avgReasoningTokens * redReasoningPrice;
+  }
+  breakdown.redteam.model = redTeamBase;
+  breakdown.redteam.total = redTeamCost;
+  breakdown.redteam.isReasoning = isRedTeamReasoning;
+  totalCost += redTeamCost;
+
   // Store estimated tokens for debugging
   const estimatedTokens = {
     stage1: {
@@ -176,6 +209,10 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
       completionPerCall: avgRankingTokens,
       totalPrompt: stage2PromptTokens * numModels,
       totalCompletion: avgRankingTokens * numModels,
+    },
+    redteam: {
+      prompt: redTeamPromptTokens,
+      completion: redTeamOutputTokens,
     },
     stage3: {
       prompt: stage3PromptTokens,
@@ -194,6 +231,7 @@ function calculateActualUsage(msg) {
     stage1: { promptTokens: 0, completionTokens: 0, totalTokens: 0, calls: 0 },
     stage2: { promptTokens: 0, completionTokens: 0, totalTokens: 0, calls: 0 },
     stage3: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    redteam: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
   };
   
   // Stage 1 usage
@@ -226,6 +264,13 @@ function calculateActualUsage(msg) {
     usage.stage3.completionTokens = msg.stage3.usage.completion_tokens || 0;
     usage.stage3.totalTokens = msg.stage3.usage.total_tokens || 0;
   }
+
+  const redUsage = msg.metadata?.red_team?.usage;
+  if (redUsage) {
+    usage.redteam.promptTokens = redUsage.prompt_tokens || 0;
+    usage.redteam.completionTokens = redUsage.completion_tokens || 0;
+    usage.redteam.totalTokens = redUsage.total_tokens || 0;
+  }
   
   return usage;
 }
@@ -240,6 +285,7 @@ export default function ChatInterface({
   const [input, setInput] = useState('');
   const [attachments, setAttachments] = useState([]);
   const [pricingData, setPricingData] = useState(null);
+  const [costExpanded, setCostExpanded] = useState(false);
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
 
@@ -467,6 +513,9 @@ export default function ChatInterface({
                     <div className="markdown-content">
                       <ReactMarkdown remarkPlugins={[remarkGfmPlugin]} components={markdownComponents}>{msg.content}</ReactMarkdown>
                     </div>
+                    <div className="copy-row">
+                      <CopyButton text={msg.content} label="Copy message" />
+                    </div>
                   </div>
                 </div>
               ) : (
@@ -589,7 +638,17 @@ export default function ChatInterface({
                       rankings={msg.stage2}
                       labelToModel={msg.metadata?.label_to_model}
                       aggregateRankings={msg.metadata?.aggregate_rankings}
+                      responseRankings={msg.metadata?.response_rankings}
+                      topKIndices={msg.metadata?.top_k_indices}
+                      consensus={msg.metadata?.consensus}
+                      redTeam={msg.metadata?.red_team}
                     />
+                  )}
+                  {msg.loading?.redteam && (
+                    <div className="stage-loading">
+                      <div className="spinner"></div>
+                      <span>Red-team review of the leading answer...</span>
+                    </div>
                   )}
                   {msg.error?.stage === 2 && (
                     <div className="stage-error">
@@ -617,7 +676,12 @@ export default function ChatInterface({
                     </div>
                   )}
                   {msg.stage3 && !msg.stage3.response?.startsWith('Error:') && (
-                    <Stage3 finalResponse={msg.stage3} />
+                    <Stage3
+                      finalResponse={msg.stage3}
+                      consensus={msg.metadata?.consensus}
+                      labelToModel={msg.metadata?.label_to_model}
+                      topKIndices={msg.metadata?.top_k_indices}
+                    />
                   )}
                   {(msg.error?.stage === 3 || msg.stage3?.response?.startsWith('Error:')) && (
                     <div className="stage-error">
@@ -674,12 +738,16 @@ export default function ChatInterface({
                             <div>Prompt: {actualUsage.stage2.promptTokens.toLocaleString()} | Completion: {actualUsage.stage2.completionTokens.toLocaleString()}</div>
                           </div>
                           <div className="usage-stage">
+                            <strong>Red team</strong> (1 call)
+                            <div>Prompt: {actualUsage.redteam.promptTokens.toLocaleString()} | Completion: {actualUsage.redteam.completionTokens.toLocaleString()}</div>
+                          </div>
+                          <div className="usage-stage">
                             <strong>Stage 3</strong> (1 call)
                             <div>Prompt: {actualUsage.stage3.promptTokens.toLocaleString()} | Completion: {actualUsage.stage3.completionTokens.toLocaleString()}</div>
                           </div>
                           <div className="usage-total">
                             <strong>Total: </strong>
-                            {(actualUsage.stage1.totalTokens + actualUsage.stage2.totalTokens + actualUsage.stage3.totalTokens).toLocaleString()} tokens
+                            {(actualUsage.stage1.totalTokens + actualUsage.stage2.totalTokens + actualUsage.redteam.totalTokens + actualUsage.stage3.totalTokens).toLocaleString()} tokens
                           </div>
                         </div>
                       </div>
@@ -710,47 +778,62 @@ export default function ChatInterface({
       <form className="input-form" onSubmit={handleSubmit}>
           {/* Cost Estimate Display */}
           {estimatedCost && (
-            <div className="cost-estimate">
-              <div className="cost-estimate-header">
+            <div className={`cost-estimate ${costExpanded ? 'expanded' : 'collapsed'}`}>
+              <button
+                type="button"
+                className="cost-estimate-header"
+                onClick={() => setCostExpanded((prev) => !prev)}
+                aria-expanded={costExpanded}
+              >
                 <span className="cost-icon">💰</span>
                 <span className="cost-label">Estimated Cost</span>
                 <span className="cost-total">${estimatedCost.totalCost.toFixed(4)}</span>
-              </div>
-              <div className="cost-breakdown">
-                <div className="cost-stage">
-                  <span>Stage 1 ({estimatedCost.breakdown.stage1.callCount} calls)</span>
-                  <span>${estimatedCost.breakdown.stage1.total.toFixed(4)}</span>
-                </div>
-                <div className="cost-stage-tokens">
-                  Est. tokens: {estimatedCost.estimatedTokens.stage1.totalPrompt.toLocaleString()} prompt + {estimatedCost.estimatedTokens.stage1.totalCompletion.toLocaleString()} completion
-                </div>
-                <div className="cost-stage">
-                  <span>Stage 2 ({estimatedCost.breakdown.stage2.callCount} calls)</span>
-                  <span>${estimatedCost.breakdown.stage2.total.toFixed(4)}</span>
-                </div>
-                <div className="cost-stage-tokens">
-                  Est. tokens: {estimatedCost.estimatedTokens.stage2.totalPrompt.toLocaleString()} prompt + {estimatedCost.estimatedTokens.stage2.totalCompletion.toLocaleString()} completion
-                </div>
-                <div className="cost-stage">
-                  <span>Stage 3 (1 call)</span>
-                  <span>${estimatedCost.breakdown.stage3.total.toFixed(4)}</span>
-                </div>
-                <div className="cost-stage-tokens">
-                  Est. tokens: {estimatedCost.estimatedTokens.stage3.prompt.toLocaleString()} prompt + {estimatedCost.estimatedTokens.stage3.completion.toLocaleString()} completion
-                </div>
-                {attachments.filter((item) => item.kind === 'image').length > 0 && (
-                  <div className="cost-note">
-                    📷 {attachments.filter((item) => item.kind === 'image').length} image
-                    {attachments.filter((item) => item.kind === 'image').length > 1 ? 's' : ''} included in cost
+                <span className="cost-chevron" aria-hidden="true">{costExpanded ? '▾' : '▸'}</span>
+              </button>
+              {costExpanded && (
+                <div className="cost-breakdown">
+                  <div className="cost-stage">
+                    <span>Stage 1 ({estimatedCost.breakdown.stage1.callCount} calls)</span>
+                    <span>${estimatedCost.breakdown.stage1.total.toFixed(4)}</span>
                   </div>
-                )}
-                {attachments.filter((item) => item.kind === 'file').length > 0 && (
-                  <div className="cost-note">
-                    📄 {attachments.filter((item) => item.kind === 'file').length} file
-                    {attachments.filter((item) => item.kind === 'file').length > 1 ? 's' : ''} included in token estimate
+                  <div className="cost-stage-tokens">
+                    Est. tokens: {estimatedCost.estimatedTokens.stage1.totalPrompt.toLocaleString()} prompt + {estimatedCost.estimatedTokens.stage1.totalCompletion.toLocaleString()} completion
                   </div>
-                )}
-              </div>
+                  <div className="cost-stage">
+                    <span>Stage 2 ({estimatedCost.breakdown.stage2.callCount} calls)</span>
+                    <span>${estimatedCost.breakdown.stage2.total.toFixed(4)}</span>
+                  </div>
+                  <div className="cost-stage-tokens">
+                    Est. tokens: {estimatedCost.estimatedTokens.stage2.totalPrompt.toLocaleString()} prompt + {estimatedCost.estimatedTokens.stage2.totalCompletion.toLocaleString()} completion
+                  </div>
+                  <div className="cost-stage">
+                    <span>Red team (1 call)</span>
+                    <span>${estimatedCost.breakdown.redteam.total.toFixed(4)}</span>
+                  </div>
+                  <div className="cost-stage-tokens">
+                    Est. tokens: {estimatedCost.estimatedTokens.redteam.prompt.toLocaleString()} prompt + {estimatedCost.estimatedTokens.redteam.completion.toLocaleString()} completion
+                  </div>
+                  <div className="cost-stage">
+                    <span>Stage 3 (1 call)</span>
+                    <span>${estimatedCost.breakdown.stage3.total.toFixed(4)}</span>
+                  </div>
+                  <div className="cost-stage-tokens">
+                    Est. tokens: {estimatedCost.estimatedTokens.stage3.prompt.toLocaleString()} prompt + {estimatedCost.estimatedTokens.stage3.completion.toLocaleString()} completion
+                  </div>
+                  {attachments.filter((item) => item.kind === 'image').length > 0 && (
+                    <div className="cost-note">
+                      📷 {attachments.filter((item) => item.kind === 'image').length} image
+                      {attachments.filter((item) => item.kind === 'image').length > 1 ? 's' : ''} included in cost
+                    </div>
+                  )}
+                  {attachments.filter((item) => item.kind === 'file').length > 0 && (
+                    <div className="cost-note">
+                      📄 {attachments.filter((item) => item.kind === 'file').length} file
+                      {attachments.filter((item) => item.kind === 'file').length > 1 ? 's' : ''} included in token estimate
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -791,16 +874,18 @@ export default function ChatInterface({
                   <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
                 </svg>
               </button>
-              <textarea
-                className="message-input"
-                placeholder="Ask your question... (Shift+Enter for new line, Enter to send)"
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={handleKeyDown}
-                onPaste={handlePaste}
-                disabled={isLoading}
-                rows={3}
-              />
+              <div className="message-input-wrap">
+                <textarea
+                  className="message-input"
+                  placeholder="Ask your question... (Shift+Enter for new line, Enter to send)"
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  onPaste={handlePaste}
+                  disabled={isLoading}
+                  rows={3}
+                />
+              </div>
               <button
                 type="submit"
                 className="send-button"

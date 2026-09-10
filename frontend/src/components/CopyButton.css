@@ -1,0 +1,29 @@
+.copy-button {
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.4;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+  flex-shrink: 0;
+}
+
+.copy-button:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--bg-hover);
+}
+
+.copy-button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.copy-button.copied {
+  color: var(--accent);
+  border-color: var(--accent);
+}

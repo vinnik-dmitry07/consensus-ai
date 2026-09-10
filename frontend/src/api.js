@@ -55,6 +55,9 @@ export const api = {
    * @param {string[]} [settings.council_models] - List of model IDs
    * @param {number} [settings.n_samples] - Number of samples per model
    * @param {string} [settings.chairman_model] - Chairman model ID
+   * @param {number} [settings.top_k] - Candidates passed to the chairman
+   * @param {boolean} [settings.self_exclusion] - Judges skip their own family
+   * @param {string} [settings.red_team_model] - Red-team model (empty = chairman)
    */
   async updateSettings(settings) {
     const response = await fetch(`${API_BASE}/api/settings`, {

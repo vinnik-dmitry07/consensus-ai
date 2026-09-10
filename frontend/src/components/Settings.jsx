@@ -14,6 +14,9 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
   const [nSamples, setNSamples] = useState(1);
   const [councilModels, setCouncilModels] = useState([]);
   const [chairmanModel, setChairmanModel] = useState('');
+  const [topK, setTopK] = useState(3);
+  const [selfExclusion, setSelfExclusion] = useState(true);
+  const [redTeamModel, setRedTeamModel] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [hasApiKey, setHasApiKey] = useState(false);
   const [maskedApiKey, setMaskedApiKey] = useState('');
@@ -46,6 +49,9 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
       setNSamples(settingsData.n_samples);
       setCouncilModels(settingsData.council_models);
       setChairmanModel(settingsData.chairman_model);
+      setTopK(settingsData.top_k ?? 3);
+      setSelfExclusion(settingsData.self_exclusion !== false);
+      setRedTeamModel(settingsData.red_team_model || '');
       setHasApiKey(settingsData.has_api_key || false);
       setMaskedApiKey(settingsData.masked_api_key || '');
       setApiKey(''); // Clear any previous input
@@ -89,16 +95,16 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
     return name.split('-')[0];
   };
 
-  // Top 8 paid models (from config.py defaults)
+  // Top 8 paid models (from config.py defaults; ~*-latest aliases)
   const TOP_8_PAID = [
-    'openai/gpt-5.5',
-    'google/gemini-3.1-pro-preview',
-    'anthropic/claude-opus-4.8',
-    'x-ai/grok-4.5',
-    'openai/gpt-5.5-reasoning',
-    'google/gemini-3.1-pro-preview-reasoning',
-    'anthropic/claude-opus-4.8-reasoning',
-    'x-ai/grok-4.5-reasoning',
+    '~openai/gpt-latest',
+    '~google/gemini-pro-latest',
+    '~anthropic/claude-opus-latest',
+    '~x-ai/grok-latest',
+    '~openai/gpt-latest-reasoning',
+    '~google/gemini-pro-latest-reasoning',
+    '~anthropic/claude-opus-latest-reasoning',
+    '~x-ai/grok-latest-reasoning',
   ];
 
   // Select top 10 free general-purpose models - largest of each family
@@ -136,14 +142,14 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
   const selectTopPaidModels = () => {
     setCouncilModels(TOP_8_PAID);
     setNSamples(3);
-    setChairmanModel('anthropic/claude-fable-5-reasoning-high');
+    setChairmanModel('~anthropic/claude-fable-latest-reasoning-high');
   };
 
   // Group models by provider
   const groupedModels = useMemo(() => {
     const groups = {};
     filteredModels.forEach((model) => {
-      const provider = model.id.split('/')[0] || 'other';
+      const provider = (model.id.split('/')[0] || 'other').replace(/^~/, '');
       if (!groups[provider]) {
         groups[provider] = [];
       }
@@ -223,6 +229,9 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
         n_samples: nSamples,
         council_models: councilModels,
         chairman_model: chairmanModel,
+        top_k: topK,
+        self_exclusion: selfExclusion,
+        red_team_model: redTeamModel,
       };
       // Only include API key if user entered a new one
       if (apiKey.trim()) {
@@ -252,6 +261,9 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
       setNSamples(resetSettings.n_samples);
       setCouncilModels(resetSettings.council_models);
       setChairmanModel(resetSettings.chairman_model);
+      setTopK(resetSettings.top_k ?? 3);
+      setSelfExclusion(resetSettings.self_exclusion !== false);
+      setRedTeamModel(resetSettings.red_team_model || '');
       setHasApiKey(resetSettings.has_api_key || false);
       setMaskedApiKey(resetSettings.masked_api_key || '');
       setApiKey('');
@@ -514,6 +526,69 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
                       })}
                     </div>
                   ))}
+                </div>
+              </div>
+
+              {/* Deliberation */}
+              <div className="settings-section">
+                <h3>Deliberation</h3>
+                <p className="settings-description">
+                  How rankings feed the chairman: top-K candidates, whether judges rank their own family, and who red-teams the leader.
+                </p>
+
+                <div className="deliberation-row">
+                  <label className="deliberation-label" htmlFor="top-k-input">Top-K candidates</label>
+                  <div className="n-samples-control">
+                    <button
+                      className="n-samples-btn"
+                      onClick={() => setTopK(Math.max(1, topK - 1))}
+                      disabled={topK <= 1}
+                    >
+                      −
+                    </button>
+                    <input
+                      id="top-k-input"
+                      type="number"
+                      min="1"
+                      max="10"
+                      value={topK}
+                      onChange={(e) => setTopK(Math.max(1, Math.min(10, parseInt(e.target.value, 10) || 1)))}
+                      className="n-samples-input"
+                    />
+                    <button
+                      className="n-samples-btn"
+                      onClick={() => setTopK(Math.min(10, topK + 1))}
+                      disabled={topK >= 10}
+                    >
+                      +
+                    </button>
+                  </div>
+                </div>
+
+                <label className="toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={selfExclusion}
+                    onChange={(e) => setSelfExclusion(e.target.checked)}
+                  />
+                  <span>Self-exclusion — judges do not rank their own model family</span>
+                </label>
+
+                <div className="deliberation-row">
+                  <label className="deliberation-label" htmlFor="red-team-select">Red-team model</label>
+                  <select
+                    id="red-team-select"
+                    value={redTeamModel}
+                    onChange={(e) => setRedTeamModel(e.target.value)}
+                    className="chairman-select"
+                  >
+                    <option value="">Same as chairman</option>
+                    {availableModels.map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {model.name}
+                      </option>
+                    ))}
+                  </select>
                 </div>
               </div>
 

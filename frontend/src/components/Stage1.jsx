@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { markdownComponents, remarkGfmPlugin } from '../markdownComponents';
+import CopyButton from './CopyButton';
 import './Stage1.css';
 
 export default function Stage1({ responses, progress }) {
@@ -62,6 +63,9 @@ export default function Stage1({ responses, progress }) {
             <div className="model-name">{responses[activeTab].model}</div>
             <div className="response-text markdown-content">
               <ReactMarkdown remarkPlugins={[remarkGfmPlugin]} components={markdownComponents}>{responses[activeTab].response}</ReactMarkdown>
+            </div>
+            <div className="copy-row">
+              <CopyButton text={responses[activeTab].response} label="Copy response" />
             </div>
           </div>
         </>

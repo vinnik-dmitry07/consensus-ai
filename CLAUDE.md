@@ -13,6 +13,7 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 **`config.py`**
 - Contains `COUNCIL_MODELS` (list of OpenRouter model identifiers)
 - Contains `CHAIRMAN_MODEL` (model that synthesizes final answer)
+- Contains `TOP_K`, `RED_TEAM_MODEL` (None = chairman), `SELF_EXCLUSION`
 - Uses environment variable `OPENROUTER_API_KEY` from `.env`
 - Backend runs on **port 8001** (NOT 8000 - user had another app on 8000)
 
@@ -24,33 +25,35 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 
 **`council.py`** - The Core Logic
 - `stage1_collect_responses()`: Parallel queries to all council models
-- `stage2_collect_rankings()`:
-  - Anonymizes responses as "Response A, B, C, etc."
-  - Creates `label_to_model` mapping for de-anonymization
-  - Prompts models to evaluate and rank (with strict format requirements)
-  - Returns tuple: (rankings_list, label_to_model_dict)
-  - Each ranking includes both raw text and `parsed_ranking` list
-- `stage3_synthesize_final()`: Chairman synthesizes from all responses + rankings
-- `parse_ranking_from_text()`: Extracts "FINAL RANKING:" section, handles both numbered lists and plain format
-- `calculate_aggregate_rankings()`: Computes average rank position across all peer evaluations
+- `build_judge_view()`: Per-judge candidate set — exclude own model family, then seeded shuffle (`sha256(judge + query)`)
+- `stage2_collect_rankings()`: Thin wrapper over the streaming impl
+  - Each judge gets its own anonymized `Response 1..M` labels (`label_to_index` maps to canonical Stage 1 indices)
+  - Prompt asks for correctness 0–10, issues, disputed claims, then `FINAL RANKING:`
+  - Canonical `label_to_model` stays `Response i+1` → model in Stage 1 order
+- `calculate_aggregate_rankings()`: Per-response normalized Borda + mean correctness + top-1 votes; per-model macro average
+- `red_team_review()`: Adversarial pass vs the leader (`VERDICT` / `CONFIDENCE`); non-fatal on failure
+- `compute_consensus()`: Council confidence `HIGH` / `MEDIUM` / `LOW` / `CONTESTED` (never "verified")
+- `run_post_ranking()`: Aggregation + red team + consensus used by every entry point
+- `stage3_synthesize_final()`: Chairman sees anonymized top-K only; Candidate #1 is the base draft
+- `parse_ranking_from_text()` / `parse_correctness_scores()` / `parse_issues()` / `parse_disputed_claims()`
 
 **`storage.py`**
 - JSON-based conversation storage in `data/conversations/`
 - Each conversation: `{id, created_at, messages[]}`
-- Assistant messages contain: `{role, stage1, stage2, stage3}`
-- Note: metadata (label_to_model, aggregate_rankings) is NOT persisted to storage, only returned via API
+- Assistant messages contain: `{role, stage1, stage2, stage3, metadata}`
+- Metadata persisted: `label_to_model`, `response_rankings`, `aggregate_rankings`, `top_k_indices`, `red_team`, `consensus`
 
 **`main.py`**
 - FastAPI app with CORS enabled for localhost:5173 and localhost:3000
 - POST `/api/conversations/{id}/message` returns metadata in addition to stages
-- Metadata includes: label_to_model mapping and aggregate_rankings
+- Streaming emits `redteam_start` / `redteam_complete` / `redteam_error` between Stage 2 and 3
+- Retry Stage 3 recomputes post-ranking (including red team)
 
 ### Frontend Structure (`frontend/src/`)
 
 **`App.jsx`**
 - Main orchestration: manages conversations list and current conversation
-- Handles message sending and metadata storage
-- Important: metadata is stored in the UI state for display but not persisted to backend JSON
+- Handles message sending, streaming events (including red-team), and metadata in UI state
 
 **`components/ChatInterface.jsx`**
 - Multiline textarea (3 rows, resizable)
@@ -63,14 +66,16 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 
 **`components/Stage2.jsx`**
 - **Critical Feature**: Tab view showing RAW evaluation text from each model
-- De-anonymization happens CLIENT-SIDE for display (models receive anonymous labels)
-- Shows "Extracted Ranking" below each evaluation so users can validate parsing
-- Aggregate rankings shown with average position and vote count
+- De-anonymization is CLIENT-SIDE via each judge's `label_to_index` (identity fallback for old messages)
+- Shows extracted ranking, per-response correctness, and that judge's disputed claims
+- Street Cred is a macro score + mean correctness per model
+- Top-K candidate list and council-confidence / red-team panel
 - Explanatory text clarifies that boldface model names are for readability only
 
 **`components/Stage3.jsx`**
 - Final synthesized answer from chairman
-- Green-tinted background (#f0fff0) to highlight conclusion
+- Council-confidence badge and "Based on" leader (+ remaining candidates)
+- Green-tinted background to highlight conclusion
 
 **Styling (`*.css`)**
 - Light mode theme (not dark mode)
@@ -81,22 +86,26 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 ## Key Design Decisions
 
 ### Stage 2 Prompt Format
-The Stage 2 prompt is very specific to ensure parseable output:
+The Stage 2 prompt is specific so both ranking and correctness parse reliably:
 ```
-1. Evaluate each response individually first
-2. Provide "FINAL RANKING:" header
-3. Numbered list format: "1. Response C", "2. Response A", etc.
-4. No additional text after ranking section
+1. Per-response evaluation + Correctness: N/10 + Issues
+2. DISPUTED CLAIMS: (or none) — agreement is not evidence of correctness
+3. FINAL RANKING: numbered "1. Response k" list, nothing after
 ```
 
-This strict format allows reliable parsing while still getting thoughtful evaluations.
+Self-exclusion drops the judge's own model family. Each judge sees a seeded shuffle of the remaining answers.
 
 ### De-anonymization Strategy
-- Models receive: "Response A", "Response B", etc.
-- Backend creates mapping: `{"Response A": "openai/gpt-5.1", ...}`
+- Each judge receives its own `Response 1..M` labels after shuffle
+- Stage 2 results store `label_to_index` (judge label → canonical Stage 1 index)
+- Canonical metadata mapping: `{"Response 1": "openai/gpt-latest", ...}` in Stage 1 order
 - Frontend displays model names in **bold** for readability
-- Users see explanation that original evaluation used anonymous labels
-- This prevents bias while maintaining transparency
+- Chairman prompt stays anonymized (`Candidate #1..#K`); no model names
+
+### Ranking → answer
+- Per-response score = mean normalized Borda `(M_j - pos) / (M_j - 1)`
+- Top-K (default 3) go to the chairman; #1 is the base draft
+- Red team tries to refute the leader; consensus level is shown as council confidence
 
 ### Error Handling Philosophy
 - Continue with successful responses if some models fail (graceful degradation)
@@ -129,8 +138,8 @@ Models are hardcoded in `backend/config.py`. Chairman can be same or different f
 
 1. **Module Import Errors**: Always run backend as `python -m backend.main` from project root, not from backend directory
 2. **CORS Issues**: Frontend must match allowed origins in `main.py` CORS middleware
-3. **Ranking Parse Failures**: If models don't follow format, fallback regex extracts any "Response X" patterns in order
-4. **Missing Metadata**: Metadata is ephemeral (not persisted), only available in API responses
+3. **Ranking Parse Failures**: If models don't follow format, fallback regex extracts any "Response X" patterns; if no ranking parses, Stage 1 order is used (`ranking_fallback`)
+4. **Old conversations**: UI falls back to identity label mapping and hides consensus / top-K / red-team panels when metadata is missing
 
 ## Future Enhancement Ideas
 
@@ -152,15 +161,17 @@ User Query
     ↓
 Stage 1: Parallel queries → [individual responses]
     ↓
-Stage 2: Anonymize → Parallel ranking queries → [evaluations + parsed rankings]
+Stage 2: Per-judge exclude-own-family + shuffle → grade + rank
     ↓
-Aggregate Rankings Calculation → [sorted by avg position]
+Aggregate (normalized Borda, correctness, top-1) → top-K
     ↓
-Stage 3: Chairman synthesis with full context
+Red team vs leader → council confidence (HIGH/MEDIUM/LOW/CONTESTED)
+    ↓
+Stage 3: Chairman anchored on Candidate #1 using top-K + consensus
     ↓
 Return: {stage1, stage2, stage3, metadata}
     ↓
-Frontend: Display with tabs + validation UI
+Frontend: Tabs, Street Cred, confidence badge, red-team panel
 ```
 
 The entire flow is async/parallel where possible to minimize latency.

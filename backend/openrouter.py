@@ -116,17 +116,17 @@ async def query_model(
     }
 
     base_model = model.replace('-reasoning-high', '').replace('-reasoning', '')
-    is_anthropic = base_model.startswith('anthropic/')
+    is_anthropic = base_model.lstrip('~').startswith('anthropic/')
 
     payload = {
         'model': base_model,
         'messages': messages,
     }
     if 'reasoning-high' in model:
-        # Anthropic (Mythos-class) models support a 'max' effort tier; use it for R+.
-        payload['reasoning'] = {'effort': 'max' if is_anthropic else 'high'}
+        # Anthropic supports 'xhigh' (extra high); use it for R+. Others use 'high'.
+        payload['reasoning'] = {'effort': 'xhigh' if is_anthropic else 'high'}
     elif 'reasoning' in model:
-        payload['reasoning'] = {'effort': 'medium'}
+        payload['reasoning'] = {'effort': 'high'}
 
     max_retries = 5
     for attempt in range(max_retries):

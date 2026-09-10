@@ -275,6 +275,44 @@ function App() {
         });
         break;
 
+      case 'redteam_start':
+        updateIfCurrentConv((prev) => {
+          const messages = [...prev.messages];
+          const idx = getTargetMsgIndex(prev);
+          messages[idx] = {
+            ...messages[idx],
+            loading: { ...messages[idx].loading, redteam: true },
+          };
+          return { ...prev, messages };
+        });
+        break;
+
+      case 'redteam_complete':
+        updateIfCurrentConv((prev) => {
+          const messages = [...prev.messages];
+          const idx = getTargetMsgIndex(prev);
+          messages[idx] = {
+            ...messages[idx],
+            metadata: event.metadata || messages[idx].metadata,
+            loading: { ...messages[idx].loading, redteam: false },
+          };
+          return { ...prev, messages };
+        });
+        break;
+
+      case 'redteam_error':
+        updateIfCurrentConv((prev) => {
+          const messages = [...prev.messages];
+          const idx = getTargetMsgIndex(prev);
+          messages[idx] = {
+            ...messages[idx],
+            metadata: event.metadata || messages[idx].metadata,
+            loading: { ...messages[idx].loading, redteam: false },
+          };
+          return { ...prev, messages };
+        });
+        break;
+
       case 'stage2_error':
         updateIfCurrentConv((prev) => {
           const messages = [...prev.messages];
@@ -392,6 +430,7 @@ function App() {
         loading: {
           stage1: true,  // Start with stage1 loading
           stage2: false,
+          redteam: false,
           stage3: false,
         },
       };
@@ -441,7 +480,8 @@ function App() {
           loading: {
             stage1: stage === 1,
             stage2: stage === 2,
-            stage3: stage === 3,
+            redteam: stage === 3,
+            stage3: false,
           },
         };
         return { ...prev, messages };
@@ -458,7 +498,7 @@ function App() {
         const messages = [...prev.messages];
         messages[messageIndex] = {
           ...messages[messageIndex],
-          loading: { stage1: false, stage2: false, stage3: false },
+          loading: { stage1: false, stage2: false, redteam: false, stage3: false },
           error: { stage, message: error.message },
         };
         return { ...prev, messages };

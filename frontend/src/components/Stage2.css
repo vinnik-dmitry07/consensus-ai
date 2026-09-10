@@ -118,6 +118,12 @@
   margin-bottom: 12px;
 }
 
+.stage2 .copy-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
 .ranking-content {
   color: var(--text-primary);
   line-height: 1.6;
@@ -150,4 +156,174 @@
 .rank-count {
   color: var(--text-muted);
   font-size: 12px;
+}
+
+.self-exclusion-note {
+  color: var(--text-muted);
+  font-weight: 400;
+  font-family: inherit;
+}
+
+.judge-correctness {
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.judge-disputed {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-color);
+}
+
+.judge-disputed strong {
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.judge-disputed ul {
+  margin: 8px 0 0 0;
+  padding-left: 20px;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.topk-candidates {
+  background: var(--bg-active);
+  padding: 16px;
+  border-radius: 8px;
+  margin-bottom: 20px;
+  border: 1px solid var(--border-color);
+}
+
+.topk-candidates h4 {
+  margin: 0 0 12px 0;
+  color: var(--text-primary);
+  font-size: 15px;
+}
+
+.consensus-panel {
+  padding: 16px;
+  border-radius: 8px;
+  margin-bottom: 8px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+}
+
+.consensus-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.consensus-header h4 {
+  margin: 0;
+}
+
+.confidence-badge,
+.verdict-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
+.confidence-high {
+  background: rgba(34, 197, 94, 0.15);
+  color: #16a34a;
+}
+
+.confidence-medium {
+  background: rgba(234, 179, 8, 0.18);
+  color: #ca8a04;
+}
+
+.confidence-low,
+.confidence-unknown {
+  background: rgba(249, 115, 22, 0.16);
+  color: #ea580c;
+}
+
+.confidence-contested {
+  background: rgba(239, 68, 68, 0.16);
+  color: #dc2626;
+}
+
+.consensus-leader {
+  margin: 0 0 8px 0;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.consensus-reasons {
+  margin: 0 0 12px 0;
+  padding-left: 20px;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.disputed-claims {
+  margin-bottom: 12px;
+}
+
+.disputed-claims strong {
+  font-size: 13px;
+  color: var(--accent);
+}
+
+.disputed-claims ul {
+  margin: 6px 0 0 0;
+  padding-left: 20px;
+  font-size: 13px;
+}
+
+.red-team-block {
+  border-top: 1px solid var(--border-color);
+  padding-top: 12px;
+}
+
+.red-team-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.verdict-upheld {
+  background: rgba(34, 197, 94, 0.15);
+  color: #16a34a;
+}
+
+.verdict-contested {
+  background: rgba(234, 179, 8, 0.18);
+  color: #ca8a04;
+}
+
+.verdict-refuted {
+  background: rgba(239, 68, 68, 0.16);
+  color: #dc2626;
+}
+
+.critique-toggle {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  border-radius: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.critique-toggle:hover {
+  border-color: var(--accent);
+}
+
+.red-team-critique {
+  margin-top: 10px;
 }

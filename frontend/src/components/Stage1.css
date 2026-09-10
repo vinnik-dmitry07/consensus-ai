@@ -107,6 +107,12 @@
   font-family: monospace;
 }
 
+.copy-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+
 .response-text {
   color: var(--text-primary);
   line-height: 1.6;

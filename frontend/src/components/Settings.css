@@ -683,6 +683,33 @@
   cursor: not-allowed;
 }
 
+.deliberation-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.deliberation-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--modal-text);
+}
+
+.toggle-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 16px;
+  font-size: 13px;
+  color: var(--modal-text);
+  cursor: pointer;
+}
+
+.toggle-row input {
+  margin-top: 2px;
+}
+
 /* Scrollbar styling */
 .models-list::-webkit-scrollbar,
 .settings-content::-webkit-scrollbar {

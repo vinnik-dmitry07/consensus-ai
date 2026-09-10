@@ -1,8 +1,13 @@
 """3-stage LLM Council orchestration."""
 
-from typing import Any, Dict, List, Tuple, Union
+import asyncio
+import hashlib
+import random
+import re
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from .openrouter import query_model, query_models_parallel
+from .openrouter import query_model
 from .settings import settings
 
 
@@ -58,18 +63,341 @@ def build_user_message(
     if not images:
         return effective_text
 
-    content = [{"type": "text", "text": effective_text}]
+    content = [{'type': 'text', 'text': effective_text}]
 
     for image_url in images:
         content.append({
-            "type": "image_url",
-            "image_url": {"url": image_url}
+            'type': 'image_url',
+            'image_url': {'url': image_url},
         })
 
     return content
 
 
-async def stage1_collect_responses(user_query: Union[str, List[Dict]], n: int = None) -> List[Dict[str, Any]]:
+def base_model_id(model: str) -> str:
+    """Strip reasoning suffixes so family variants share one identity."""
+    return model.replace('-reasoning-high', '').replace('-reasoning', '')
+
+
+def canonical_label_to_model(stage1_results: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Map Response i+1 labels to Stage 1 model ids (canonical order)."""
+    return {
+        f'Response {i + 1}': result['model']
+        for i, result in enumerate(stage1_results)
+    }
+
+
+def _as_int_keyed(mapping: Optional[Dict]) -> Dict[int, Any]:
+    """Coerce JSON string keys back to ints; skip unparseable keys."""
+    if not mapping:
+        return {}
+    out = {}
+    for key, value in mapping.items():
+        try:
+            out[int(key)] = value
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def build_judge_view(
+    judge_model: str,
+    stage1_results: List[Dict[str, Any]],
+    query_text: str,
+    self_exclusion: bool = None,
+) -> Dict[str, Any]:
+    """
+    Build a per-judge candidate set: exclude own family, then seeded shuffle.
+
+    Returns:
+        candidates, label_to_index (judge label -> canonical Stage 1 index),
+        self_excluded
+    """
+    if self_exclusion is None:
+        self_exclusion = settings.self_exclusion
+
+    all_indices = list(range(len(stage1_results)))
+    judge_base = base_model_id(judge_model)
+
+    if self_exclusion:
+        eligible = [
+            i for i in all_indices
+            if base_model_id(stage1_results[i]['model']) != judge_base
+        ]
+        excluded = True
+        if not eligible:
+            eligible = all_indices
+            excluded = False
+    else:
+        eligible = all_indices
+        excluded = False
+
+    seed_src = f'{judge_model}\0{query_text}'.encode('utf-8')
+    rng = random.Random(int(hashlib.sha256(seed_src).hexdigest(), 16))
+    shuffled = list(eligible)
+    rng.shuffle(shuffled)
+
+    label_to_index = {
+        f'Response {i + 1}': idx
+        for i, idx in enumerate(shuffled)
+    }
+    candidates = [
+        {
+            'label': f'Response {i + 1}',
+            'index': idx,
+            'response': stage1_results[idx].get('response', ''),
+        }
+        for i, idx in enumerate(shuffled)
+    ]
+    return {
+        'candidates': candidates,
+        'label_to_index': label_to_index,
+        'self_excluded': excluded,
+    }
+
+
+def build_stage2_prompt(query_text: str, candidates: List[Dict[str, Any]]) -> str:
+    """Structured Stage 2 prompt: correctness, issues, disputed claims, ranking."""
+    responses_text = '\n\n'.join(
+        f"{c['label']}:\n{c['response']}" for c in candidates
+    )
+    return f'''You are evaluating different responses to the following question.
+
+Question: {query_text}
+
+Here are the responses from different models (anonymized):
+
+{responses_text}
+
+Your task:
+1. Evaluate each response independently. For each one, briefly say what it does well and poorly, then give an absolute correctness score and list concrete factual or logical issues.
+2. List claims that are disputed, contradicted, or unverified across the responses. If every response shares the same error, you MUST report it — do not assume that agreement implies correctness.
+3. Then, at the very end, provide a final ranking from best to worst.
+
+IMPORTANT: Use this exact structure (markers in all caps where shown):
+
+Response 1:
+<brief evaluation>
+Correctness: 8/10
+Issues: <concrete factual/logical errors, or none>
+
+Response 2:
+<brief evaluation>
+Correctness: 5/10
+Issues: <concrete factual/logical errors, or none>
+
+(repeat for every response)
+
+DISPUTED CLAIMS:
+- <claim> (asserted by Response x, y; contradicted by / unverified)
+(or none)
+
+FINAL RANKING:
+1. Response 2
+2. Response 1
+
+Rules for FINAL RANKING:
+- Start with the line "FINAL RANKING:" (all caps, with colon)
+- Numbered list from best to worst
+- Each line: number, period, space, then ONLY the response label (e.g., "1. Response 1")
+- No extra text after the ranking section
+
+Now provide your evaluation and ranking:'''
+
+
+def parse_ranking_from_text(ranking_text: str) -> List[str]:
+    """
+    Parse the FINAL RANKING section from the model's response.
+
+    Args:
+        ranking_text: The full text response from the model
+
+    Returns:
+        List of response labels in ranked order
+    """
+    if ranking_text is None:
+        return []
+
+    if 'FINAL RANKING:' in ranking_text:
+        parts = ranking_text.split('FINAL RANKING:')
+        if len(parts) >= 2:
+            ranking_section = parts[1]
+            numbered_matches = re.findall(r'\d+\.\s*Response \d+', ranking_section)
+            if numbered_matches:
+                return [re.search(r'Response \d+', m).group() for m in numbered_matches]
+            matches = re.findall(r'Response \d+', ranking_section)
+            return matches
+
+    matches = re.findall(r'Response \d+', ranking_text)
+    return matches
+
+
+def _evaluation_section(text: str) -> str:
+    """Text before DISPUTED CLAIMS / FINAL RANKING."""
+    section = text
+    if 'DISPUTED CLAIMS:' in section:
+        section = section.split('DISPUTED CLAIMS:')[0]
+    if 'FINAL RANKING:' in section:
+        section = section.split('FINAL RANKING:')[0]
+    return section
+
+
+def _iter_response_blocks(text: str):
+    """Yield (label, block_body) for each Response N: section."""
+    section = _evaluation_section(text)
+    matches = list(re.finditer(r'Response\s+(\d+)\s*:', section))
+    for i, match in enumerate(matches):
+        label = f'Response {match.group(1)}'
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(section)
+        yield label, section[start:end]
+
+
+def parse_correctness_scores(text: str) -> Dict[str, Optional[float]]:
+    """Parse Correctness: N/10 per Response label. Missing score -> None."""
+    scores: Dict[str, Optional[float]] = {}
+    if not text:
+        return scores
+    for label, block in _iter_response_blocks(text):
+        match = re.search(
+            r'Correctness:\s*(\d+(?:\.\d+)?)\s*(?:/\s*10)?',
+            block,
+            re.IGNORECASE,
+        )
+        if match:
+            scores[label] = max(0.0, min(10.0, float(match.group(1))))
+        else:
+            scores[label] = None
+    return scores
+
+
+def parse_issues(text: str) -> Dict[str, List[str]]:
+    """Parse Issues: lines per Response label. 'none' -> []."""
+    issues: Dict[str, List[str]] = {}
+    if not text:
+        return issues
+    none_tokens = {'none', 'none.', 'n/a', 'na', '-', '—'}
+    for label, block in _iter_response_blocks(text):
+        match = re.search(r'Issues:\s*(.*)', block, re.IGNORECASE | re.DOTALL)
+        if not match:
+            issues[label] = []
+            continue
+        raw = match.group(1).strip()
+        raw = re.split(r'\n\s*\n', raw, maxsplit=1)[0].strip()
+        if not raw or raw.lower() in none_tokens:
+            issues[label] = []
+            continue
+        items = []
+        for line in re.split(r'[\n;]+', raw):
+            cleaned = line.strip().lstrip('-*•').strip()
+            if cleaned and cleaned.lower() not in none_tokens:
+                items.append(cleaned)
+        issues[label] = items
+    return issues
+
+
+def parse_disputed_claims(text: str) -> List[str]:
+    """Parse the DISPUTED CLAIMS section. 'none' -> []."""
+    if not text or 'DISPUTED CLAIMS:' not in text:
+        return []
+    section = text.split('DISPUTED CLAIMS:', 1)[1]
+    if 'FINAL RANKING:' in section:
+        section = section.split('FINAL RANKING:')[0]
+    stripped = section.strip()
+    if re.match(r'^(none|n/a|na|-|—)\.?\s*$', stripped, re.IGNORECASE):
+        return []
+    claims = []
+    none_tokens = {'none', 'none.', 'n/a', 'na', '-', '—'}
+    for line in section.splitlines():
+        cleaned = line.strip().lstrip('-*•').strip()
+        if not cleaned or cleaned.lower() in none_tokens:
+            continue
+        claims.append(cleaned)
+    return claims
+
+
+def map_ranking_to_indices(
+    parsed_labels: List[str],
+    label_to_index: Dict[str, int],
+) -> List[int]:
+    """Map judge-facing Response labels to canonical Stage 1 indices."""
+    ranked = []
+    seen = set()
+    for label in parsed_labels:
+        idx = label_to_index.get(label)
+        if idx is None:
+            continue
+        idx = int(idx)
+        if idx in seen:
+            continue
+        ranked.append(idx)
+        seen.add(idx)
+    return ranked
+
+
+def resolve_ranked_indices(ranking: Dict[str, Any]) -> List[int]:
+    """Canonical ranked indices from a Stage 2 result, with fallbacks."""
+    stored = ranking.get('ranked_indices')
+    if stored:
+        return [int(i) for i in stored]
+
+    parsed = ranking.get('parsed_ranking') or parse_ranking_from_text(
+        ranking.get('ranking', '') or ''
+    )
+    mapping = ranking.get('label_to_index') or {}
+    if mapping:
+        mapping = {k: int(v) for k, v in mapping.items()}
+        return map_ranking_to_indices(parsed, mapping)
+
+    indices = []
+    seen = set()
+    for label in parsed:
+        match = re.search(r'(\d+)', label)
+        if not match:
+            continue
+        idx = int(match.group(1)) - 1
+        if idx in seen:
+            continue
+        indices.append(idx)
+        seen.add(idx)
+    return indices
+
+
+def format_stage2_result(
+    model: str,
+    response: Dict[str, Any],
+    view: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Parse a judge reply into a Stage 2 result dict."""
+    full_text = response.get('content', '') or ''
+    parsed = parse_ranking_from_text(full_text)
+    label_to_index = view['label_to_index']
+    ranked_indices = map_ranking_to_indices(parsed, label_to_index)
+    correctness_labels = parse_correctness_scores(full_text)
+    issues_labels = parse_issues(full_text)
+    correctness = {}
+    issues = {}
+    for label, idx in label_to_index.items():
+        correctness[str(idx)] = correctness_labels.get(label)
+        issues[str(idx)] = issues_labels.get(label, [])
+    return {
+        'model': model,
+        'ranking': full_text,
+        'parsed_ranking': parsed,
+        'ranked_indices': ranked_indices,
+        'label_to_index': label_to_index,
+        'correctness': correctness,
+        'issues': issues,
+        'disputed_claims': parse_disputed_claims(full_text),
+        'self_excluded': view['self_excluded'],
+        'usage': response.get('usage', {}),
+    }
+
+
+async def stage1_collect_responses(
+    user_query: Union[str, List[Dict]],
+    n: int = None,
+) -> List[Dict[str, Any]]:
     """
     Stage 1: Collect individual responses from all council models.
 
@@ -83,10 +411,7 @@ async def stage1_collect_responses(user_query: Union[str, List[Dict]], n: int = 
     if n is None:
         n = settings.n_samples
 
-    messages = [{"role": "user", "content": user_query}]
-
-    # Create tasks for N samples per model
-    import asyncio
+    messages = [{'role': 'user', 'content': user_query}]
 
     tasks = []
     models_expanded = []
@@ -96,23 +421,25 @@ async def stage1_collect_responses(user_query: Union[str, List[Dict]], n: int = 
             tasks.append(query_model(model, messages))
             models_expanded.append(model)
 
-    # Query all models in parallel
     raw_responses = await asyncio.gather(*tasks)
 
-    # Format results
     stage1_results = []
     for model, response in zip(models_expanded, raw_responses):
-        if response is not None:  # Only include successful responses
+        if response is not None:
             stage1_results.append({
-                "model": model,
-                "response": response.get('content', ''),
-                "usage": response.get('usage', {})
+                'model': model,
+                'response': response.get('content', ''),
+                'usage': response.get('usage', {}),
             })
 
     return stage1_results
 
 
-async def stage1_collect_responses_streaming(user_query: Union[str, List[Dict]], n: int = None, existing_results: List[Dict] = None):
+async def stage1_collect_responses_streaming(
+    user_query: Union[str, List[Dict]],
+    n: int = None,
+    existing_results: List[Dict] = None,
+):
     """
     Stage 1 with streaming: Collect responses and yield progress events.
 
@@ -124,20 +451,16 @@ async def stage1_collect_responses_streaming(user_query: Union[str, List[Dict]],
     Yields:
         Tuples of (event_type, event_data)
     """
-    import asyncio
-
     if n is None:
         n = settings.n_samples
 
-    messages = [{"role": "user", "content": user_query}]
+    messages = [{'role': 'user', 'content': user_query}]
 
-    # Build list of expected models
     models_expanded = []
     for model in settings.council_models:
         for _ in range(n):
             models_expanded.append(model)
 
-    # Determine which models already have results
     existing_models = set()
     all_results = []
     if existing_results:
@@ -145,21 +468,17 @@ async def stage1_collect_responses_streaming(user_query: Union[str, List[Dict]],
             existing_models.add(result['model'])
             all_results.append(result)
 
-    # Filter out models that already have results
     pending_models = [m for m in models_expanded if m not in existing_models]
 
-    # Send init event
     yield ('init', {
         'total_models': len(models_expanded),
         'pending_models': len(pending_models),
-        'existing_count': len(all_results)
+        'existing_count': len(all_results),
     })
 
-    # Replay existing results
     for result in all_results:
         yield ('model_complete', {'result': result, 'existing': True})
 
-    # Query pending models
     if pending_models:
         async def query_with_model(model):
             response = await query_model(model, messages)
@@ -171,9 +490,9 @@ async def stage1_collect_responses_streaming(user_query: Union[str, List[Dict]],
             model, response = await coro
             if response is not None:
                 result = {
-                    "model": model,
-                    "response": response.get('content', ''),
-                    "usage": response.get('usage', {})
+                    'model': model,
+                    'response': response.get('content', ''),
+                    'usage': response.get('usage', {}),
                 }
                 all_results.append(result)
                 yield ('model_complete', {'result': result, 'existing': False})
@@ -181,323 +500,553 @@ async def stage1_collect_responses_streaming(user_query: Union[str, List[Dict]],
     yield ('all_complete', {'results': all_results})
 
 
-async def stage2_collect_rankings(
-    user_query: str,
-    stage1_results: List[Dict[str, Any]]
-) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
-    """
-    Stage 2: Each model ranks the anonymized responses.
-
-    Args:
-        user_query: The original user query
-        stage1_results: Results from Stage 1
-
-    Returns:
-        Tuple of (rankings list, label_to_model mapping)
-    """
-    # Create anonymized labels for responses (Response 1, Response 2, etc.)
-    labels = [str(i + 1) for i in range(len(stage1_results))]  # 1, 2, 3, ...
-
-    # Create mapping from label to model name
-    label_to_model = {
-        f"Response {label}": result['model']
-        for label, result in zip(labels, stage1_results)
-    }
-
-    # Build the ranking prompt
-    responses_text = "\n\n".join([
-        f"Response {label}:\n{result['response']}"
-        for label, result in zip(labels, stage1_results)
-    ])
-
-    ranking_prompt = f"""You are evaluating different responses to the following question:
-
-Question: {user_query}
-
-Here are the responses from different models (anonymized):
-
-{responses_text}
-
-Your task:
-1. First, evaluate each response individually. For each response, explain what it does well and what it does poorly.
-2. Then, at the very end of your response, provide a final ranking.
-
-IMPORTANT: Your final ranking MUST be formatted EXACTLY as follows:
-- Start with the line "FINAL RANKING:" (all caps, with colon)
-- Then list the responses from best to worst as a numbered list
-- Each line should be: number, period, space, then ONLY the response label (e.g., "1. Response 1")
-- Do not add any other text or explanations in the ranking section
-
-Example of the correct format for your ENTIRE response:
-
-Response 1 provides good detail on X but misses Y...
-Response 2 is accurate but lacks depth on Z...
-Response 3 offers the most comprehensive answer...
-
-FINAL RANKING:
-1. Response 3
-2. Response 1
-3. Response 2
-
-Now provide your evaluation and ranking:"""
-
-    messages = [{"role": "user", "content": ranking_prompt}]
-
-    # Get rankings from all council models in parallel
-    responses = await query_models_parallel(settings.council_models, messages)
-
-    # Format results
-    stage2_results = []
-    for model, response in responses.items():
-        if response is not None:
-            full_text = response.get('content', '')
-            parsed = parse_ranking_from_text(full_text)
-            stage2_results.append({
-                "model": model,
-                "ranking": full_text,
-                "parsed_ranking": parsed,
-                "usage": response.get('usage', {})
-            })
-
-    return stage2_results, label_to_model
-
-
 async def stage2_collect_rankings_streaming(
     user_query: str,
-    stage1_results: List[Dict[str, Any]]
+    stage1_results: List[Dict[str, Any]],
 ):
     """
-    Stage 2 with streaming: Collect rankings and yield progress events.
-
-    Args:
-        user_query: The original user query
-        stage1_results: Results from Stage 1
+    Stage 2 with streaming: per-judge views, then yield progress events.
 
     Yields:
         Tuples of (event_type, event_data)
     """
-    import asyncio
+    label_to_model = canonical_label_to_model(stage1_results)
+    models = list(settings.council_models)
 
-    # Create anonymized labels for responses (Response 1, Response 2, etc.)
-    labels = [str(i + 1) for i in range(len(stage1_results))]
-
-    # Create mapping from label to model name
-    label_to_model = {
-        f"Response {label}": result['model']
-        for label, result in zip(labels, stage1_results)
-    }
-
-    # Build the ranking prompt
-    responses_text = "\n\n".join([
-        f"Response {label}:\n{result['response']}"
-        for label, result in zip(labels, stage1_results)
-    ])
-
-    ranking_prompt = f"""You are evaluating different responses to the following question:
-
-Question: {user_query}
-
-Here are the responses from different models (anonymized):
-
-{responses_text}
-
-Your task:
-1. First, evaluate each response individually. For each response, explain what it does well and what it does poorly.
-2. Then, at the very end of your response, provide a final ranking.
-
-IMPORTANT: Your final ranking MUST be formatted EXACTLY as follows:
-- Start with the line "FINAL RANKING:" (all caps, with colon)
-- Then list the responses from best to worst as a numbered list
-- Each line should be: number, period, space, then ONLY the response label (e.g., "1. Response 1")
-- Do not add any other text or explanations in the ranking section
-
-Example of the correct format for your ENTIRE response:
-
-Response 1 provides good detail on X but misses Y...
-Response 2 is accurate but lacks depth on Z...
-Response 3 offers the most comprehensive answer...
-
-FINAL RANKING:
-1. Response 3
-2. Response 1
-3. Response 2
-
-Now provide your evaluation and ranking:"""
-
-    messages = [{"role": "user", "content": ranking_prompt}]
-    models = settings.council_models
-
-    # Send init event
     yield ('init', {
         'total_models': len(models),
-        'completed': 0
+        'completed': 0,
     })
 
-    # Query models and yield progress
     stage2_results = []
 
     async def query_with_model(model):
-        response = await query_model(model, messages)
-        return model, response
+        view = build_judge_view(model, stage1_results, user_query)
+        prompt = build_stage2_prompt(user_query, view['candidates'])
+        response = await query_model(model, [{'role': 'user', 'content': prompt}])
+        return model, response, view
 
     tasks = [query_with_model(model) for model in models]
 
     for coro in asyncio.as_completed(tasks):
-        model, response = await coro
+        model, response, view = await coro
         if response is not None:
-            full_text = response.get('content', '')
-            parsed = parse_ranking_from_text(full_text)
-            result = {
-                "model": model,
-                "ranking": full_text,
-                "parsed_ranking": parsed,
-                "usage": response.get('usage', {})
-            }
+            result = format_stage2_result(model, response, view)
             stage2_results.append(result)
             yield ('model_complete', {'result': result})
 
-    yield ('all_complete', {'results': stage2_results, 'label_to_model': label_to_model})
+    yield ('all_complete', {
+        'results': stage2_results,
+        'label_to_model': label_to_model,
+    })
+
+
+async def stage2_collect_rankings(
+    user_query: str,
+    stage1_results: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+    """
+    Stage 2: Each model ranks the anonymized responses.
+
+    Thin wrapper around the streaming implementation.
+
+    Returns:
+        Tuple of (rankings list, canonical label_to_model mapping)
+    """
+    stage2_results = []
+    label_to_model = canonical_label_to_model(stage1_results)
+    async for event_type, event_data in stage2_collect_rankings_streaming(
+        user_query, stage1_results
+    ):
+        if event_type == 'all_complete':
+            stage2_results = event_data['results']
+            label_to_model = event_data['label_to_model']
+    return stage2_results, label_to_model
+
+
+def calculate_aggregate_rankings(
+    stage1_results: List[Dict[str, Any]],
+    stage2_results: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], bool]:
+    """
+    Aggregate per-response and per-model scores from Stage 2.
+
+    Per-response score is the mean normalized Borda
+    (M_j - pos) / (M_j - 1) over judges with M_j >= 2.
+
+    Returns:
+        (response_rankings, aggregate_rankings, ranking_fallback)
+    """
+    n = len(stage1_results)
+    borda_scores = defaultdict(list)
+    correctness_scores = defaultdict(list)
+    merged_issues = defaultdict(list)
+    seen_issues = defaultdict(set)
+    top1_votes = defaultdict(int)
+
+    for ranking in stage2_results:
+        ranked = resolve_ranked_indices(ranking)
+        m_j = len(ranked)
+        if m_j >= 2:
+            for pos, idx in enumerate(ranked, start=1):
+                if 0 <= idx < n:
+                    borda_scores[idx].append((m_j - pos) / (m_j - 1))
+        if ranked and 0 <= ranked[0] < n:
+            top1_votes[ranked[0]] += 1
+
+        for idx, score in _as_int_keyed(ranking.get('correctness')).items():
+            if score is not None and 0 <= idx < n:
+                correctness_scores[idx].append(float(score))
+
+        for idx, items in _as_int_keyed(ranking.get('issues')).items():
+            if not items or not (0 <= idx < n):
+                continue
+            for item in items:
+                key = item.lower()
+                if key in seen_issues[idx]:
+                    continue
+                seen_issues[idx].add(key)
+                merged_issues[idx].append(item)
+
+    response_rankings = []
+    for i in range(n):
+        scores = borda_scores.get(i, [])
+        corr = correctness_scores.get(i, [])
+        response_rankings.append({
+            'index': i,
+            'model': stage1_results[i]['model'],
+            'score': round(sum(scores) / len(scores), 4) if scores else 0.0,
+            'mean_correctness': (
+                round(sum(corr) / len(corr), 2) if corr else None
+            ),
+            'votes': len(scores),
+            'top1_votes': top1_votes.get(i, 0),
+            'issues': merged_issues.get(i, []),
+        })
+
+    ranking_fallback = not any(r['votes'] > 0 for r in response_rankings)
+    if ranking_fallback:
+        response_rankings.sort(key=lambda row: row['index'])
+    else:
+        response_rankings.sort(
+            key=lambda row: (
+                -row['score'],
+                -(
+                    row['mean_correctness']
+                    if row['mean_correctness'] is not None
+                    else -1.0
+                ),
+                row['index'],
+            )
+        )
+
+    by_model = defaultdict(lambda: {'scores': [], 'correctness': []})
+    for row in response_rankings:
+        by_model[row['model']]['scores'].append(row['score'])
+        if row['mean_correctness'] is not None:
+            by_model[row['model']]['correctness'].append(row['mean_correctness'])
+
+    aggregate_rankings = []
+    for model, data in by_model.items():
+        scores = data['scores']
+        corr = data['correctness']
+        aggregate_rankings.append({
+            'model': model,
+            'score': round(sum(scores) / len(scores), 4) if scores else 0.0,
+            'mean_correctness': (
+                round(sum(corr) / len(corr), 2) if corr else None
+            ),
+            'rankings_count': len(scores),
+        })
+    aggregate_rankings.sort(
+        key=lambda row: (
+            -row['score'],
+            -(
+                row['mean_correctness']
+                if row['mean_correctness'] is not None
+                else -1.0
+            ),
+        )
+    )
+
+    return response_rankings, aggregate_rankings, ranking_fallback
+
+
+def parse_red_team_verdict(text: str) -> Tuple[str, Optional[float]]:
+    """Parse VERDICT and CONFIDENCE from a red-team reply."""
+    verdict = 'CONTESTED'
+    confidence = None
+    if not text:
+        return verdict, confidence
+    verdict_match = re.search(
+        r'VERDICT:\s*(REFUTED|CONTESTED|UPHELD)',
+        text,
+        re.IGNORECASE,
+    )
+    if verdict_match:
+        verdict = verdict_match.group(1).upper()
+    conf_match = re.search(
+        r'CONFIDENCE:\s*(\d+(?:\.\d+)?)\s*(?:/\s*10)?',
+        text,
+        re.IGNORECASE,
+    )
+    if conf_match:
+        confidence = max(0.0, min(10.0, float(conf_match.group(1))))
+    return verdict, confidence
+
+
+def _pick_red_team_model(
+    leader_model: str,
+    response_rankings: List[Dict[str, Any]],
+) -> Tuple[str, bool]:
+    """Choose a red-team model, avoiding the leader's family when possible."""
+    requested = settings.red_team_model or settings.chairman_model
+    leader_base = base_model_id(leader_model)
+    if base_model_id(requested) != leader_base:
+        return requested, False
+    for row in response_rankings:
+        candidate = row['model']
+        if base_model_id(candidate) != leader_base:
+            return candidate, False
+    return requested, True
+
+
+async def red_team_review(
+    query_text: str,
+    leader_response: str,
+    leader_index: int,
+    response_rankings: List[Dict[str, Any]],
+    stage1_results: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Adversarial review of the leading Stage 1 answer.
+
+    Failure is non-fatal: returns None.
+    """
+    if not stage1_results or leader_index < 0 or leader_index >= len(stage1_results):
+        return None
+
+    leader_model = stage1_results[leader_index]['model']
+    model, same_family = _pick_red_team_model(leader_model, response_rankings)
+
+    prompt = f'''You are an adversarial reviewer. Independently verify the following answer and try to refute it. Do not assume it is correct. Look for factual errors, logical flaws, missing caveats, and confident-but-wrong claims.
+
+Question: {query_text}
+
+Answer under review:
+{leader_response}
+
+Write a critique that attempts to refute the answer. Then end with EXACTLY these two lines:
+
+VERDICT: REFUTED | CONTESTED | UPHELD
+CONFIDENCE: <0-10>
+
+Meaning:
+- REFUTED = you found a concrete, decisive error that invalidates the main conclusion
+- CONTESTED = you found a plausible error or a serious unresolved issue, but it is not decisive
+- UPHELD = you could not find a concrete refutation
+'''
+
+    response = await query_model(model, [{'role': 'user', 'content': prompt}])
+    if response is None:
+        return None
+
+    critique = response.get('content', '') or ''
+    verdict, confidence = parse_red_team_verdict(critique)
+    return {
+        'model': model,
+        'target_index': leader_index,
+        'critique': critique,
+        'verdict': verdict,
+        'confidence': confidence,
+        'usage': response.get('usage', {}),
+        'same_family': same_family,
+    }
+
+
+def compute_consensus(
+    response_rankings: List[Dict[str, Any]],
+    stage2_results: List[Dict[str, Any]],
+    red_team: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Council confidence: HIGH / MEDIUM / LOW / CONTESTED.
+
+    Wording is confidence, never 'verified'.
+    """
+    if not response_rankings:
+        return {
+            'level': 'LOW',
+            'reasons': ['No ranked responses'],
+            'leader_index': None,
+            'leader_score': None,
+            'leader_mean_correctness': None,
+            'top1_agreement': 0.0,
+            'disputed_claims': [],
+            'red_team_verdict': None,
+        }
+
+    leader = response_rankings[0]
+    n_judges = max(len(stage2_results), 1)
+    top1_agreement = leader.get('top1_votes', 0) / n_judges
+    leader_corr = leader.get('mean_correctness')
+
+    disputed = []
+    seen = set()
+    for ranking in stage2_results:
+        for claim in ranking.get('disputed_claims') or []:
+            key = claim.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            disputed.append(claim)
+
+    verdict = (red_team or {}).get('verdict')
+    reasons = []
+
+    if red_team is None:
+        reasons.append('Red-team review was unavailable')
+
+    if verdict == 'REFUTED':
+        level = 'CONTESTED'
+        reasons.append('Red team found a decisive refutation of the leading answer')
+    elif (
+        (leader_corr is not None and leader_corr < 6)
+        or top1_agreement < 0.4
+        or verdict == 'CONTESTED'
+    ):
+        level = 'LOW'
+        if leader_corr is not None and leader_corr < 6:
+            reasons.append(
+                f'Leading answer mean correctness is {leader_corr:.1f}/10'
+            )
+        if top1_agreement < 0.4:
+            reasons.append(f'Top-1 agreement is {top1_agreement:.0%}')
+        if verdict == 'CONTESTED':
+            reasons.append('Red team contested the leading answer')
+    elif (
+        (leader_corr is not None and leader_corr < 8)
+        or top1_agreement < 0.7
+        or disputed
+    ):
+        level = 'MEDIUM'
+        if leader_corr is not None and leader_corr < 8:
+            reasons.append(
+                f'Leading answer mean correctness is {leader_corr:.1f}/10'
+            )
+        if top1_agreement < 0.7:
+            reasons.append(f'Top-1 agreement is {top1_agreement:.0%}')
+        if disputed:
+            reasons.append(f'{len(disputed)} disputed claim(s) remain unresolved')
+    else:
+        level = 'HIGH'
+        reasons.append('Judges agreed on a high-correctness leader')
+
+    return {
+        'level': level,
+        'reasons': reasons,
+        'leader_index': leader['index'],
+        'leader_score': leader['score'],
+        'leader_mean_correctness': leader_corr,
+        'top1_agreement': round(top1_agreement, 3),
+        'disputed_claims': disputed,
+        'red_team_verdict': verdict,
+    }
+
+
+def build_council_metadata(
+    label_to_model: Dict[str, str],
+    response_rankings: List[Dict[str, Any]],
+    aggregate_rankings: List[Dict[str, Any]],
+    top_k_indices: List[int],
+    red_team: Optional[Dict[str, Any]],
+    consensus: Dict[str, Any],
+    ranking_fallback: bool = False,
+) -> Dict[str, Any]:
+    """Assemble the metadata blob persisted with an assistant message."""
+    return {
+        'label_to_model': label_to_model,
+        'response_rankings': response_rankings,
+        'aggregate_rankings': aggregate_rankings,
+        'top_k_indices': top_k_indices,
+        'red_team': red_team,
+        'consensus': consensus,
+        'ranking_fallback': ranking_fallback,
+    }
+
+
+async def run_post_ranking(
+    query_text: str,
+    stage1_results: List[Dict[str, Any]],
+    stage2_results: List[Dict[str, Any]],
+) -> Tuple[
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[int],
+    Optional[Dict[str, Any]],
+    Dict[str, Any],
+    bool,
+]:
+    """
+    Aggregate rankings, red-team the leader, compute consensus.
+
+    Returns:
+        response_rankings, aggregate_rankings, top_k_indices,
+        red_team, consensus, ranking_fallback
+    """
+    response_rankings, aggregate_rankings, ranking_fallback = (
+        calculate_aggregate_rankings(stage1_results, stage2_results)
+    )
+    top_n = max(1, min(settings.top_k, len(response_rankings) or 1))
+    top_k_indices = [row['index'] for row in response_rankings[:top_n]]
+
+    red_team = None
+    if response_rankings:
+        leader_index = response_rankings[0]['index']
+        try:
+            red_team = await red_team_review(
+                query_text,
+                stage1_results[leader_index].get('response', ''),
+                leader_index,
+                response_rankings,
+                stage1_results,
+            )
+        except Exception:
+            red_team = None
+
+    consensus = compute_consensus(response_rankings, stage2_results, red_team)
+    return (
+        response_rankings,
+        aggregate_rankings,
+        top_k_indices,
+        red_team,
+        consensus,
+        ranking_fallback,
+    )
+
+
+def _format_candidate_block(
+    ordinal: int,
+    row: Dict[str, Any],
+    response_text: str,
+) -> str:
+    correctness = row.get('mean_correctness')
+    corr_text = f'{correctness:.1f}/10' if correctness is not None else 'n/a'
+    issues = row.get('issues') or []
+    issues_text = '; '.join(issues) if issues else 'none'
+    return (
+        f'Candidate #{ordinal} (score={row.get("score", 0):.2f}, '
+        f'correctness={corr_text}):\n'
+        f'Judge issues: {issues_text}\n'
+        f'{response_text}'
+    )
 
 
 async def stage3_synthesize_final(
     user_query: str,
     stage1_results: List[Dict[str, Any]],
-    stage2_results: List[Dict[str, Any]]
+    stage2_results: List[Dict[str, Any]] = None,
+    metadata: Dict[str, Any] = None,
 ) -> Dict[str, Any]:
     """
-    Stage 3: Chairman synthesizes final response.
+    Stage 3: Chairman synthesizes from anonymized top-K plus consensus.
 
-    Args:
-        user_query: The original user query
-        stage1_results: Individual model responses from Stage 1
-        stage2_results: Rankings from Stage 2
-
-    Returns:
-        Dict with 'model' and 'response' keys
+    Candidate #1 is the base draft. Raw Stage 2 text and model names are omitted.
     """
-    # Build comprehensive context for chairman
-    stage1_text = "\n\n".join([
-        f"Model: {result['model']}\nResponse: {result['response']}"
-        for result in stage1_results
-    ])
+    del stage2_results  # rankings are consumed via metadata, not raw text
+    metadata = metadata or {}
+    consensus = metadata.get('consensus') or {}
+    red_team = metadata.get('red_team')
+    top_k_indices = metadata.get('top_k_indices') or []
+    response_rankings = metadata.get('response_rankings') or []
+    by_index = {row['index']: row for row in response_rankings}
 
-    stage2_text = "\n\n".join([
-        f"Model: {result['model']}\nRanking: {result['ranking']}"
-        for result in stage2_results
-    ])
+    if not top_k_indices and stage1_results:
+        top_k_indices = list(range(min(settings.top_k, len(stage1_results))))
 
-    chairman_prompt = f"""You are the Chairman of an LLM Council. Multiple AI models have provided responses to a user's question, and then ranked each other's responses.
+    level = consensus.get('level', 'MEDIUM')
+    reasons = consensus.get('reasons') or []
+    disputed = consensus.get('disputed_claims') or []
+    reasons_text = '\n'.join(f'- {r}' for r in reasons) or '- none'
+    disputed_text = '\n'.join(f'- {c}' for c in disputed) or '- none'
+
+    if red_team:
+        verdict = red_team.get('verdict', 'n/a')
+        conf = red_team.get('confidence')
+        conf_text = f'{conf}/10' if conf is not None else 'n/a'
+        red_team_block = (
+            f'Red-team verdict: {verdict} (confidence {conf_text})\n'
+            f'Red-team critique:\n{red_team.get("critique", "")}'
+        )
+    else:
+        red_team_block = 'Red-team review was unavailable.'
+
+    candidate_blocks = []
+    for ordinal, idx in enumerate(top_k_indices, start=1):
+        if idx < 0 or idx >= len(stage1_results):
+            continue
+        row = by_index.get(idx, {
+            'index': idx,
+            'score': 0.0,
+            'mean_correctness': None,
+            'issues': [],
+        })
+        candidate_blocks.append(
+            _format_candidate_block(
+                ordinal,
+                row,
+                stage1_results[idx].get('response', ''),
+            )
+        )
+    candidates_text = '\n\n'.join(candidate_blocks) or '(no candidates)'
+
+    chairman_prompt = f'''You are the Chairman of an LLM Council. Peer judges ranked anonymized answers and graded correctness. A red-team reviewer then tried to refute the leading answer.
 
 Original Question: {user_query}
 
-STAGE 1 - Individual Responses:
-{stage1_text}
+COUNCIL CONFIDENCE: {level}
+Reasons:
+{reasons_text}
 
-STAGE 2 - Peer Rankings:
-{stage2_text}
+Disputed claims:
+{disputed_text}
 
-Your task as Chairman is to synthesize all of this information into a single, comprehensive, accurate answer to the user's original question. Consider:
-- The individual responses and their insights
-- The peer rankings and what they reveal about response quality
-- Any patterns of agreement or disagreement
+{red_team_block}
 
-Provide a clear, well-reasoned final answer that represents the council's collective wisdom:"""
+CANDIDATES (ordered by peer score, best first). Candidate #1 is the base draft.
 
-    messages = [{"role": "user", "content": chairman_prompt}]
+{candidates_text}
 
-    # Query the chairman model
+Your task:
+- Treat Candidate #1 as the base draft.
+- Apply edits from later candidates only where they correct an error or add verified content.
+- Address every disputed claim: resolve it or flag it as unresolved.
+- If the red-team verdict is REFUTED, present the refutation and a corrected answer instead of the leader's conclusion.
+- If council confidence is LOW or CONTESTED, open with a one-line caveat.
+- Do not mention model names.
+
+Provide a clear, well-reasoned final answer:'''
+
+    messages = [{'role': 'user', 'content': chairman_prompt}]
     response = await query_model(settings.chairman_model, messages)
 
     if response is None:
-        # Raise exception so the retry mechanism can handle it
-        raise Exception(f'Chairman model ({settings.chairman_model}) failed to generate response')
+        raise Exception(
+            f'Chairman model ({settings.chairman_model}) failed to generate response'
+        )
+
+    leader_index = consensus.get('leader_index')
+    if leader_index is None and top_k_indices:
+        leader_index = top_k_indices[0]
 
     return {
         'model': settings.chairman_model,
         'response': response.get('content', ''),
         'usage': response.get('usage', {}),
+        'based_on_index': leader_index,
+        'top_k_indices': top_k_indices,
+        'consensus_level': level,
     }
-
-
-def parse_ranking_from_text(ranking_text: str) -> List[str]:
-    """
-    Parse the FINAL RANKING section from the model's response.
-
-    Args:
-        ranking_text: The full text response from the model
-
-    Returns:
-        List of response labels in ranked order
-    """
-    import re
-
-    # Look for "FINAL RANKING:" section
-    if "FINAL RANKING:" in ranking_text:
-        # Extract everything after "FINAL RANKING:"
-        parts = ranking_text.split("FINAL RANKING:")
-        if len(parts) >= 2:
-            ranking_section = parts[1]
-            # Try to extract numbered list format (e.g., "1. Response 1")
-            # This pattern looks for: number, period, optional space, "Response X"
-            numbered_matches = re.findall(r'\d+\.\s*Response \d+', ranking_section)
-            if numbered_matches:
-                # Extract just the "Response X" part
-                return [re.search(r'Response \d+', m).group() for m in numbered_matches]
-
-            # Fallback: Extract all "Response X" patterns in order
-            matches = re.findall(r'Response \d+', ranking_section)
-            return matches
-
-    # Fallback: try to find any "Response X" patterns in order
-    matches = re.findall(r'Response \d+', ranking_text)
-    return matches
-
-
-def calculate_aggregate_rankings(
-    stage2_results: List[Dict[str, Any]],
-    label_to_model: Dict[str, str]
-) -> List[Dict[str, Any]]:
-    """
-    Calculate aggregate rankings across all models.
-
-    Args:
-        stage2_results: Rankings from each model
-        label_to_model: Mapping from anonymous labels to model names
-
-    Returns:
-        List of dicts with model name and average rank, sorted best to worst
-    """
-    from collections import defaultdict
-
-    # Track positions for each model
-    model_positions = defaultdict(list)
-
-    for ranking in stage2_results:
-        ranking_text = ranking['ranking']
-
-        # Parse the ranking from the structured format
-        parsed_ranking = parse_ranking_from_text(ranking_text)
-
-        for position, label in enumerate(parsed_ranking, start=1):
-            if label in label_to_model:
-                model_name = label_to_model[label]
-                model_positions[model_name].append(position)
-
-    # Calculate average position for each model
-    aggregate = []
-    for model, positions in model_positions.items():
-        if positions:
-            avg_rank = sum(positions) / len(positions)
-            aggregate.append({
-                "model": model,
-                "average_rank": round(avg_rank, 2),
-                "rankings_count": len(positions)
-            })
-
-    # Sort by average rank (lower is better)
-    aggregate.sort(key=lambda x: x['average_rank'])
-
-    return aggregate
 
 
 async def generate_conversation_title(user_query: str) -> str:
@@ -510,30 +1059,25 @@ async def generate_conversation_title(user_query: str) -> str:
     Returns:
         A short title (3-5 words)
     """
-    title_prompt = f"""Generate a very short title (3-5 words maximum) that summarizes the following question.
+    title_prompt = f'''Generate a very short title (3-5 words maximum) that summarizes the following question.
 The title should be concise and descriptive. Do not use quotes or punctuation in the title.
 
 Question: {user_query}
 
-Title:"""
+Title:'''
 
-    messages = [{"role": "user", "content": title_prompt}]
+    messages = [{'role': 'user', 'content': title_prompt}]
 
-    # Use gemini-2.5-flash for title generation (fast and cheap)
-    response = await query_model("google/gemini-2.5-flash", messages, timeout=30.0)
+    response = await query_model('google/gemini-2.5-flash', messages, timeout=30.0)
 
     if response is None:
-        # Fallback to a generic title
-        return "New Conversation"
+        return 'New Conversation'
 
     title = response.get('content', 'New Conversation').strip()
-
-    # Clean up the title - remove quotes, limit length
     title = title.strip('"\'')
 
-    # Truncate if too long
     if len(title) > 50:
-        title = title[:47] + "..."
+        title = title[:47] + '...'
 
     return title
 
@@ -548,33 +1092,42 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
     Returns:
         Tuple of (stage1_results, stage2_results, stage3_result, metadata)
     """
-    # Stage 1: Collect individual responses
     stage1_results = await stage1_collect_responses(user_query)
 
-    # If no models responded successfully, return error
     if not stage1_results:
         return [], [], {
-            "model": "error",
-            "response": "All models failed to respond. Please try again."
+            'model': 'error',
+            'response': 'All models failed to respond. Please try again.',
         }, {}
 
-    # Stage 2: Collect rankings
-    stage2_results, label_to_model = await stage2_collect_rankings(user_query, stage1_results)
+    stage2_results, label_to_model = await stage2_collect_rankings(
+        user_query, stage1_results
+    )
 
-    # Calculate aggregate rankings
-    aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
+    (
+        response_rankings,
+        aggregate_rankings,
+        top_k_indices,
+        red_team,
+        consensus,
+        ranking_fallback,
+    ) = await run_post_ranking(user_query, stage1_results, stage2_results)
 
-    # Stage 3: Synthesize final answer
+    metadata = build_council_metadata(
+        label_to_model,
+        response_rankings,
+        aggregate_rankings,
+        top_k_indices,
+        red_team,
+        consensus,
+        ranking_fallback,
+    )
+
     stage3_result = await stage3_synthesize_final(
         user_query,
         stage1_results,
-        stage2_results
+        stage2_results,
+        metadata,
     )
-
-    # Prepare metadata
-    metadata = {
-        "label_to_model": label_to_model,
-        "aggregate_rankings": aggregate_rankings
-    }
 
     return stage1_results, stage2_results, stage3_result, metadata

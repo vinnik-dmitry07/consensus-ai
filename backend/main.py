@@ -3,7 +3,7 @@
 import asyncio
 import json
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,13 +12,14 @@ from pydantic import BaseModel
 
 from . import storage
 from .council import (
+    build_council_metadata,
     build_user_message,
-    calculate_aggregate_rankings,
+    canonical_label_to_model,
     compose_follow_up_query,
     generate_conversation_title,
     get_effective_text,
     run_full_council,
-    stage1_collect_responses,
+    run_post_ranking,
     stage1_collect_responses_streaming,
     stage2_collect_rankings,
     stage2_collect_rankings_streaming,
@@ -130,7 +131,75 @@ class Conversation(BaseModel):
 
 
 def _files_to_dicts(files: List[FileAttachment]) -> List[Dict[str, str]]:
-    return [{"name": f.name, "content": f.content} for f in files]
+    return [{'name': f.name, 'content': f.content} for f in files]
+
+
+async def _post_ranking_metadata(
+    query_text: str,
+    stage1_results: List[Dict[str, Any]],
+    stage2_results: List[Dict[str, Any]],
+    label_to_model: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Aggregate ranks, red-team the leader, and build persisted metadata."""
+    (
+        response_rankings,
+        aggregate_rankings,
+        top_k_indices,
+        red_team,
+        consensus,
+        ranking_fallback,
+    ) = await run_post_ranking(query_text, stage1_results, stage2_results)
+    return build_council_metadata(
+        label_to_model or canonical_label_to_model(stage1_results),
+        response_rankings,
+        aggregate_rankings,
+        top_k_indices,
+        red_team,
+        consensus,
+        ranking_fallback,
+    )
+
+
+async def _run_and_save_post_ranking(
+    conversation_id: str,
+    msg_index: int,
+    query_text: str,
+    stage1_results: List[Dict[str, Any]],
+    stage2_results: List[Dict[str, Any]],
+    label_to_model: Optional[Dict[str, str]] = None,
+) -> Tuple[Dict[str, Any], bool, Optional[str]]:
+    """Persist post-ranking metadata. Returns (metadata, red_team_ok, error)."""
+    try:
+        metadata = await _post_ranking_metadata(
+            query_text, stage1_results, stage2_results, label_to_model
+        )
+        storage.update_streaming_message(
+            conversation_id, msg_index, metadata=metadata
+        )
+        return metadata, metadata.get('red_team') is not None, None
+    except Exception as exc:
+        metadata = {
+            'label_to_model': label_to_model or canonical_label_to_model(stage1_results),
+            'response_rankings': [],
+            'aggregate_rankings': [],
+            'top_k_indices': list(range(min(settings.top_k, len(stage1_results)))),
+            'red_team': None,
+            'consensus': {
+                'level': 'LOW',
+                'reasons': [f'Post-ranking failed: {exc}'],
+                'leader_index': 0 if stage1_results else None,
+                'leader_score': None,
+                'leader_mean_correctness': None,
+                'top1_agreement': 0.0,
+                'disputed_claims': [],
+                'red_team_verdict': None,
+            },
+            'ranking_fallback': True,
+        }
+        storage.update_streaming_message(
+            conversation_id, msg_index, metadata=metadata
+        )
+        return metadata, False, str(exc)
 
 
 @app.get("/")
@@ -184,6 +253,9 @@ class UpdateSettingsRequest(BaseModel):
     council_models: Optional[List[str]] = None
     n_samples: Optional[int] = None
     chairman_model: Optional[str] = None
+    top_k: Optional[int] = None
+    red_team_model: Optional[str] = None
+    self_exclusion: Optional[bool] = None
     api_key: Optional[str] = None
 
 
@@ -198,13 +270,19 @@ async def update_settings(request: UpdateSettingsRequest):
     """Update council settings."""
     update_data = {}
     if request.council_models is not None:
-        update_data["council_models"] = request.council_models
+        update_data['council_models'] = request.council_models
     if request.n_samples is not None:
-        update_data["n_samples"] = request.n_samples
+        update_data['n_samples'] = request.n_samples
     if request.chairman_model is not None:
-        update_data["chairman_model"] = request.chairman_model
+        update_data['chairman_model'] = request.chairman_model
+    if request.top_k is not None:
+        update_data['top_k'] = request.top_k
+    if request.red_team_model is not None:
+        update_data['red_team_model'] = request.red_team_model
+    if request.self_exclusion is not None:
+        update_data['self_exclusion'] = request.self_exclusion
     if request.api_key is not None:
-        update_data["api_key"] = request.api_key
+        update_data['api_key'] = request.api_key
     
     settings.update_from_dict(update_data)
     return settings.to_dict()
@@ -231,6 +309,10 @@ async def get_council_pricing():
     
     chairman_base = settings.chairman_model.replace('-reasoning-high', '').replace('-reasoning', '')
     all_models.add(chairman_base)
+
+    red_team_id = settings.red_team_model or settings.chairman_model
+    red_team_base = red_team_id.replace('-reasoning-high', '').replace('-reasoning', '')
+    all_models.add(red_team_base)
     
     # Build response with pricing for each model
     pricing_data = {}
@@ -240,10 +322,13 @@ async def get_council_pricing():
     
     # Also return the council structure
     return {
-        "council_models": settings.council_models,
-        "chairman_model": settings.chairman_model,
-        "n_samples": settings.n_samples,
-        "pricing": pricing_data
+        'council_models': settings.council_models,
+        'chairman_model': settings.chairman_model,
+        'n_samples': settings.n_samples,
+        'top_k': settings.top_k,
+        'self_exclusion': settings.self_exclusion,
+        'red_team_model': settings.red_team_model,
+        'pricing': pricing_data,
     }
 
 
@@ -359,7 +444,7 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
         stage2_results = None
         stage3_result = None
         label_to_model = None
-        aggregate_rankings = None
+        metadata = {}
         current_stage = None
         msg_index = None
 
@@ -439,15 +524,13 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                         label_to_model = event_data['label_to_model']
 
                 if not stage2_results:
-                    raise Exception("All models failed to respond in Stage 2")
-                aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
-                # Save stage2 results
+                    raise Exception('All models failed to respond in Stage 2')
                 storage.update_streaming_message(
                     conversation_id, msg_index,
                     stage2=stage2_results,
-                    metadata={'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}
+                    metadata={'label_to_model': label_to_model},
                 )
-                yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
+                yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model}})}\n\n"
             except Exception as e:
                 storage.update_streaming_message(
                     conversation_id, msg_index,
@@ -457,11 +540,24 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                 yield f"data: {json.dumps({'type': 'stage2_error', 'stage': 2, 'message': str(e)})}\n\n"
                 return
 
+            current_stage = 2
+            yield f"data: {json.dumps({'type': 'redteam_start'})}\n\n"
+            metadata, red_team_ok, red_team_error = await _run_and_save_post_ranking(
+                conversation_id, msg_index, query_text,
+                stage1_results, stage2_results, label_to_model,
+            )
+            if red_team_ok:
+                yield f"data: {json.dumps({'type': 'redteam_complete', 'metadata': metadata})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'redteam_error', 'message': red_team_error or 'Red-team review unavailable', 'metadata': metadata})}\n\n"
+
             # Stage 3: Synthesize final answer
             current_stage = 3
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             try:
-                stage3_result = await stage3_synthesize_final(query_text, stage1_results, stage2_results)
+                stage3_result = await stage3_synthesize_final(
+                    query_text, stage1_results, stage2_results, metadata
+                )
                 # Save stage3 and mark streaming complete
                 storage.update_streaming_message(
                     conversation_id, msg_index,
@@ -545,7 +641,7 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
         stage2_results = None
         stage3_result = None
         label_to_model = None
-        aggregate_rankings = None
+        metadata = {}
 
         try:
             # Mark as streaming, clear stage2/stage3 but keep stage1 for resume
@@ -591,14 +687,13 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
             try:
                 stage2_results, label_to_model = await stage2_collect_rankings(query_text, stage1_results)
                 if not stage2_results:
-                    raise Exception("All models failed to respond in Stage 2")
-                aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
+                    raise Exception('All models failed to respond in Stage 2')
                 storage.update_streaming_message(
                     conversation_id, msg_index,
                     stage2=stage2_results,
-                    metadata={'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}
+                    metadata={'label_to_model': label_to_model},
                 )
-                yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
+                yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model}})}\n\n"
             except Exception as e:
                 storage.update_streaming_message(
                     conversation_id, msg_index,
@@ -608,10 +703,22 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
                 yield f"data: {json.dumps({'type': 'stage2_error', 'stage': 2, 'message': str(e)})}\n\n"
                 return
 
+            yield f"data: {json.dumps({'type': 'redteam_start'})}\n\n"
+            metadata, red_team_ok, red_team_error = await _run_and_save_post_ranking(
+                conversation_id, msg_index, query_text,
+                stage1_results, stage2_results, label_to_model,
+            )
+            if red_team_ok:
+                yield f"data: {json.dumps({'type': 'redteam_complete', 'metadata': metadata})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'redteam_error', 'message': red_team_error or 'Red-team review unavailable', 'metadata': metadata})}\n\n"
+
             # Stage 3: Synthesize final answer
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             try:
-                stage3_result = await stage3_synthesize_final(query_text, stage1_results, stage2_results)
+                stage3_result = await stage3_synthesize_final(
+                    query_text, stage1_results, stage2_results, metadata
+                )
                 storage.update_streaming_message(
                     conversation_id, msg_index,
                     stage3=stage3_result,
@@ -675,7 +782,7 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
         stage2_results = None
         stage3_result = None
         label_to_model = None
-        aggregate_rankings = None
+        metadata = {}
 
         try:
             # Mark as streaming
@@ -694,14 +801,13 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
                         label_to_model = event_data['label_to_model']
 
                 if not stage2_results:
-                    raise Exception("All models failed to respond in Stage 2")
-                aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
+                    raise Exception('All models failed to respond in Stage 2')
                 storage.update_streaming_message(
                     conversation_id, msg_index,
                     stage2=stage2_results,
-                    metadata={'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}
+                    metadata={'label_to_model': label_to_model},
                 )
-                yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model, 'aggregate_rankings': aggregate_rankings}})}\n\n"
+                yield f"data: {json.dumps({'type': 'stage2_complete', 'data': stage2_results, 'metadata': {'label_to_model': label_to_model}})}\n\n"
             except Exception as e:
                 storage.update_streaming_message(
                     conversation_id, msg_index,
@@ -711,10 +817,22 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
                 yield f"data: {json.dumps({'type': 'stage2_error', 'stage': 2, 'message': str(e)})}\n\n"
                 return
 
+            yield f"data: {json.dumps({'type': 'redteam_start'})}\n\n"
+            metadata, red_team_ok, red_team_error = await _run_and_save_post_ranking(
+                conversation_id, msg_index, query_text,
+                stage1_results, stage2_results, label_to_model,
+            )
+            if red_team_ok:
+                yield f"data: {json.dumps({'type': 'redteam_complete', 'metadata': metadata})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'redteam_error', 'message': red_team_error or 'Red-team review unavailable', 'metadata': metadata})}\n\n"
+
             # Stage 3: Synthesize final answer
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             try:
-                stage3_result = await stage3_synthesize_final(query_text, stage1_results, stage2_results)
+                stage3_result = await stage3_synthesize_final(
+                    query_text, stage1_results, stage2_results, metadata
+                )
                 storage.update_streaming_message(
                     conversation_id, msg_index,
                     stage3=stage3_result,
@@ -783,10 +901,23 @@ async def retry_stage3_stream(conversation_id: str, request: RetryStageRequest):
             # Mark as streaming
             storage.update_streaming_message(conversation_id, msg_index, streaming=True)
 
+            label_to_model = (metadata or {}).get('label_to_model')
+            yield f"data: {json.dumps({'type': 'redteam_start'})}\n\n"
+            metadata, red_team_ok, red_team_error = await _run_and_save_post_ranking(
+                conversation_id, msg_index, query_text,
+                stage1_results, stage2_results, label_to_model,
+            )
+            if red_team_ok:
+                yield f"data: {json.dumps({'type': 'redteam_complete', 'metadata': metadata})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'redteam_error', 'message': red_team_error or 'Red-team review unavailable', 'metadata': metadata})}\n\n"
+
             # Stage 3: Synthesize final answer
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             try:
-                stage3_result = await stage3_synthesize_final(query_text, stage1_results, stage2_results)
+                stage3_result = await stage3_synthesize_final(
+                    query_text, stage1_results, stage2_results, metadata
+                )
                 storage.update_streaming_message(
                     conversation_id, msg_index,
                     stage3=stage3_result,

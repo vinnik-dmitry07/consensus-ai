@@ -7,8 +7,9 @@ Fork of [karpathy/llm-council](https://github.com/karpathy/llm-council) with a s
 ## How it works
 
 1. **Stage 1: First opinions** — Your query goes to every council model in parallel. With `N_SAMPLES > 1`, each model can produce multiple independent answers. Responses appear in a tab view.
-2. **Stage 2: Peer review** — Each model evaluates anonymized responses (`Response A`, `Response B`, …) and ranks them. The UI shows raw evaluations, parsed rankings, and aggregate scores.
-3. **Stage 3: Final answer** — The Chairman reads all responses and rankings, then produces a synthesized answer.
+2. **Stage 2: Peer review** — Each judge skips its own model family, sees a shuffled anonymous list, grades correctness, lists disputed claims, and ranks the rest. Rankings become a Borda score plus a council-confidence level.
+3. **Red team** — A reviewer tries to refute the leading answer (`REFUTED` / `CONTESTED` / `UPHELD`). Failure of this pass is non-fatal.
+4. **Stage 3: Final answer** — The Chairman starts from the top-ranked answer as a base draft, applies corrections from the remaining top-K, and must address disputed claims and the red-team verdict.
 
 ## Screenshots
 
@@ -38,7 +39,7 @@ Fork of [karpathy/llm-council](https://github.com/karpathy/llm-council) with a s
 
 ## Features
 
-- **Settings UI** — Pick council models, chairman, samples per model, and API key without editing code
+- **Settings UI** — Pick council models, chairman, samples per model, top-K, self-exclusion, red-team model, and API key without editing code
 - **Reasoning modes** — Each model supports **Base**, **R** (medium reasoning), and **R+** (high reasoning) via `-reasoning` / `-reasoning-high` suffixes
 - **Quick presets** — Top 10 Free and Top 8 Paid model shortcuts in Settings
 - **Streaming** — Live progress during Stage 1–3; resume interrupted runs from where they stopped
@@ -86,19 +87,19 @@ Defaults live in `backend/config.py`. You can also change everything in the Sett
 
 ```python
 COUNCIL_MODELS = [
-    "openai/gpt-5.5",
-    "google/gemini-3.1-pro-preview",
-    "anthropic/claude-opus-4.8",
-    "x-ai/grok-4.5",
-    "openai/gpt-5.5-reasoning",
-    "google/gemini-3.1-pro-preview-reasoning",
-    "anthropic/claude-opus-4.8-reasoning",
-    "x-ai/grok-4.5-reasoning",
+    "~openai/gpt-latest",
+    "~google/gemini-pro-latest",
+    "~anthropic/claude-opus-latest",
+    "~x-ai/grok-latest",
+    "~openai/gpt-latest-reasoning",
+    "~google/gemini-pro-latest-reasoning",
+    "~anthropic/claude-opus-latest-reasoning",
+    "~x-ai/grok-latest-reasoning",
 ]
 
 N_SAMPLES = 3
 
-CHAIRMAN_MODEL = "anthropic/claude-fable-5-reasoning-high"
+CHAIRMAN_MODEL = "~anthropic/claude-fable-latest-reasoning-high"
 ```
 
 ## Running the application
