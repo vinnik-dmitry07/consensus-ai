@@ -96,9 +96,15 @@ export default function Sidebar({
         {credits && (
           <div className="credits-display">
             <div className="credits-icon">💳</div>
-            <div className="credits-info">
-              <span className="credits-label">Credits</span>
-              <span className="credits-value">${credits.remaining.toFixed(2)}</span>
+            <div className='credits-info'>
+              <span className='credits-label'>Credits</span>
+              <span className='credits-value'>${credits.remaining.toFixed(2)}</span>
+              {credits.limit_remaining != null && (
+                <span className='credits-key-limit'>
+                  Key ${Number(credits.limit_remaining).toFixed(2)} left
+                  {credits.limit_reset ? ` (${credits.limit_reset})` : ''}
+                </span>
+              )}
             </div>
           </div>
         )}

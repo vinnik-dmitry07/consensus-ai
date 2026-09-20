@@ -141,6 +141,7 @@ function App() {
             ...messages[idx], 
             loading: { ...messages[idx].loading, stage1: true }, 
             stage1Progress: null,
+            stage1_failures: [],
             error: null 
           };
           return { ...prev, messages };
@@ -156,7 +157,7 @@ function App() {
             stage1Progress: { 
               total: event.data.total_models, 
               completed: event.data.existing_count || 0, 
-              results: [] 
+              results: [],
             }
           };
           return { ...prev, messages };
@@ -184,13 +185,34 @@ function App() {
         });
         break;
 
+      case 'stage1_model_failed':
+        updateIfCurrentConv((prev) => {
+          const messages = [...prev.messages];
+          const idx = getTargetMsgIndex(prev);
+          const progress = messages[idx].stage1Progress;
+          const isExisting = event.data.existing;
+          messages[idx] = {
+            ...messages[idx],
+            stage1_failures: [...(messages[idx].stage1_failures || []), event.data],
+            ...(progress && {
+              stage1Progress: {
+                ...progress,
+                completed: isExisting ? progress.completed : progress.completed + 1,
+              },
+            }),
+          };
+          return { ...prev, messages };
+        });
+        break;
+
       case 'stage1_complete':
         updateIfCurrentConv((prev) => {
           const messages = [...prev.messages];
           const idx = getTargetMsgIndex(prev);
           messages[idx] = { 
             ...messages[idx], 
-            stage1: event.data, 
+            stage1: event.data,
+            stage1_failures: event.failures || messages[idx].stage1_failures || [],
             stage1Progress: null,
             loading: { ...messages[idx].loading, stage1: false } 
           };
@@ -202,8 +224,11 @@ function App() {
         updateIfCurrentConv((prev) => {
           const messages = [...prev.messages];
           const idx = getTargetMsgIndex(prev);
+          const progressResults = messages[idx].stage1Progress?.results;
           messages[idx] = { 
-            ...messages[idx], 
+            ...messages[idx],
+            stage1: messages[idx].stage1 || progressResults || [],
+            stage1_failures: event.failures || messages[idx].stage1_failures || [],
             loading: { ...messages[idx].loading, stage1: false }, 
             stage1Progress: null,
             error: { stage: 1, message: event.message } 
@@ -221,7 +246,8 @@ function App() {
           messages[idx] = { 
             ...messages[idx], 
             loading: { ...messages[idx].loading, stage2: true },
-            stage2Progress: null
+            stage2Progress: null,
+            stage2_failures: [],
           };
           return { ...prev, messages };
         });
@@ -243,18 +269,25 @@ function App() {
         break;
 
       case 'stage2_model_complete':
+      case 'stage2_model_failed':
         updateIfCurrentConv((prev) => {
           const messages = [...prev.messages];
           const idx = getTargetMsgIndex(prev);
           const progress = messages[idx].stage2Progress;
+          const nextFailures = eventType === 'stage2_model_failed'
+            ? [...(messages[idx].stage2_failures || []), event.data]
+            : messages[idx].stage2_failures;
           if (progress) {
             messages[idx] = {
               ...messages[idx],
+              stage2_failures: nextFailures,
               stage2Progress: {
                 ...progress,
                 completed: progress.completed + 1
               }
             };
+          } else if (eventType === 'stage2_model_failed') {
+            messages[idx] = { ...messages[idx], stage2_failures: nextFailures };
           }
           return { ...prev, messages };
         });
@@ -266,7 +299,8 @@ function App() {
           const idx = getTargetMsgIndex(prev);
           messages[idx] = { 
             ...messages[idx], 
-            stage2: event.data, 
+            stage2: event.data,
+            stage2_failures: event.failures || messages[idx].stage2_failures || [],
             metadata: event.metadata, 
             loading: { ...messages[idx].loading, stage2: false },
             stage2Progress: null
@@ -317,7 +351,12 @@ function App() {
         updateIfCurrentConv((prev) => {
           const messages = [...prev.messages];
           const idx = getTargetMsgIndex(prev);
-          messages[idx] = { ...messages[idx], loading: { ...messages[idx].loading, stage2: false }, error: { stage: 2, message: event.message } };
+          messages[idx] = {
+            ...messages[idx],
+            loading: { ...messages[idx].loading, stage2: false },
+            error: { stage: 2, message: event.message },
+            stage2_failures: event.failures ?? messages[idx].stage2_failures ?? [],
+          };
           return { ...prev, messages };
         });
         setIsLoading(false);
@@ -427,6 +466,7 @@ function App() {
         stage3: null,
         metadata: null,
         error: null,
+        stage1_failures: [],
         loading: {
           stage1: true,  // Start with stage1 loading
           stage2: false,
@@ -477,6 +517,8 @@ function App() {
           ...msg,
           error: null,
           streaming: false,
+          stage1_failures: stage === 1 ? [] : msg.stage1_failures,
+          stage2_failures: stage === 3 ? msg.stage2_failures : [],
           loading: {
             stage1: stage === 1,
             stage2: stage === 2,
@@ -521,6 +563,7 @@ function App() {
         onToggleDarkMode={() => setDarkMode(!darkMode)}
       />
       <ChatInterface
+        key={currentConversationId ?? 'new'}
         conversation={currentConversation}
         onSendMessage={handleSendMessage}
         onRetryStage={handleRetryStage}

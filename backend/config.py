@@ -38,7 +38,30 @@ RED_TEAM_MODEL = None
 SELF_EXCLUSION = True
 
 # OpenRouter API endpoint
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions'
+OPENROUTER_CREDITS_URL = 'https://openrouter.ai/api/v1/credits'
+OPENROUTER_MODELS_URL = 'https://openrouter.ai/api/v1/models'
+OPENROUTER_KEY_URL = 'https://openrouter.ai/api/v1/key'
+
+# Cap reserved completion tokens so OpenRouter 402s less often.
+DEFAULT_MAX_TOKENS = 16000
+DEFAULT_MAX_TOKENS_HIGH = 32000  # xhigh can use ~95% of the cap
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = (os.getenv(name) or '').strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
+
+OPENROUTER_MAX_TOKENS = _positive_int_env('OPENROUTER_MAX_TOKENS', DEFAULT_MAX_TOKENS)
+OPENROUTER_MAX_TOKENS_HIGH = _positive_int_env(
+    'OPENROUTER_MAX_TOKENS_HIGH', DEFAULT_MAX_TOKENS_HIGH
+)
 
 # Data directory for conversation storage
 DATA_DIR = "data/conversations"

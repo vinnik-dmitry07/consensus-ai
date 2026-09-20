@@ -207,3 +207,8 @@
   font-weight: 600;
   color: var(--accent);
 }
+
+.credits-key-limit {
+  font-size: 11px;
+  color: var(--text-muted);
+}

@@ -4,11 +4,45 @@ import asyncio
 import hashlib
 import random
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from .openrouter import query_model
+from .openrouter import query_model, query_model_result
 from .settings import settings
+
+
+class Stage1AllFailed(Exception):
+    """Every Stage 1 sample failed; per-model errors are on .failures."""
+
+    def __init__(self, failures: List[Dict[str, Any]]):
+        super().__init__('All models failed to respond in Stage 1')
+        self.failures = failures
+
+
+def pending_stage1_slots(
+    council_models: List[str],
+    n: int,
+    existing_results: Optional[List[Dict[str, Any]]] = None,
+) -> List[str]:
+    """Remaining Stage 1 samples after counting existing successes per model."""
+    used = Counter(result['model'] for result in existing_results or [])
+    pending = []
+    for model in council_models:
+        pending.extend([model] * max(0, n - used[model]))
+    return pending
+
+
+def retained_stage1_failures(
+    existing_failures: Optional[List[Dict[str, Any]]],
+    pending_models: List[str],
+) -> List[Dict[str, Any]]:
+    """Keep prior failures only for models that will not be queried again."""
+    pending_set = set(pending_models)
+    return [
+        failure
+        for failure in (existing_failures or [])
+        if failure.get('model') not in pending_set
+    ]
 
 
 def format_files_for_prompt(files: List[Dict[str, str]]) -> str:
@@ -397,98 +431,82 @@ def format_stage2_result(
 async def stage1_collect_responses(
     user_query: Union[str, List[Dict]],
     n: int = None,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Stage 1: Collect individual responses from all council models.
 
-    Args:
-        user_query: The user's question (string or multimodal content list)
-        n: Number of samples to collect per model (default: settings.n_samples)
-
     Returns:
-        List of dicts with 'model' and 'response' keys
+        (results, failures) — failures keep the structured OpenRouter error
     """
     if n is None:
         n = settings.n_samples
 
     messages = [{'role': 'user', 'content': user_query}]
+    models_expanded = pending_stage1_slots(settings.council_models, n)
 
-    tasks = []
-    models_expanded = []
-
-    for model in settings.council_models:
-        for _ in range(n):
-            tasks.append(query_model(model, messages))
-            models_expanded.append(model)
-
+    tasks = [query_model_result(model, messages) for model in models_expanded]
     raw_responses = await asyncio.gather(*tasks)
 
     stage1_results = []
+    failures = []
     for model, response in zip(models_expanded, raw_responses):
-        if response is not None:
+        if response.get('ok'):
             stage1_results.append({
                 'model': model,
                 'response': response.get('content', ''),
                 'usage': response.get('usage', {}),
             })
+        else:
+            failures.append({'model': model, 'error': response['error']})
 
-    return stage1_results
+    return stage1_results, failures
 
 
 async def stage1_collect_responses_streaming(
     user_query: Union[str, List[Dict]],
     n: int = None,
     existing_results: List[Dict] = None,
+    existing_failures: List[Dict] = None,
 ):
     """
     Stage 1 with streaming: Collect responses and yield progress events.
 
-    Args:
-        user_query: The user's question (string or multimodal content list)
-        n: Number of samples to collect per model (default: settings.n_samples)
-        existing_results: Optional list of existing results to resume from
-
-    Yields:
-        Tuples of (event_type, event_data)
+    Resume counts successes per model against n_samples. Prior failures for
+    models still being queried are dropped; the rest are replayed.
     """
     if n is None:
         n = settings.n_samples
 
     messages = [{'role': 'user', 'content': user_query}]
-
-    models_expanded = []
-    for model in settings.council_models:
-        for _ in range(n):
-            models_expanded.append(model)
-
-    existing_models = set()
-    all_results = []
-    if existing_results:
-        for result in existing_results:
-            existing_models.add(result['model'])
-            all_results.append(result)
-
-    pending_models = [m for m in models_expanded if m not in existing_models]
+    total_slots = len(settings.council_models) * n
+    all_results = list(existing_results or [])
+    pending_models = pending_stage1_slots(
+        settings.council_models, n, all_results
+    )
+    failures = retained_stage1_failures(existing_failures, pending_models)
 
     yield ('init', {
-        'total_models': len(models_expanded),
+        'total_models': total_slots,
         'pending_models': len(pending_models),
-        'existing_count': len(all_results),
+        'existing_count': len(all_results) + len(failures),
     })
 
     for result in all_results:
         yield ('model_complete', {'result': result, 'existing': True})
 
+    for failure in failures:
+        yield ('model_failed', {**failure, 'existing': True})
+
     if pending_models:
         async def query_with_model(model):
-            response = await query_model(model, messages)
+            response = await query_model_result(model, messages)
             return model, response
 
         tasks = [query_with_model(model) for model in pending_models]
 
         for coro in asyncio.as_completed(tasks):
             model, response = await coro
-            if response is not None:
+            if response.get('ok'):
                 result = {
                     'model': model,
                     'response': response.get('content', ''),
@@ -496,8 +514,12 @@ async def stage1_collect_responses_streaming(
                 }
                 all_results.append(result)
                 yield ('model_complete', {'result': result, 'existing': False})
+            else:
+                failure = {'model': model, 'error': response['error']}
+                failures.append(failure)
+                yield ('model_failed', failure)
 
-    yield ('all_complete', {'results': all_results})
+    yield ('all_complete', {'results': all_results, 'failures': failures})
 
 
 async def stage2_collect_rankings_streaming(
@@ -523,21 +545,27 @@ async def stage2_collect_rankings_streaming(
     async def query_with_model(model):
         view = build_judge_view(model, stage1_results, user_query)
         prompt = build_stage2_prompt(user_query, view['candidates'])
-        response = await query_model(model, [{'role': 'user', 'content': prompt}])
+        response = await query_model_result(model, [{'role': 'user', 'content': prompt}])
         return model, response, view
 
     tasks = [query_with_model(model) for model in models]
+    failures = []
 
     for coro in asyncio.as_completed(tasks):
         model, response, view = await coro
-        if response is not None:
+        if response.get('ok'):
             result = format_stage2_result(model, response, view)
             stage2_results.append(result)
             yield ('model_complete', {'result': result})
+        else:
+            failure = {'model': model, 'error': response['error']}
+            failures.append(failure)
+            yield ('model_failed', failure)
 
     yield ('all_complete', {
         'results': stage2_results,
         'label_to_model': label_to_model,
+        'failures': failures,
     })
 
 
@@ -747,11 +775,20 @@ Meaning:
 - UPHELD = you could not find a concrete refutation
 '''
 
-    response = await query_model(model, [{'role': 'user', 'content': prompt}])
-    if response is None:
-        return None
+    result = await query_model_result(model, [{'role': 'user', 'content': prompt}])
+    if not result.get('ok'):
+        return {
+            'model': model,
+            'target_index': leader_index,
+            'critique': '',
+            'verdict': None,
+            'confidence': None,
+            'usage': {},
+            'same_family': same_family,
+            'error': result.get('error'),
+        }
 
-    critique = response.get('content', '') or ''
+    critique = result.get('content', '') or ''
     verdict, confidence = parse_red_team_verdict(critique)
     return {
         'model': model,
@@ -759,7 +796,7 @@ Meaning:
         'critique': critique,
         'verdict': verdict,
         'confidence': confidence,
-        'usage': response.get('usage', {}),
+        'usage': result.get('usage', {}),
         'same_family': same_family,
     }
 
@@ -804,7 +841,7 @@ def compute_consensus(
     verdict = (red_team or {}).get('verdict')
     reasons = []
 
-    if red_team is None:
+    if red_team is None or red_team.get('error'):
         reasons.append('Red-team review was unavailable')
 
     if verdict == 'REFUTED':
@@ -1028,11 +1065,13 @@ Your task:
 Provide a clear, well-reasoned final answer:'''
 
     messages = [{'role': 'user', 'content': chairman_prompt}]
-    response = await query_model(settings.chairman_model, messages)
+    result = await query_model_result(settings.chairman_model, messages)
 
-    if response is None:
+    if not result.get('ok'):
+        err = result.get('error') or {}
+        detail = err.get('message') or 'failed to generate response'
         raise Exception(
-            f'Chairman model ({settings.chairman_model}) failed to generate response'
+            f'Chairman model ({settings.chairman_model}) failed: {detail}'
         )
 
     leader_index = consensus.get('leader_index')
@@ -1041,8 +1080,8 @@ Provide a clear, well-reasoned final answer:'''
 
     return {
         'model': settings.chairman_model,
-        'response': response.get('content', ''),
-        'usage': response.get('usage', {}),
+        'response': result.get('content', ''),
+        'usage': result.get('usage', {}),
         'based_on_index': leader_index,
         'top_k_indices': top_k_indices,
         'consensus_level': level,
@@ -1082,7 +1121,7 @@ Title:'''
     return title
 
 
-async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
+async def run_full_council(user_query: str) -> Tuple[List, List, Optional[Dict], Dict]:
     """
     Run the complete 3-stage council process.
 
@@ -1092,13 +1131,10 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
     Returns:
         Tuple of (stage1_results, stage2_results, stage3_result, metadata)
     """
-    stage1_results = await stage1_collect_responses(user_query)
+    stage1_results, stage1_failures = await stage1_collect_responses(user_query)
 
     if not stage1_results:
-        return [], [], {
-            'model': 'error',
-            'response': 'All models failed to respond. Please try again.',
-        }, {}
+        return [], [], None, {'stage1_failures': stage1_failures}
 
     stage2_results, label_to_model = await stage2_collect_rankings(
         user_query, stage1_results
@@ -1122,6 +1158,7 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
         consensus,
         ranking_fallback,
     )
+    metadata['stage1_failures'] = stage1_failures
 
     stage3_result = await stage3_synthesize_final(
         user_query,

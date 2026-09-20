@@ -156,7 +156,9 @@ def add_assistant_message(
     stage1: List[Dict[str, Any]],
     stage2: List[Dict[str, Any]],
     stage3: Dict[str, Any],
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None,
+    stage1_failures: Optional[List[Dict[str, Any]]] = None,
+    error: Optional[Dict[str, Any]] = None,
 ):
     """
     Add an assistant message with all 3 stages to a conversation.
@@ -181,6 +183,10 @@ def add_assistant_message(
     
     if metadata:
         message["metadata"] = metadata
+    if stage1_failures:
+        message['stage1_failures'] = stage1_failures
+    if error:
+        message['error'] = error
 
     conversation["messages"].append(message)
 
@@ -265,6 +271,7 @@ def create_streaming_assistant_message(conversation_id: str) -> int:
     message = {
         "role": "assistant",
         "stage1": [],
+        "stage1_failures": [],
         "stage2": None,
         "stage3": None,
         "streaming": True  # Mark as in-progress
@@ -274,19 +281,33 @@ def create_streaming_assistant_message(conversation_id: str) -> int:
     return len(conversation["messages"]) - 1
 
 
-def append_stage1_result(conversation_id: str, message_index: int, result: Dict[str, Any]):
-    """
-    Append a single stage1 result to an assistant message.
-    """
+def _append_message_list_item(
+    conversation_id: str,
+    message_index: int,
+    field: str,
+    item: Dict[str, Any],
+):
     conversation = get_conversation(conversation_id)
     if conversation is None:
-        raise ValueError(f"Conversation {conversation_id} not found")
+        raise ValueError(f'Conversation {conversation_id} not found')
 
-    message = conversation["messages"][message_index]
-    if message.get("stage1") is None:
-        message["stage1"] = []
-    message["stage1"].append(result)
+    message = conversation['messages'][message_index]
+    if message.get(field) is None:
+        message[field] = []
+    message[field].append(item)
     save_conversation(conversation)
+
+
+def append_stage1_result(conversation_id: str, message_index: int, result: Dict[str, Any]):
+    """Append a single stage1 result to an assistant message."""
+    _append_message_list_item(conversation_id, message_index, 'stage1', result)
+
+
+def append_stage1_failure(conversation_id: str, message_index: int, failure: Dict[str, Any]):
+    """Append a Stage 1 per-model failure as it happens."""
+    _append_message_list_item(
+        conversation_id, message_index, 'stage1_failures', failure
+    )
 
 
 def update_streaming_message(
@@ -297,7 +318,9 @@ def update_streaming_message(
     metadata: Optional[Dict[str, Any]] = None,
     error: Optional[Dict[str, Any]] = None,
     streaming: bool = True,
-    stage1_complete: bool = None
+    stage1_complete: bool = None,
+    stage1_failures: Optional[List[Dict[str, Any]]] = None,
+    stage2_failures: Optional[List[Dict[str, Any]]] = None,
 ):
     """
     Update a streaming assistant message with stage2/stage3 results.
@@ -310,6 +333,10 @@ def update_streaming_message(
     
     if stage1_complete is not None:
         message["stage1_complete"] = stage1_complete
+    if stage1_failures is not None:
+        message['stage1_failures'] = stage1_failures
+    if stage2_failures is not None:
+        message['stage2_failures'] = stage2_failures
     if stage2 is not None:
         message["stage2"] = stage2
     if stage3 is not None:

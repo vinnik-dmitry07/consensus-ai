@@ -223,6 +223,18 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
   return { totalCost, breakdown, n_samples, estimatedTokens };
 }
 
+function hasFinalAnswer(stage3) {
+  if (!stage3 || stage3.model === 'error') return false;
+  const text = stage3.response;
+  if (typeof text !== 'string') return false;
+  const stripped = text.trim();
+  return (
+    Boolean(stripped)
+    && !stripped.startsWith('Error:')
+    && stripped !== 'All models failed to respond. Please try again.'
+  );
+}
+
 // Calculate actual usage from message data
 function calculateActualUsage(msg) {
   if (!msg.stage1 && !msg.stage2 && !msg.stage3) return null;
@@ -301,11 +313,6 @@ export default function ChatInterface({
     };
     fetchPricing();
   }, [settingsVersion]);
-
-  useEffect(() => {
-    setInput('');
-    setAttachments([]);
-  }, [conversation?.id]);
 
   // Calculate estimated cost when input or attachments change
   const estimatedCost = useMemo(() => {
@@ -529,13 +536,13 @@ export default function ChatInterface({
                       <span>Running Stage 1: Collecting individual responses...</span>
                     </div>
                   )}
-                  {msg.stage1Progress && (
-                    <Stage1 
-                      responses={msg.stage1Progress.results} 
+                  {(msg.stage1Progress || msg.stage1 || msg.stage1_failures?.length > 0) && (
+                    <Stage1
+                      responses={msg.stage1Progress?.results || msg.stage1 || []}
                       progress={msg.stage1Progress}
+                      failures={msg.stage1_failures}
                     />
                   )}
-                  {msg.stage1 && !msg.stage1Progress && <Stage1 responses={msg.stage1} />}
                   {/* Interrupted during Stage 1 - partial results collected */}
                   {msg.streaming && !msg.loading?.stage1 && !msg.stage1Progress && !msg.stage2 && !msg.error && (!msg.stage1 || msg.stage1.length === 0) && (
                     <div className="stage-interrupted">
@@ -644,6 +651,23 @@ export default function ChatInterface({
                       redTeam={msg.metadata?.red_team}
                     />
                   )}
+                  {msg.stage2_failures?.length > 0 && (
+                    <div className="stage-error">
+                      <div className="error-content">
+                        <span className="error-icon">⚠️</span>
+                        <div className="error-details">
+                          <strong>Some Stage 2 judges failed</strong>
+                          {msg.stage2_failures.map((failure, i) => (
+                            <p key={i}>
+                              {(failure.model || '').split('/')[1] || failure.model}
+                              {': '}
+                              {failure.error?.message || 'Request failed'}
+                            </p>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  )}
                   {msg.loading?.redteam && (
                     <div className="stage-loading">
                       <div className="spinner"></div>
@@ -675,7 +699,7 @@ export default function ChatInterface({
                       <span>Running Stage 3: Final synthesis...</span>
                     </div>
                   )}
-                  {msg.stage3 && !msg.stage3.response?.startsWith('Error:') && (
+                  {hasFinalAnswer(msg.stage3) && (
                     <Stage3
                       finalResponse={msg.stage3}
                       consensus={msg.metadata?.consensus}
@@ -683,13 +707,19 @@ export default function ChatInterface({
                       topKIndices={msg.metadata?.top_k_indices}
                     />
                   )}
-                  {(msg.error?.stage === 3 || msg.stage3?.response?.startsWith('Error:')) && (
+                  {(msg.error?.stage === 3 || (msg.stage3 && !hasFinalAnswer(msg.stage3))) && (
                     <div className="stage-error">
                       <div className="error-content">
                         <span className="error-icon">⚠️</span>
                         <div className="error-details">
                           <strong>Stage 3 Failed</strong>
-                          <p>{msg.error?.message || msg.stage3?.response || 'Unable to generate final synthesis'}</p>
+                          <p>
+                            {msg.error?.message
+                              || (msg.stage3?.response?.startsWith('Error:')
+                                ? msg.stage3.response
+                                : null)
+                              || 'Chairman returned no answer'}
+                          </p>
                         </div>
                       </div>
                       <button 
@@ -722,7 +752,7 @@ export default function ChatInterface({
                   )}
 
                   {/* Debug: Actual Usage Stats */}
-                  {msg.stage3 && !msg.stage3.response?.startsWith('Error:') && (() => {
+                  {(() => {
                     const actualUsage = calculateActualUsage(msg);
                     if (!actualUsage) return null;
                     return (

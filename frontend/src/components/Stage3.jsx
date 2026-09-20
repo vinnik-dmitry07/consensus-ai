@@ -42,6 +42,7 @@ export default function Stage3({
   if (!finalResponse) {
     return null;
   }
+  const answer = finalResponse.response;
 
   const level = finalResponse.consensus_level || consensus?.level;
   const basedOn =
@@ -71,11 +72,11 @@ export default function Stage3({
         )}
         <div className="final-text markdown-content">
           <ReactMarkdown remarkPlugins={[remarkGfmPlugin]} components={markdownComponents}>
-            {finalResponse.response}
+            {answer}
           </ReactMarkdown>
         </div>
         <div className="copy-row">
-          <CopyButton text={finalResponse.response} label="Copy answer" />
+          <CopyButton text={answer} label="Copy answer" />
         </div>
       </div>
     </div>

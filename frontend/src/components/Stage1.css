@@ -93,6 +93,17 @@
   font-weight: 600;
 }
 
+.tab-failed {
+  color: var(--error, #b91c1c);
+  border-color: #fecaca;
+}
+
+.tab-failed.active {
+  color: var(--error, #b91c1c);
+  border-color: #f87171;
+  border-bottom-color: var(--bg-primary);
+}
+
 .tab-content {
   background: var(--bg-primary);
   padding: 16px;

@@ -141,6 +141,9 @@ function ConsensusPanel({ consensus, redTeam, indexToName, labelToModel }) {
               {redTeam.confidence != null ? ` · ${redTeam.confidence}/10` : ''}
             </span>
           </div>
+          {redTeam.error?.message && (
+            <p className="stage-description">{redTeam.error.message}</p>
+          )}
           {redTeam.same_family && (
             <p className="stage-description">
               Reviewer is the same model family as the leader.
