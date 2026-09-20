@@ -2,6 +2,8 @@
 import asyncio
 import time
 import traceback
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -31,13 +33,60 @@ def resolve_max_tokens(model: str, override: Optional[int] = None) -> int:
     return OPENROUTER_MAX_TOKENS
 
 
+# Upper bound on an honoured Retry-After; a longer wait ties up a council slot.
+MAX_RETRY_AFTER_SECONDS = 60
+
+
 class CatalogueUnavailable(Exception):
     """OpenRouter model list could not be loaded."""
+
+
+def parse_retry_after(raw: Optional[str], fallback: float) -> float:
+    """
+    Seconds to wait from a Retry-After header.
+
+    RFC 9110 allows either a delta in seconds or an HTTP-date, and a proxy in
+    front of OpenRouter may send either. Anything unparseable falls back to the
+    caller's backoff, and every value is clamped so one header cannot park a
+    request for an hour.
+    """
+    wait = None
+    if raw is not None:
+        text = str(raw).strip()
+        try:
+            wait = float(text)
+        except ValueError:
+            try:
+                when = parsedate_to_datetime(text)
+            except (TypeError, ValueError):
+                wait = None
+            else:
+                if when is not None:
+                    if when.tzinfo is None:
+                        when = when.replace(tzinfo=timezone.utc)
+                    wait = (when - datetime.now(timezone.utc)).total_seconds()
+    if wait is None:
+        wait = fallback
+    return max(0.0, min(float(wait), MAX_RETRY_AFTER_SECONDS))
 
 
 def catalogue_model_id(model: str) -> str:
     """Strip local reasoning suffixes so the id matches the OpenRouter catalogue."""
     return model.replace('-reasoning-high', '').replace('-reasoning', '')
+
+
+def model_family(model: str) -> str:
+    """
+    Group models by the vendor that trained them.
+
+    OpenRouter ids are '<author>/<slug>', so the author segment is the family:
+    'anthropic/claude-opus-4.1' and 'anthropic/claude-sonnet-4.5' are one
+    family, and a judge must not grade its own vendor's answers. Ids with no
+    author fall back to the whole catalogue id.
+    """
+    base = catalogue_model_id(str(model or '')).strip().lstrip('~').lower()
+    author, sep, _ = base.partition('/')
+    return author if sep and author else base
 
 
 async def unknown_catalogue_ids(models: List[str]) -> List[str]:
@@ -243,8 +292,10 @@ async def query_model_result(
 
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 429 and attempt < max_retries - 1:
-                wait = int(e.response.headers.get('Retry-After', 2**attempt))
-                print(f'Rate limited for {model}, retrying in {wait}s...')
+                wait = parse_retry_after(
+                    e.response.headers.get('Retry-After'), 2**attempt
+                )
+                print(f'Rate limited for {model}, retrying in {wait:g}s...')
                 await asyncio.sleep(wait)
                 continue
 

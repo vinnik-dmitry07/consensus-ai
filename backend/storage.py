@@ -15,6 +15,16 @@ _CONVERSATION_ID_RE = re.compile(
 )
 
 
+class _Unset:
+    """Sentinel: 'argument not supplied', so None can mean 'clear this field'."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return 'UNSET'
+
+
+UNSET = _Unset()
+
+
 def ensure_data_dir():
     """Ensure the data directory exists."""
     Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
@@ -325,9 +335,10 @@ def append_stage1_failure(conversation_id: str, message_index: int, failure: Dic
 def update_streaming_message(
     conversation_id: str,
     message_index: int,
-    stage2: Optional[List[Dict[str, Any]]] = None,
-    stage3: Optional[Dict[str, Any]] = None,
-    metadata: Optional[Dict[str, Any]] = None,
+    stage1: Any = UNSET,
+    stage2: Any = UNSET,
+    stage3: Any = UNSET,
+    metadata: Any = UNSET,
     error: Optional[Dict[str, Any]] = None,
     streaming: bool = True,
     stage1_complete: bool = None,
@@ -336,6 +347,10 @@ def update_streaming_message(
 ):
     """
     Update a streaming assistant message with stage2/stage3 results.
+
+    stage1/stage2/stage3/metadata use the UNSET sentinel: omitting one leaves
+    the stored value alone, while passing None clears it. A retry that wipes a
+    later stage must not leave the previous run's answer on the message.
     """
     conversation = get_conversation(conversation_id)
     if conversation is None:
@@ -343,17 +358,19 @@ def update_streaming_message(
 
     message = conversation["messages"][message_index]
     
+    if stage1 is not UNSET:
+        message["stage1"] = stage1
     if stage1_complete is not None:
         message["stage1_complete"] = stage1_complete
     if stage1_failures is not None:
         message['stage1_failures'] = stage1_failures
     if stage2_failures is not None:
         message['stage2_failures'] = stage2_failures
-    if stage2 is not None:
+    if stage2 is not UNSET:
         message["stage2"] = stage2
-    if stage3 is not None:
+    if stage3 is not UNSET:
         message["stage3"] = stage3
-    if metadata is not None:
+    if metadata is not UNSET:
         message["metadata"] = metadata
     if error is not None:
         message["error"] = error

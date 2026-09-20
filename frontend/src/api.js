@@ -4,6 +4,22 @@
 
 const API_BASE = 'http://localhost:8001';
 
+/**
+ * Pull the backend's own explanation out of an error response.
+ * A retry can be refused for a reason the user can act on (for example, the
+ * earlier answer a follow-up was built on is gone), so show that, not a stub.
+ */
+async function errorDetail(response, fallback) {
+  try {
+    const body = await response.json();
+    const detail = body?.detail;
+    if (typeof detail === 'string' && detail.trim()) return detail;
+  } catch {
+    // Not JSON, or already consumed - fall through to the generic message.
+  }
+  return fallback;
+}
+
 export const api = {
   /**
    * Get OpenRouter credits balance.
@@ -200,7 +216,9 @@ export const api = {
     );
 
     if (!response.ok) {
-      throw new Error(`Failed to retry stage ${stage}`);
+      throw new Error(
+        await errorDetail(response, `Failed to retry stage ${stage}`)
+      );
     }
 
     await this._processSSEStream(response, onEvent);

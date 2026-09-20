@@ -134,6 +134,45 @@ def _prepare_council_query(
     return user_message, query_text, None
 
 
+def _rebuild_council_query(conversation: Dict[str, Any], user_msg_index: int):
+    """
+    Rebuild the council inputs a stored user message was originally run with.
+
+    A retry must ask the same question as the first attempt. Messages recorded
+    with 'follow_up_to' were composed against the earlier final answer, so a
+    retry has to recompose them; otherwise the council is handed a bare
+    fragment ("what about its population?") and answers something else.
+    """
+    messages = conversation.get('messages', [])
+    user_message = messages[user_msg_index]
+    content = user_message.get('content', '')
+    images = user_message.get('images', []) or []
+    files = user_message.get('files', []) or []
+    follow_up_to = user_message.get('follow_up_to')
+
+    if follow_up_to is None:
+        return build_user_message(content, images, files), get_effective_text(
+            content, files
+        )
+
+    prior_answer = None
+    if 0 <= follow_up_to < len(messages):
+        prior_answer = _usable_final_answer(messages[follow_up_to].get('stage3'))
+    if not prior_answer:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                'The earlier council answer this message follows up on is no '
+                'longer available. Retry that message first.'
+            ),
+        )
+
+    composed = compose_follow_up_query(
+        prior_answer, get_effective_text(content, files)
+    )
+    return composed, composed
+
+
 class ConversationMetadata(BaseModel):
     """Conversation metadata for list view."""
     id: str
@@ -238,14 +277,17 @@ async def _emit_stage1_sse(
     """Yield Stage 1 SSE lines and persist successes and failures as they land."""
     results: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
+    council_models = list(settings.council_models)
     pending = pending_stage1_slots(
-        settings.council_models, settings.n_samples, existing_results
+        council_models, settings.n_samples, existing_results
     )
     if existing_failures:
         storage.update_streaming_message(
             conversation_id,
             msg_index,
-            stage1_failures=retained_stage1_failures(existing_failures, pending),
+            stage1_failures=retained_stage1_failures(
+                existing_failures, pending, council_models
+            ),
         )
     async for event_type, event_data in stage1_collect_responses_streaming(
         user_message,
@@ -273,9 +315,13 @@ async def _emit_stage1_sse(
 
     collected['results'] = results
     collected['failures'] = failures
+    # Write back the full result set, not just the appended ones: a resume may
+    # have dropped samples from models the council no longer contains, and the
+    # stored Stage 1 must match what Stage 2 actually ranked.
     storage.update_streaming_message(
         conversation_id,
         msg_index,
+        stage1=results,
         stage1_complete=bool(results),
         stage1_failures=failures,
     )
@@ -337,6 +383,23 @@ async def _emit_stage2_sse(
         metadata={'label_to_model': label_to_model},
     )
     yield f"data: {json.dumps({'type': 'stage2_complete', 'data': results, 'failures': failures, 'metadata': {'label_to_model': label_to_model}})}\n\n"
+
+
+def _settle_title_task(conversation_id: str, title_task: "asyncio.Task") -> None:
+    """Save an already-finished title, or cancel one still in flight."""
+    if not title_task.done():
+        title_task.cancel()
+        return
+    if title_task.cancelled():
+        return
+    try:
+        title = title_task.result()
+    except Exception:
+        return
+    try:
+        storage.update_conversation_title(conversation_id, title)
+    except Exception:
+        pass
 
 
 def _persist_generic_error(
@@ -649,6 +712,7 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
         metadata = {}
         current_stage = None
         msg_index = None
+        title_task = None
 
         try:
             files = _files_to_dicts(request.files)
@@ -673,7 +737,6 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             msg_index = storage.create_streaming_assistant_message(conversation_id)
 
             # Start title generation in parallel (don't await yet)
-            title_task = None
             if is_first_message and follow_up_to is None:
                 title_task = asyncio.create_task(generate_conversation_title(query_text))
 
@@ -753,8 +816,9 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
 
             # Wait for title generation if it was started
             if title_task:
+                pending_title, title_task = title_task, None
                 try:
-                    title = await title_task
+                    title = await pending_title
                     storage.update_conversation_title(conversation_id, title)
                     yield f"data: {json.dumps({'type': 'title_complete', 'data': {'title': title}})}\n\n"
                 except Exception:
@@ -773,6 +837,12 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                 yield (
                     f"data: {json.dumps({'type': 'error', 'stage': current_stage, 'message': str(e)})}\n\n"
                 )
+        finally:
+            # Every stage failure returns early, so the title task would
+            # otherwise be abandoned mid-flight. Keep the title when the call
+            # already came back, and cancel it instead of leaking the task.
+            if title_task is not None:
+                _settle_title_task(conversation_id, title_task)
 
     return StreamingResponse(
         event_generator(),
@@ -808,11 +878,7 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
     if user_msg_index < 0 or messages[user_msg_index].get("role") != "user":
         raise HTTPException(status_code=400, detail="Could not find corresponding user message")
 
-    user_message_content = messages[user_msg_index].get("content", "")
-    user_images = messages[user_msg_index].get("images", [])
-    user_files = messages[user_msg_index].get("files", [])
-    user_message = build_user_message(user_message_content, user_images, user_files)
-    query_text = get_effective_text(user_message_content, user_files)
+    user_message, query_text = _rebuild_council_query(conversation, user_msg_index)
 
     msg_index = request.message_index
     
@@ -829,11 +895,14 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
         current_stage = 1
 
         try:
-            # Mark as streaming, clear stage2/stage3 but keep stage1 for resume
+            # Mark as streaming, clear stage2/stage3 but keep stage1 for resume.
+            # The old rankings, metadata and final answer describe a run that is
+            # being replaced; leaving them behind would show a finished answer
+            # above a Stage 1 that has just been re-collected or has failed.
             storage.update_streaming_message(
                 conversation_id, msg_index,
-                stage2=None, stage3=None, streaming=True,
-                stage2_failures=[],
+                stage2=None, stage3=None, metadata=None, streaming=True,
+                stage1_complete=False, stage2_failures=[],
             )
 
             # Stage 1: Collect responses with streaming progress (resume from existing)
@@ -950,9 +1019,7 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
     if user_msg_index < 0 or messages[user_msg_index].get("role") != "user":
         raise HTTPException(status_code=400, detail="Could not find corresponding user message")
 
-    user_message_content = messages[user_msg_index].get("content", "")
-    user_files = messages[user_msg_index].get("files", [])
-    query_text = get_effective_text(user_message_content, user_files)
+    _, query_text = _rebuild_council_query(conversation, user_msg_index)
     msg_index = request.message_index
 
     async def event_generator():
@@ -963,9 +1030,12 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
         current_stage = 2
 
         try:
-            # Mark as streaming
+            # Mark as streaming and drop the run being replaced, so a Stage 2
+            # that fails cannot leave the previous final answer on the message.
             storage.update_streaming_message(
-                conversation_id, msg_index, streaming=True, stage2_failures=[],
+                conversation_id, msg_index,
+                stage2=None, stage3=None, metadata=None,
+                streaming=True, stage2_failures=[],
             )
 
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
@@ -1055,16 +1125,16 @@ async def retry_stage3_stream(conversation_id: str, request: RetryStageRequest):
     if user_msg_index < 0 or messages[user_msg_index].get("role") != "user":
         raise HTTPException(status_code=400, detail="Could not find corresponding user message")
 
-    user_message_content = messages[user_msg_index].get("content", "")
-    user_files = messages[user_msg_index].get("files", [])
-    query_text = get_effective_text(user_message_content, user_files)
+    _, query_text = _rebuild_council_query(conversation, user_msg_index)
     msg_index = request.message_index
 
     async def event_generator():
         metadata = dict(assistant_msg.get('metadata') or {})
         try:
-            # Mark as streaming
-            storage.update_streaming_message(conversation_id, msg_index, streaming=True)
+            # Mark as streaming and drop the answer being replaced.
+            storage.update_streaming_message(
+                conversation_id, msg_index, stage3=None, streaming=True
+            )
 
             label_to_model = metadata.get('label_to_model')
             yield f"data: {json.dumps({'type': 'redteam_start'})}\n\n"

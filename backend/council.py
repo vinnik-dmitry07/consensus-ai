@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .config import TITLE_MODEL
 from .openrouter import (
-    catalogue_model_id as base_model_id,
+    model_family,
     query_model,
     query_model_result,
 )
@@ -34,13 +34,41 @@ class Stage1AllFailed(Exception):
         self.failures = failures
 
 
+def usable_stage1_results(
+    council_models: List[str],
+    n: int,
+    existing_results: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Prior Stage 1 samples a resume may still reuse, in their original order.
+
+    The council can be edited between the first attempt and the retry, so drop
+    answers from models that are no longer on it and any sample beyond the
+    current n_samples. Keeping them would let a model the user removed win the
+    ranking and reach the chairman.
+    """
+    allowed = set(council_models)
+    kept: List[Dict[str, Any]] = []
+    used: Counter = Counter()
+    for result in existing_results or []:
+        model = result.get('model')
+        if model not in allowed or used[model] >= n:
+            continue
+        used[model] += 1
+        kept.append(result)
+    return kept
+
+
 def pending_stage1_slots(
     council_models: List[str],
     n: int,
     existing_results: Optional[List[Dict[str, Any]]] = None,
 ) -> List[str]:
     """Remaining Stage 1 samples after counting existing successes per model."""
-    used = Counter(result['model'] for result in existing_results or [])
+    used = Counter(
+        result['model']
+        for result in usable_stage1_results(council_models, n, existing_results)
+    )
     pending = []
     for model in council_models:
         pending.extend([model] * max(0, n - used[model]))
@@ -50,13 +78,16 @@ def pending_stage1_slots(
 def retained_stage1_failures(
     existing_failures: Optional[List[Dict[str, Any]]],
     pending_models: List[str],
+    council_models: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Keep prior failures only for models that will not be queried again."""
+    """Keep prior failures only for council models that will not be queried again."""
     pending_set = set(pending_models)
+    allowed = set(council_models) if council_models is not None else None
     return [
         failure
         for failure in (existing_failures or [])
         if failure.get('model') not in pending_set
+        and (allowed is None or failure.get('model') in allowed)
     ]
 
 
@@ -161,12 +192,12 @@ def build_judge_view(
         self_exclusion = settings.self_exclusion
 
     all_indices = list(range(len(stage1_results)))
-    judge_base = base_model_id(judge_model)
+    judge_family = model_family(judge_model)
 
     if self_exclusion:
         eligible = [
             i for i in all_indices
-            if base_model_id(stage1_results[i]['model']) != judge_base
+            if model_family(stage1_results[i]['model']) != judge_family
         ]
         excluded = True
         if not eligible:
@@ -489,12 +520,13 @@ async def stage1_collect_responses_streaming(
         n = settings.n_samples
 
     messages = [{'role': 'user', 'content': user_query}]
-    total_slots = len(settings.council_models) * n
-    all_results = list(existing_results or [])
-    pending_models = pending_stage1_slots(
-        settings.council_models, n, all_results
+    council_models = list(settings.council_models)
+    total_slots = len(council_models) * n
+    all_results = usable_stage1_results(council_models, n, existing_results)
+    pending_models = pending_stage1_slots(council_models, n, all_results)
+    failures = retained_stage1_failures(
+        existing_failures, pending_models, council_models
     )
-    failures = retained_stage1_failures(existing_failures, pending_models)
 
     yield ('init', {
         'total_models': total_slots,
@@ -744,12 +776,12 @@ def _pick_red_team_model(
 ) -> Tuple[str, bool]:
     """Choose a red-team model, avoiding the leader's family when possible."""
     requested = settings.red_team_model or settings.chairman_model
-    leader_base = base_model_id(leader_model)
-    if base_model_id(requested) != leader_base:
+    leader_family = model_family(leader_model)
+    if model_family(requested) != leader_family:
         return requested, False
     for row in response_rankings:
         candidate = row['model']
-        if base_model_id(candidate) != leader_base:
+        if model_family(candidate) != leader_family:
             return candidate, False
     return requested, True
 
@@ -822,7 +854,7 @@ def _family_top1_agreement(
 ) -> float:
     """Share of sighted judges whose first pick is the leader's family."""
     leader = response_rankings[0]
-    leader_family = base_model_id(leader.get('model') or '')
+    leader_family = model_family(leader.get('model') or '')
     index_to_model = {
         int(row['index']): row.get('model') or ''
         for row in response_rankings
@@ -835,7 +867,7 @@ def _family_top1_agreement(
         mapping = ranking.get('label_to_index') or {}
         if mapping:
             saw_family = any(
-                base_model_id(index_to_model.get(int(idx), '')) == leader_family
+                model_family(index_to_model.get(int(idx), '')) == leader_family
                 for idx in mapping.values()
             )
         else:
@@ -846,7 +878,7 @@ def _family_top1_agreement(
         ranked = resolve_ranked_indices(ranking)
         if not ranked:
             continue
-        first_family = base_model_id(index_to_model.get(ranked[0], ''))
+        first_family = model_family(index_to_model.get(ranked[0], ''))
         if first_family == leader_family:
             votes += 1
     if eligible == 0:
@@ -917,7 +949,11 @@ def compute_consensus(
         (leader_corr is not None and leader_corr < 8)
         or top1_agreement < 0.7
         or disputed
+        or verdict is None
     ):
+        # verdict is None means the red team never returned a usable verdict:
+        # peer agreement alone has not survived an adversarial pass, so the
+        # council cannot claim HIGH. The caveat reason is already recorded.
         level = 'MEDIUM'
         if leader_corr is not None and leader_corr < 8:
             reasons.append(

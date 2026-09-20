@@ -13,6 +13,7 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 **`config.py`**
 - Contains `COUNCIL_MODELS` (list of OpenRouter model identifiers)
 - Contains `CHAIRMAN_MODEL` (model that synthesizes final answer)
+- Contains `N_SAMPLES` (independent Stage 1 answers collected per model)
 - Contains `TOP_K`, `RED_TEAM_MODEL` (None = chairman), `SELF_EXCLUSION`
 - Uses environment variable `OPENROUTER_API_KEY` from `.env`
 - Backend runs on **port 8001** (NOT 8000 - user had another app on 8000)
@@ -22,23 +23,31 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 - `query_models_parallel()`: Parallel queries using `asyncio.gather()`
 - Returns dict with 'content' and optional 'reasoning_details'
 - Graceful degradation: returns None on failure, continues with successful responses
+- `model_family()`: vendor segment of an OpenRouter id (`anthropic/…`), used for
+  self-exclusion and red-team selection — never compare raw model ids for this
+- `parse_retry_after()`: 429 backoff from the header; seconds or HTTP-date, and
+  clamped to `MAX_RETRY_AFTER_SECONDS` so one header cannot stall a run
 
 **`council.py`** - The Core Logic
 - `stage1_collect_responses()`: Parallel queries to all council models
-- `build_judge_view()`: Per-judge candidate set — exclude own model family, then seeded shuffle (`sha256(judge + query)`)
+- `usable_stage1_results()`: Prior samples a resume may reuse — drops models no longer on the council and samples beyond the current `n_samples`
+- `build_judge_view()`: Per-judge candidate set — exclude own vendor family (`model_family`), then seeded shuffle (`sha256(judge + query)`)
 - `stage2_collect_rankings()`: Thin wrapper over the streaming impl
   - Each judge gets its own anonymized `Response 1..M` labels (`label_to_index` maps to canonical Stage 1 indices)
   - Prompt asks for correctness 0–10, issues, disputed claims, then `FINAL RANKING:`
   - Canonical `label_to_model` stays `Response i+1` → model in Stage 1 order
 - `calculate_aggregate_rankings()`: Per-response normalized Borda + mean correctness + top-1 votes; per-model macro average
 - `red_team_review()`: Adversarial pass vs the leader (`VERDICT` / `CONFIDENCE`); non-fatal on failure
-- `compute_consensus()`: Council confidence `HIGH` / `MEDIUM` / `LOW` / `CONTESTED` (never "verified")
+- `compute_consensus()`: Council confidence `HIGH` / `MEDIUM` / `LOW` / `CONTESTED` (never "verified"). `HIGH` requires a red-team verdict — if the red team did not run, confidence is capped at `MEDIUM`
 - `run_post_ranking()`: Aggregation + red team + consensus used by every entry point
 - `stage3_synthesize_final()`: Chairman sees anonymized top-K only; Candidate #1 is the base draft
 - `parse_ranking_from_text()` / `parse_correctness_scores()` / `parse_issues()` / `parse_disputed_claims()`
 
 **`storage.py`**
 - JSON-based conversation storage in `data/conversations/`
+- `update_streaming_message()` uses the `UNSET` sentinel: an omitted field is
+  left alone, an explicit `None` clears it. Retries rely on this to wipe the run
+  they replace — passing `None` must not silently no-op
 - Each conversation: `{id, created_at, messages[]}`
 - Assistant messages contain: `{role, stage1, stage2, stage3, metadata}`
 - Metadata persisted: `label_to_model`, `response_rankings`, `aggregate_rankings`, `top_k_indices`, `red_team`, `consensus`
@@ -48,6 +57,8 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 - POST `/api/conversations/{id}/message` returns metadata in addition to stages
 - Streaming emits `redteam_start` / `redteam_complete` / `redteam_error` between Stage 2 and 3
 - Retry Stage 3 recomputes post-ranking (including red team)
+- `_rebuild_council_query()`: every retry endpoint rebuilds the *original* query. A message stored with `follow_up_to` is recomposed against that earlier final answer; if it is gone, the retry is refused with 400 rather than silently re-asking a bare fragment
+- Each retry clears the stages it replaces (Stage 1 retry clears stage2/stage3/metadata, Stage 2 retry clears stage3, Stage 3 retry clears stage3), so a failed retry never leaves the previous run's answer on the message
 
 ### Frontend Structure (`frontend/src/`)
 
@@ -93,7 +104,7 @@ The Stage 2 prompt is specific so both ranking and correctness parse reliably:
 3. FINAL RANKING: numbered "1. Response k" list, nothing after
 ```
 
-Self-exclusion drops the judge's own model family. Each judge sees a seeded shuffle of the remaining answers.
+Self-exclusion drops every answer from the judge's own vendor (`model_family`, i.e. the author segment of the OpenRouter id), so two Anthropic models never grade each other. If that would leave a judge with nothing to rank, exclusion is skipped for that judge and `self_excluded` is False. Each judge sees a seeded shuffle of the remaining answers.
 
 ### De-anonymization Strategy
 - Each judge receives its own `Response 1..M` labels after shuffle
@@ -140,6 +151,7 @@ Models are hardcoded in `backend/config.py`. Chairman can be same or different f
 2. **CORS Issues**: Frontend must match allowed origins in `main.py` CORS middleware
 3. **Ranking Parse Failures**: If models don't follow format, fallback regex extracts any "Response X" patterns; if no ranking parses, Stage 1 order is used (`ranking_fallback`)
 4. **Old conversations**: UI falls back to identity label mapping and hides consensus / top-K / red-team panels when metadata is missing
+5. **Resume after a settings change**: Stage 1 retry reuses stored samples, but only for models still on the council and only up to the current `n_samples`; the surviving set is written back so Stage 1 on disk matches what Stage 2 ranked
 
 ## Future Enhancement Ideas
 
