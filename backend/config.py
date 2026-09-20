@@ -12,11 +12,11 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 # Council members - list of OpenRouter model identifiers
 # ~*-latest aliases always resolve to the newest model in each family
 COUNCIL_MODELS = [
-    '~openai/gpt-latest',
+    '~openai/gpt-sol-latest',
     '~google/gemini-pro-latest',
     '~anthropic/claude-opus-latest',
     '~x-ai/grok-latest',
-    '~openai/gpt-latest-reasoning',
+    '~openai/gpt-sol-latest-reasoning',
     '~google/gemini-pro-latest-reasoning',
     '~anthropic/claude-opus-latest-reasoning',
     '~x-ai/grok-latest-reasoning',
@@ -27,6 +27,9 @@ N_SAMPLES = 3
 
 # Chairman model - synthesizes final response
 CHAIRMAN_MODEL = '~anthropic/claude-fable-latest-reasoning-high'
+
+# Cheap model for conversation titles
+TITLE_MODEL = 'google/gemini-2.5-flash'
 
 # How many top-ranked Stage 1 answers the chairman sees
 TOP_K = 3

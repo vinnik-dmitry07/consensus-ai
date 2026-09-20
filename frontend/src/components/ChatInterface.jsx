@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { markdownComponents, remarkGfmPlugin } from '../markdownComponents';
 import { api } from '../api';
@@ -10,6 +10,12 @@ import './ChatInterface.css';
 
 const MAX_FILE_SIZE = 100 * 1024;
 const MAX_ATTACHMENTS = 10;
+const INPUT_MIN_HEIGHT = 48;
+const INPUT_MAX_HEIGHT = 300;
+
+function clampInputHeight(value) {
+  return Math.min(INPUT_MAX_HEIGHT, Math.max(INPUT_MIN_HEIGHT, value));
+}
 
 const TEXT_EXTENSIONS = new Set([
   'txt', 'md', 'json', 'csv', 'py', 'js', 'jsx', 'ts', 'tsx',
@@ -75,6 +81,14 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
   const numModels = council_models.length;
   const totalStage1Responses = n_samples * numModels;
   const topK = Math.max(1, Math.min(top_k, totalStage1Responses || 1));
+  const baseModelId = (model) => (
+    String(model || '').replace('-reasoning-high', '').replace('-reasoning', '')
+  );
+  const familySizes = {};
+  for (const model of council_models) {
+    const family = baseModelId(model);
+    familySizes[family] = (familySizes[family] || 0) + 1;
+  }
   
   // Estimation constants - calibrated from actual usage data
   const avgResponseTokens = 2500;       // Average Stage 1 response length (actual ~2550)
@@ -89,11 +103,12 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
   // Stage 1 prompt: just user input
   const stage1PromptTokens = inputTokens;
   
-  // Stage 2: each judge typically excludes its own family's samples
-  const othersPerJudge = self_exclusion
-    ? Math.max(1, totalStage1Responses - n_samples)
-    : totalStage1Responses;
-  const stage2PromptTokens = stage2SystemTokens + inputTokens + (othersPerJudge * avgResponseTokens);
+  const othersForJudge = (model) => {
+    if (!self_exclusion) return totalStage1Responses;
+    const family = baseModelId(model);
+    const excluded = (familySizes[family] || 1) * n_samples;
+    return Math.max(1, totalStage1Responses - excluded);
+  };
   
   // Stage 3: top-K answers + consensus/red-team overhead
   const stage3PromptTokens = stage3SystemTokens + inputTokens + (topK * avgResponseTokens) + 800;
@@ -109,7 +124,7 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
 
   // Stage 1: N_SAMPLES calls per model
   for (const model of council_models) {
-    const baseModel = model.replace('-reasoning-high', '').replace('-reasoning', '');
+    const baseModel = baseModelId(model);
     const isReasoning = model.includes('reasoning');
     const modelPricing = pricing[baseModel]?.pricing || {};
     
@@ -135,9 +150,10 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
     totalCost += totalModelCost;
   }
 
+  let stage2TotalPrompt = 0;
   // Stage 2: One call per model, but evaluating ALL N_SAMPLES×MODELS responses
   for (const model of council_models) {
-    const baseModel = model.replace('-reasoning-high', '').replace('-reasoning', '');
+    const baseModel = baseModelId(model);
     const isReasoning = model.includes('reasoning');
     const modelPricing = pricing[baseModel]?.pricing || {};
     
@@ -145,6 +161,10 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
     const completionPrice = parseFloat(modelPricing.completion || '0');
     const reasoningPrice = parseFloat(modelPricing.internal_reasoning || '0');
     
+    const stage2PromptTokens = (
+      stage2SystemTokens + inputTokens + (othersForJudge(model) * avgResponseTokens)
+    );
+    stage2TotalPrompt += stage2PromptTokens;
     let cost = stage2PromptTokens * promptPrice;
     cost += avgRankingTokens * completionPrice;
     if (isReasoning) {
@@ -158,7 +178,7 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
   }
 
   // Stage 3: Chairman model synthesizes final answer
-  const chairmanBase = chairman_model.replace('-reasoning-high', '').replace('-reasoning', '');
+  const chairmanBase = baseModelId(chairman_model);
   const isChairmanReasoning = chairman_model.includes('reasoning');
   const isHighEffort = chairman_model.includes('-reasoning-high');
   const chairmanPricing = pricing[chairmanBase]?.pricing || {};
@@ -180,7 +200,7 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
   totalCost += stage3Cost;
 
   const redTeamId = red_team_model || chairman_model;
-  const redTeamBase = redTeamId.replace('-reasoning-high', '').replace('-reasoning', '');
+  const redTeamBase = baseModelId(redTeamId);
   const isRedTeamReasoning = redTeamId.includes('reasoning');
   const redTeamPricing = pricing[redTeamBase]?.pricing || {};
   const redPromptPrice = parseFloat(redTeamPricing.prompt || '0');
@@ -205,9 +225,8 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
       totalCompletion: avgResponseTokens * totalStage1Responses,
     },
     stage2: {
-      promptPerCall: stage2PromptTokens,
       completionPerCall: avgRankingTokens,
-      totalPrompt: stage2PromptTokens * numModels,
+      totalPrompt: stage2TotalPrompt,
       totalCompletion: avgRankingTokens * numModels,
     },
     redteam: {
@@ -300,6 +319,32 @@ export default function ChatInterface({
   const [costExpanded, setCostExpanded] = useState(false);
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
+  const inputRef = useRef(null);
+  const wrapRef = useRef(null);
+  const wrapObserverRef = useRef(null);
+  const userFloorRef = useRef(0);
+  const lastAppliedHeightRef = useRef(INPUT_MIN_HEIGHT);
+
+  const setWrapRef = useCallback((node) => {
+    if (wrapObserverRef.current) {
+      wrapObserverRef.current.disconnect();
+      wrapObserverRef.current = null;
+    }
+    wrapRef.current = node;
+    if (!node || typeof ResizeObserver === 'undefined') return;
+
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      const box = entry.borderBoxSize;
+      const boxSize = Array.isArray(box) ? box[0] : box;
+      const height = boxSize?.blockSize ?? entry.contentRect.height;
+      if (Math.abs(height - lastAppliedHeightRef.current) < 2) return;
+      userFloorRef.current = clampInputHeight(height);
+    });
+    observer.observe(node);
+    wrapObserverRef.current = observer;
+  }, []);
 
   // Fetch pricing data on mount and when settings change
   useEffect(() => {
@@ -384,6 +429,7 @@ export default function ChatInterface({
         .filter((item) => item.kind === 'file')
         .map((item) => ({ name: item.name, content: item.content }));
       onSendMessage(input, images, files);
+      userFloorRef.current = 0;
       setInput('');
       setAttachments([]);
     }
@@ -414,6 +460,31 @@ export default function ChatInterface({
       }
     }
   };
+
+  const applyWrapHeight = (height) => {
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+    lastAppliedHeightRef.current = height;
+    wrap.style.height = `${height}px`;
+  };
+
+  const measureContentHeight = () => {
+    const textarea = inputRef.current;
+    if (!textarea || !textarea.value) return INPUT_MIN_HEIGHT;
+    textarea.style.height = 'auto';
+    const measured = textarea.scrollHeight;
+    textarea.style.height = '100%';
+    return clampInputHeight(measured);
+  };
+
+  const syncInputHeight = () => {
+    const next = clampInputHeight(Math.max(measureContentHeight(), userFloorRef.current));
+    applyWrapHeight(next);
+  };
+
+  useLayoutEffect(() => {
+    syncInputHeight();
+  }, [input]);
 
   const handleFileSelect = async (e) => {
     const selectedFiles = Array.from(e.target.files);
@@ -904,8 +975,9 @@ export default function ChatInterface({
                   <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
                 </svg>
               </button>
-              <div className="message-input-wrap">
+              <div className="message-input-wrap" ref={setWrapRef}>
                 <textarea
+                  ref={inputRef}
                   className="message-input"
                   placeholder="Ask your question... (Shift+Enter for new line, Enter to send)"
                   value={input}
@@ -913,7 +985,7 @@ export default function ChatInterface({
                   onKeyDown={handleKeyDown}
                   onPaste={handlePaste}
                   disabled={isLoading}
-                  rows={3}
+                  rows={1}
                 />
               </div>
               <button

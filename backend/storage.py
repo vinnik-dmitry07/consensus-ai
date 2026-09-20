@@ -2,11 +2,17 @@
 
 import json
 import os
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .config import DATA_DIR
+
+_CONVERSATION_ID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+    re.IGNORECASE,
+)
 
 
 def ensure_data_dir():
@@ -15,8 +21,17 @@ def ensure_data_dir():
 
 
 def get_conversation_path(conversation_id: str) -> str:
-    """Get the file path for a conversation."""
-    return os.path.join(DATA_DIR, f"{conversation_id}.json")
+    """Return the JSON path for a conversation, or raise on an unsafe id."""
+    if not isinstance(conversation_id, str) or not _CONVERSATION_ID_RE.fullmatch(
+        conversation_id
+    ):
+        raise ValueError('Invalid conversation id')
+
+    base = Path(DATA_DIR).resolve()
+    path = (base / f'{conversation_id}.json').resolve()
+    if not path.is_relative_to(base):
+        raise ValueError('Invalid conversation id')
+    return str(path)
 
 
 def create_conversation(conversation_id: str) -> Dict[str, Any]:
@@ -33,17 +48,13 @@ def create_conversation(conversation_id: str) -> Dict[str, Any]:
 
     conversation = {
         "id": conversation_id,
-        "created_at": datetime.utcnow().isoformat(),
+        'created_at': datetime.now(timezone.utc).isoformat(),
         "title": "New Conversation",
         "messages": [],
         "removed": False
     }
 
-    # Save to file
-    path = get_conversation_path(conversation_id)
-    with open(path, 'w') as f:
-        json.dump(conversation, f, indent=2)
-
+    save_conversation(conversation)
     return conversation
 
 
@@ -57,7 +68,10 @@ def get_conversation(conversation_id: str) -> Optional[Dict[str, Any]]:
     Returns:
         Conversation dict or None if not found
     """
-    path = get_conversation_path(conversation_id)
+    try:
+        path = get_conversation_path(conversation_id)
+    except ValueError:
+        return None
 
     if not os.path.exists(path):
         return None
@@ -75,9 +89,10 @@ def save_conversation(conversation: Dict[str, Any]):
     """
     ensure_data_dir()
 
-    path = get_conversation_path(conversation['id'])
-    with open(path, 'w') as f:
-        json.dump(conversation, f, indent=2)
+    path = Path(get_conversation_path(conversation['id']))
+    tmp = path.with_name(f'{path.stem}.tmp.json')
+    tmp.write_text(json.dumps(conversation, indent=2), encoding='utf-8')
+    tmp.replace(path)
 
 
 def list_conversations() -> List[Dict[str, Any]]:
@@ -91,20 +106,17 @@ def list_conversations() -> List[Dict[str, Any]]:
 
     conversations = []
     for filename in os.listdir(DATA_DIR):
-        if filename.endswith('.json'):
-            path = os.path.join(DATA_DIR, filename)
-            with open(path, 'r') as f:
-                data = json.load(f)
-                # Skip removed conversations
-                if data.get("removed", False):
-                    continue
-                # Return metadata only
-                conversations.append({
-                    "id": data["id"],
-                    "created_at": data["created_at"],
-                    "title": data.get("title", "New Conversation"),
-                    "message_count": len(data["messages"])
-                })
+        if not filename.endswith('.json'):
+            continue
+        data = get_conversation(filename[:-5])
+        if data is None or data.get('removed'):
+            continue
+        conversations.append({
+            'id': data['id'],
+            'created_at': data['created_at'],
+            'title': data.get('title', 'New Conversation'),
+            'message_count': len(data['messages']),
+        })
 
     # Sort by creation time, newest first
     conversations.sort(key=lambda x: x["created_at"], reverse=True)

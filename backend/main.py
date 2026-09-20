@@ -27,7 +27,13 @@ from .council import (
     stage2_collect_rankings_streaming,
     stage3_synthesize_final,
 )
-from .openrouter import get_credits, get_key_info, get_models_pricing
+from .openrouter import (
+    CatalogueUnavailable,
+    get_credits,
+    get_key_info,
+    get_models_pricing,
+    unknown_catalogue_ids,
+)
 from .settings import settings
 
 app = FastAPI(title="LLM Council API")
@@ -333,6 +339,23 @@ async def _emit_stage2_sse(
     yield f"data: {json.dumps({'type': 'stage2_complete', 'data': results, 'failures': failures, 'metadata': {'label_to_model': label_to_model}})}\n\n"
 
 
+def _persist_generic_error(
+    conversation_id: str,
+    msg_index: int,
+    stage: Optional[int],
+    exc: Exception,
+) -> str:
+    storage.update_streaming_message(
+        conversation_id,
+        msg_index,
+        error={'stage': stage, 'message': str(exc)},
+        streaming=False,
+    )
+    return (
+        f"data: {json.dumps({'type': 'error', 'stage': stage, 'message': str(exc)})}\n\n"
+    )
+
+
 def _persist_stage2_error(
     conversation_id: str,
     msg_index: int,
@@ -436,7 +459,26 @@ async def update_settings(request: UpdateSettingsRequest):
         update_data['self_exclusion'] = request.self_exclusion
     if request.api_key is not None:
         update_data['api_key'] = request.api_key
-    
+
+    council = update_data.get('council_models', settings.council_models)
+    chairman = update_data.get('chairman_model', settings.chairman_model)
+    red_team = update_data.get('red_team_model', settings.red_team_model)
+    to_check = list(council) + [chairman]
+    if red_team:
+        to_check.append(red_team)
+    try:
+        unknown = await unknown_catalogue_ids(to_check)
+    except CatalogueUnavailable:
+        raise HTTPException(
+            status_code=503,
+            detail='Model catalogue unavailable',
+        )
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail={'unknown_models': unknown},
+        )
+
     settings.update_from_dict(update_data)
     return settings.to_dict()
 
@@ -723,8 +765,14 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             yield f"data: {json.dumps({'type': 'complete'})}\n\n"
 
         except Exception as e:
-            # Send generic error event
-            yield f"data: {json.dumps({'type': 'error', 'stage': current_stage, 'message': str(e)})}\n\n"
+            if msg_index is not None:
+                yield _persist_generic_error(
+                    conversation_id, msg_index, current_stage, e
+                )
+            else:
+                yield (
+                    f"data: {json.dumps({'type': 'error', 'stage': current_stage, 'message': str(e)})}\n\n"
+                )
 
     return StreamingResponse(
         event_generator(),
@@ -778,6 +826,7 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
         stage3_result = None
         label_to_model = None
         metadata = {}
+        current_stage = 1
 
         try:
             # Mark as streaming, clear stage2/stage3 but keep stage1 for resume
@@ -816,6 +865,7 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
                 yield f"data: {json.dumps({'type': 'stage1_error', 'stage': 1, 'message': str(e), 'failures': failures})}\n\n"
                 return
 
+            current_stage = 2
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
             collected_s2 = {}
             try:
@@ -840,6 +890,7 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
                 yield f"data: {json.dumps({'type': 'redteam_error', 'message': red_team_error or 'Red-team review unavailable', 'metadata': metadata})}\n\n"
 
             # Stage 3: Synthesize final answer
+            current_stage = 3
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             try:
                 stage3_result = await stage3_synthesize_final(
@@ -864,7 +915,7 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
             yield f"data: {json.dumps({'type': 'complete'})}\n\n"
 
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            yield _persist_generic_error(conversation_id, msg_index, current_stage, e)
 
     return StreamingResponse(
         event_generator(),
@@ -909,6 +960,7 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
         stage3_result = None
         label_to_model = None
         metadata = {}
+        current_stage = 2
 
         try:
             # Mark as streaming
@@ -940,6 +992,7 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
                 yield f"data: {json.dumps({'type': 'redteam_error', 'message': red_team_error or 'Red-team review unavailable', 'metadata': metadata})}\n\n"
 
             # Stage 3: Synthesize final answer
+            current_stage = 3
             yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
             try:
                 stage3_result = await stage3_synthesize_final(
@@ -963,7 +1016,7 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
             yield f"data: {json.dumps({'type': 'complete'})}\n\n"
 
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            yield _persist_generic_error(conversation_id, msg_index, current_stage, e)
 
     return StreamingResponse(
         event_generator(),
@@ -991,7 +1044,6 @@ async def retry_stage3_stream(conversation_id: str, request: RetryStageRequest):
 
     stage1_results = assistant_msg.get("stage1")
     stage2_results = assistant_msg.get("stage2")
-    metadata = assistant_msg.get("metadata", {})
 
     if not stage1_results:
         raise HTTPException(status_code=400, detail="Stage 1 results not available. Retry Stage 1 first.")
@@ -1009,11 +1061,12 @@ async def retry_stage3_stream(conversation_id: str, request: RetryStageRequest):
     msg_index = request.message_index
 
     async def event_generator():
+        metadata = dict(assistant_msg.get('metadata') or {})
         try:
             # Mark as streaming
             storage.update_streaming_message(conversation_id, msg_index, streaming=True)
 
-            label_to_model = (metadata or {}).get('label_to_model')
+            label_to_model = metadata.get('label_to_model')
             yield f"data: {json.dumps({'type': 'redteam_start'})}\n\n"
             metadata, red_team_ok, red_team_error = await _run_and_save_post_ranking(
                 conversation_id, msg_index, query_text,
@@ -1047,7 +1100,7 @@ async def retry_stage3_stream(conversation_id: str, request: RetryStageRequest):
             yield f"data: {json.dumps({'type': 'complete'})}\n\n"
 
         except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            yield _persist_generic_error(conversation_id, msg_index, 3, e)
 
     return StreamingResponse(
         event_generator(),
@@ -1058,4 +1111,4 @@ async def retry_stage3_stream(conversation_id: str, request: RetryStageRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host='127.0.0.1', port=8001)

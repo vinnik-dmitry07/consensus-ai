@@ -142,34 +142,6 @@ export const api = {
   },
 
   /**
-   * Send a message in a conversation.
-   * @param {string} conversationId - The conversation ID
-   * @param {string} content - The message content
-   * @param {string[]} images - Optional array of base64 image data URLs
-   * @param {{name: string, content: string}[]} files - Optional attached text files
-   */
-  async sendMessage(conversationId, content, images = [], files = []) {
-    const response = await fetch(
-      `${API_BASE}/api/conversations/${conversationId}/message`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          content,
-          images,
-          files,
-        }),
-      }
-    );
-    if (!response.ok) {
-      throw new Error('Failed to send message');
-    }
-    return response.json();
-  },
-
-  /**
    * Send a message and receive streaming updates.
    * @param {string} conversationId - The conversation ID
    * @param {string} content - The message content

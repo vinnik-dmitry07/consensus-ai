@@ -207,7 +207,8 @@
 .message-input-wrap {
   flex: 1;
   min-width: 0;
-  min-height: 80px;
+  height: 48px;
+  min-height: 48px;
   max-height: 300px;
   resize: vertical;
   overflow: hidden;
@@ -218,8 +219,8 @@
   display: block;
   width: 100%;
   height: 100%;
-  min-height: 80px;
-  padding: 14px;
+  min-height: 48px;
+  padding: 11px 14px;
   background: var(--bg-primary);
   border: 1px solid var(--border-color);
   border-radius: 8px;
@@ -245,7 +246,8 @@
 }
 
 .send-button {
-  padding: 14px 28px;
+  height: 48px;
+  padding: 0 28px;
   background: var(--accent);
   border: 1px solid var(--accent);
   border-radius: 8px;
@@ -256,6 +258,9 @@
   transition: background 0.2s;
   white-space: nowrap;
   align-self: flex-end;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .send-button:hover:not(:disabled) {

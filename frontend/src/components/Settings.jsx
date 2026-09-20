@@ -75,67 +75,72 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
     );
   }, [availableModels, searchQuery]);
 
-  // Extract model size from name (e.g., "70B", "405B", "8x7B")
-  const extractSize = (name) => {
-    const match = name.match(/(\d+)x?(\d*)b/i);
-    if (!match) return 0;
-    const base = parseInt(match[1]);
-    const mult = match[2] ? parseInt(match[2]) : 1;
-    return match[0].includes('x') ? base * mult : base;
+  // Extract model size from id, then name, then description (e.g. "550B", "2.4T")
+  const parseSizeFromText = (text) => {
+    if (!text) return 0;
+    let max = 0;
+    for (const match of String(text).matchAll(/(\d+(?:\.\d+)?)\s*([bt])\b/gi)) {
+      const value = parseFloat(match[1]);
+      const size = match[2].toLowerCase() === 't' ? value * 1000 : value;
+      if (size > max) max = size;
+    }
+    return max;
   };
 
-  // Get model family from id (e.g., "meta-llama/llama-3.3-70b" -> "llama")
-  const getFamily = (id) => {
-    const name = id.split('/').pop().toLowerCase();
-    // Common family patterns
-    const families = ['llama', 'gemma', 'qwen', 'mistral', 'phi', 'deepseek', 'gemini', 'gpt', 'claude', 'olmo', 'hermes', 'dolphin', 'glm', 'yi'];
-    for (const f of families) {
-      if (name.includes(f)) return f;
+  const extractSize = (model) => {
+    for (const source of [model.id, model.name, model.description]) {
+      const size = parseSizeFromText(source);
+      if (size > 0) return size;
     }
-    return name.split('-')[0];
+    return 0;
+  };
+
+  // Family = leading alpha run of the model slug (e.g. "nvidia/nemotron-3-ultra-550b:free" -> "nemotron")
+  const getFamily = (id) => {
+    const slug = id.replace(/:free$/i, '').split('/').pop().toLowerCase();
+    const match = slug.match(/^[a-z]+/);
+    return match ? match[0] : slug;
   };
 
   // Top 8 paid models (from config.py defaults; ~*-latest aliases)
   const TOP_8_PAID = [
-    '~openai/gpt-latest',
+    '~openai/gpt-sol-latest',
     '~google/gemini-pro-latest',
     '~anthropic/claude-opus-latest',
     '~x-ai/grok-latest',
-    '~openai/gpt-latest-reasoning',
+    '~openai/gpt-sol-latest-reasoning',
     '~google/gemini-pro-latest-reasoning',
     '~anthropic/claude-opus-latest-reasoning',
     '~x-ai/grok-latest-reasoning',
   ];
 
-  // Select top 10 free general-purpose models - largest of each family
+  // Select 10 largest free models, one per family; chairman is the largest as R+
   const selectTopFreeModels = () => {
-    // Whitelist: known general-purpose model families (not code-specialized)
-    const validFamilies = ['llama', 'gemma', 'qwen', 'mistral', 'phi', 'deepseek', 'glm', 'yi', 'olmo', 'hermes', 'dolphin', 'gemini', 'gpt', 'claude'];
-    // Blacklist: code-specialized variants within those families
-    const codeVariants = ['coder', 'codestral', 'starcoder', 'codellama', 'devstral'];
-    
-    const freeModels = availableModels.filter(m => {
+    const specialized = /code|coder|codestral|devstral|starcoder|safety|guard|omni|-fin(?=:|$)|-sante(?=:|$)/i;
+
+    const freeModels = availableModels.filter((m) => {
       if (!m.id.endsWith(':free')) return false;
-      const lower = m.id.toLowerCase();
-      if (codeVariants.some(c => lower.includes(c))) return false;
-      return validFamilies.some(f => lower.includes(f));
+      return !specialized.test(m.id.toLowerCase());
     });
-    
+
     const familyBest = {};
     for (const model of freeModels) {
       const family = getFamily(model.id);
-      const size = extractSize(model.name);
-      if (!familyBest[family] || size > familyBest[family].size) {
-        familyBest[family] = { id: model.id, size };
+      const size = extractSize(model);
+      const name = model.name || model.id;
+      const current = familyBest[family];
+      if (!current || size > current.size || (size === current.size && name.localeCompare(current.name) > 0)) {
+        familyBest[family] = { id: model.id, size, name };
       }
     }
     const top = Object.values(familyBest)
-      .sort((a, b) => b.size - a.size)
+      .sort((a, b) => b.size - a.size || a.name.localeCompare(b.name))
       .slice(0, 10)
-      .map(m => m.id);
+      .map((m) => m.id);
     setCouncilModels(top);
-    // Set chairman to Qwen 235B free with reasoning+
-    setChairmanModel('qwen/qwen3-235b-a22b:free-reasoning-high');
+    if (top.length > 0) {
+      setChairmanModel(`${top[0]}-reasoning-high`);
+    }
   };
 
   // Select top 8 paid models

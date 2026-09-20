@@ -412,7 +412,20 @@ function App() {
         break;
 
       case 'error':
-        console.error('Stream error:', event.message);
+        updateIfCurrentConv((prev) => {
+          const messages = [...prev.messages];
+          const idx = getTargetMsgIndex(prev);
+          if (!messages[idx]) return prev;
+          const stage = event.stage;
+          const stagedError = stage === 1 || stage === 2 || stage === 3;
+          messages[idx] = {
+            ...messages[idx],
+            loading: { stage1: false, stage2: false, redteam: false, stage3: false },
+            streaming: false,
+            ...(stagedError ? { error: { stage, message: event.message } } : {}),
+          };
+          return { ...prev, messages };
+        });
         setIsLoading(false);
         streamingConvIdRef.current = null;
         break;

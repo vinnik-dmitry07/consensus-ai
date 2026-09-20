@@ -7,8 +7,23 @@ import re
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from .openrouter import query_model, query_model_result
+from .config import TITLE_MODEL
+from .openrouter import (
+    catalogue_model_id as base_model_id,
+    query_model,
+    query_model_result,
+)
 from .settings import settings
+
+# Colon may sit inside or outside bold: **LABEL:** or **LABEL**:
+_HEADING = r'\*{0,2}%s\*{0,2}\s*:\s*\*{0,2}'
+_RESPONSE_N = r'\*{0,2}Response\s+(\d+)\*{0,2}'
+# Line-start headers only. Colon-less "Response N" must be the whole line
+# so in-prose mentions do not open a new block.
+_RESPONSE_HEADER = re.compile(
+    r'(?m)^\s*(?:\d+\.\s*)?\*{0,2}Response\s+(\d+)\*{0,2}'
+    r'(?:\s*:\s*\*{0,2}|\s*\*{0,2}\s*$)'
+)
 
 
 class Stage1AllFailed(Exception):
@@ -106,11 +121,6 @@ def build_user_message(
         })
 
     return content
-
-
-def base_model_id(model: str) -> str:
-    """Strip reasoning suffixes so family variants share one identity."""
-    return model.replace('-reasoning-high', '').replace('-reasoning', '')
 
 
 def canonical_label_to_model(stage1_results: List[Dict[str, Any]]) -> Dict[str, str]:
@@ -252,34 +262,27 @@ def parse_ranking_from_text(ranking_text: str) -> List[str]:
     if ranking_text is None:
         return []
 
-    if 'FINAL RANKING:' in ranking_text:
-        parts = ranking_text.split('FINAL RANKING:')
-        if len(parts) >= 2:
-            ranking_section = parts[1]
-            numbered_matches = re.findall(r'\d+\.\s*Response \d+', ranking_section)
-            if numbered_matches:
-                return [re.search(r'Response \d+', m).group() for m in numbered_matches]
-            matches = re.findall(r'Response \d+', ranking_section)
-            return matches
-
-    matches = re.findall(r'Response \d+', ranking_text)
-    return matches
+    header = re.search(_HEADING % 'FINAL RANKING', ranking_text, re.IGNORECASE)
+    section = ranking_text[header.end():] if header else ranking_text
+    numbered = re.findall(rf'\d+\.\s*{_RESPONSE_N}', section)
+    if numbered:
+        return [f'Response {n}' for n in numbered]
+    return [f'Response {n}' for n in re.findall(_RESPONSE_N, section)]
 
 
 def _evaluation_section(text: str) -> str:
-    """Text before DISPUTED CLAIMS / FINAL RANKING."""
-    section = text
-    if 'DISPUTED CLAIMS:' in section:
-        section = section.split('DISPUTED CLAIMS:')[0]
-    if 'FINAL RANKING:' in section:
-        section = section.split('FINAL RANKING:')[0]
-    return section
+    text = re.split(
+        _HEADING % 'DISPUTED CLAIMS', text, maxsplit=1, flags=re.IGNORECASE
+    )[0]
+    return re.split(
+        _HEADING % 'FINAL RANKING', text, maxsplit=1, flags=re.IGNORECASE
+    )[0]
 
 
 def _iter_response_blocks(text: str):
     """Yield (label, block_body) for each Response N: section."""
     section = _evaluation_section(text)
-    matches = list(re.finditer(r'Response\s+(\d+)\s*:', section))
+    matches = list(_RESPONSE_HEADER.finditer(section))
     for i, match in enumerate(matches):
         label = f'Response {match.group(1)}'
         start = match.end()
@@ -294,7 +297,7 @@ def parse_correctness_scores(text: str) -> Dict[str, Optional[float]]:
         return scores
     for label, block in _iter_response_blocks(text):
         match = re.search(
-            r'Correctness:\s*(\d+(?:\.\d+)?)\s*(?:/\s*10)?',
+            _HEADING % 'Correctness' + r'\s*\*{0,2}(\d+(?:\.\d+)?)\*{0,2}\s*(?:/\s*10)?',
             block,
             re.IGNORECASE,
         )
@@ -312,7 +315,11 @@ def parse_issues(text: str) -> Dict[str, List[str]]:
         return issues
     none_tokens = {'none', 'none.', 'n/a', 'na', '-', '—'}
     for label, block in _iter_response_blocks(text):
-        match = re.search(r'Issues:\s*(.*)', block, re.IGNORECASE | re.DOTALL)
+        match = re.search(
+            rf'{_HEADING % "Issues"}\s*(.*)',
+            block,
+            re.IGNORECASE | re.DOTALL,
+        )
         if not match:
             issues[label] = []
             continue
@@ -332,11 +339,15 @@ def parse_issues(text: str) -> Dict[str, List[str]]:
 
 def parse_disputed_claims(text: str) -> List[str]:
     """Parse the DISPUTED CLAIMS section. 'none' -> []."""
-    if not text or 'DISPUTED CLAIMS:' not in text:
+    if not text:
         return []
-    section = text.split('DISPUTED CLAIMS:', 1)[1]
-    if 'FINAL RANKING:' in section:
-        section = section.split('FINAL RANKING:')[0]
+    heading = re.search(_HEADING % 'DISPUTED CLAIMS', text, re.IGNORECASE)
+    if not heading:
+        return []
+    section = text[heading.end():]
+    section = re.split(
+        _HEADING % 'FINAL RANKING', section, maxsplit=1, flags=re.IGNORECASE
+    )[0]
     stripped = section.strip()
     if re.match(r'^(none|n/a|na|-|—)\.?\s*$', stripped, re.IGNORECASE):
         return []
@@ -614,7 +625,11 @@ def calculate_aggregate_rankings(
 
     for ranking in stage2_results:
         ranked = resolve_ranked_indices(ranking)
-        m_j = len(ranked)
+        shown = ranking.get('label_to_index') or {}
+        # Score listed candidates against the shown set. Unranked shown
+        # candidates abstain (no 0), so a lazy top-3 list inflates those
+        # three scores instead of treating 3rd-of-3 as last place.
+        m_j = len(shown) if shown else len(ranked)
         if m_j >= 2:
             for pos, idx in enumerate(ranked, start=1):
                 if 0 <= idx < n:
@@ -801,6 +816,44 @@ Meaning:
     }
 
 
+def _family_top1_agreement(
+    response_rankings: List[Dict[str, Any]],
+    stage2_results: List[Dict[str, Any]],
+) -> float:
+    """Share of sighted judges whose first pick is the leader's family."""
+    leader = response_rankings[0]
+    leader_family = base_model_id(leader.get('model') or '')
+    index_to_model = {
+        int(row['index']): row.get('model') or ''
+        for row in response_rankings
+        if row.get('index') is not None
+    }
+
+    votes = 0
+    eligible = 0
+    for ranking in stage2_results:
+        mapping = ranking.get('label_to_index') or {}
+        if mapping:
+            saw_family = any(
+                base_model_id(index_to_model.get(int(idx), '')) == leader_family
+                for idx in mapping.values()
+            )
+        else:
+            saw_family = True
+        if not saw_family:
+            continue
+        eligible += 1
+        ranked = resolve_ranked_indices(ranking)
+        if not ranked:
+            continue
+        first_family = base_model_id(index_to_model.get(ranked[0], ''))
+        if first_family == leader_family:
+            votes += 1
+    if eligible == 0:
+        return 0.0
+    return votes / eligible
+
+
 def compute_consensus(
     response_rankings: List[Dict[str, Any]],
     stage2_results: List[Dict[str, Any]],
@@ -824,8 +877,7 @@ def compute_consensus(
         }
 
     leader = response_rankings[0]
-    n_judges = max(len(stage2_results), 1)
-    top1_agreement = leader.get('top1_votes', 0) / n_judges
+    top1_agreement = _family_top1_agreement(response_rankings, stage2_results)
     leader_corr = leader.get('mean_correctness')
 
     disputed = []
@@ -1107,7 +1159,7 @@ Title:'''
 
     messages = [{'role': 'user', 'content': title_prompt}]
 
-    response = await query_model('google/gemini-2.5-flash', messages, timeout=30.0)
+    response = await query_model(TITLE_MODEL, messages, timeout=30.0)
 
     if response is None:
         return 'New Conversation'

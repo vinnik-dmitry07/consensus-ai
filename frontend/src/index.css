@@ -79,6 +79,18 @@ body {
   overflow-wrap: break-word;
 }
 
+.markdown-content a,
+.markdown-content a:visited {
+  color: var(--accent);
+  text-decoration: underline;
+  transition: color 0.2s ease;
+}
+
+.markdown-content a:hover,
+.markdown-content a:focus-visible {
+  color: var(--accent-hover);
+}
+
 .markdown-content p {
   margin: 0 0 12px 0;
 }

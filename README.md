@@ -87,11 +87,11 @@ Defaults live in `backend/config.py`. You can also change everything in the Sett
 
 ```python
 COUNCIL_MODELS = [
-    "~openai/gpt-latest",
+    "~openai/gpt-sol-latest",
     "~google/gemini-pro-latest",
     "~anthropic/claude-opus-latest",
     "~x-ai/grok-latest",
-    "~openai/gpt-latest-reasoning",
+    "~openai/gpt-sol-latest-reasoning",
     "~google/gemini-pro-latest-reasoning",
     "~anthropic/claude-opus-latest-reasoning",
     "~x-ai/grok-latest-reasoning",

@@ -31,6 +31,34 @@ def resolve_max_tokens(model: str, override: Optional[int] = None) -> int:
     return OPENROUTER_MAX_TOKENS
 
 
+class CatalogueUnavailable(Exception):
+    """OpenRouter model list could not be loaded."""
+
+
+def catalogue_model_id(model: str) -> str:
+    """Strip local reasoning suffixes so the id matches the OpenRouter catalogue."""
+    return model.replace('-reasoning-high', '').replace('-reasoning', '')
+
+
+async def unknown_catalogue_ids(models: List[str]) -> List[str]:
+    """Return catalogue ids that are not in the OpenRouter model list."""
+    pricing = await get_models_pricing()
+    if not pricing:
+        raise CatalogueUnavailable('OpenRouter model catalogue unavailable')
+    unknown = []
+    seen = set()
+    for model in models:
+        if not model or not str(model).strip():
+            continue
+        cid = catalogue_model_id(str(model).strip())
+        if cid in seen:
+            continue
+        seen.add(cid)
+        if cid not in pricing:
+            unknown.append(cid)
+    return unknown
+
+
 def parse_http_error(response: httpx.Response) -> Dict[str, Any]:
     """Extract status, user-facing message, and raw detail from an HTTP error."""
     status = response.status_code
@@ -88,18 +116,17 @@ async def get_models_pricing() -> Dict[str, Dict[str, Any]]:
             response.raise_for_status()
             data = response.json()
 
-            # Build cache: model_id -> model info
-            _models_cache = {}
-            _models_cache_time = time.time()
+            built = {}
             for model in data.get('data', []):
                 model_id = model.get('id')
                 if model_id:
-                    _models_cache[model_id] = {
+                    built[model_id] = {
                         'name': model.get('name'),
                         'pricing': model.get('pricing', {}),
                         'description': model.get('description', ''),
                     }
-            
+            _models_cache = built
+            _models_cache_time = time.time()
             return _models_cache
     except Exception as e:
         print(f"Error fetching models: {e}")
@@ -265,44 +292,3 @@ async def query_model(
         'reasoning_details': result.get('reasoning_details'),
         'usage': result.get('usage', {}),
     }
-
-
-async def query_models_parallel(
-    models: List[str], messages: List[Dict[str, str]], max_concurrent: int = 5
-) -> Dict[str, Optional[Dict[str, Any]]]:
-    """
-    Query multiple models in parallel with rate limiting.
-
-    Args:
-        models: List of OpenRouter model identifiers
-        messages: List of message dicts to send to each model
-        max_concurrent: Max concurrent requests to avoid rate limits
-
-    Returns:
-        Dict mapping model identifier to response dict (or None if failed)
-    """
-    # Filter out non-existent models first
-    available = await get_models_pricing()
-    valid_models = []
-    for m in models:
-        base_model = m.replace('-reasoning-high', '').replace('-reasoning', '')
-        if base_model in available:
-            valid_models.append(m)
-        else:
-            print(f'Model {m} not available - skipping')
-
-    semaphore = asyncio.Semaphore(max_concurrent)
-
-    async def limited_query(model: str):
-        async with semaphore:
-            return await query_model(model, messages)
-
-    tasks = [limited_query(model) for model in valid_models]
-    responses = await asyncio.gather(*tasks)
-
-    result = {model: response for model, response in zip(valid_models, responses)}
-    # Add None for skipped models
-    for m in models:
-        if m not in result:
-            result[m] = None
-    return result
