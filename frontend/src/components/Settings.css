@@ -100,6 +100,17 @@
   padding: 24px;
 }
 
+.engine-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.engine-url-input {
+  margin-top: 4px;
+}
+
 .settings-section {
   margin-bottom: 32px;
 }

@@ -1,277 +1,84 @@
 /**
- * API client for the LLM Council backend.
+ * API client for the LLM Council.
+ *
+ * The method surface stays stable. Calls go to whichever engine is selected
+ * (in-browser IndexedDB, or the local Python backend).
  */
 
-const API_BASE = 'http://localhost:8001';
+import { getEngine } from './engine/index.js';
 
-/**
- * Pull the backend's own explanation out of an error response.
- * A retry can be refused for a reason the user can act on (for example, the
- * earlier answer a follow-up was built on is gone), so show that, not a stub.
- */
-async function errorDetail(response, fallback) {
-  try {
-    const body = await response.json();
-    const detail = body?.detail;
-    if (typeof detail === 'string' && detail.trim()) return detail;
-  } catch {
-    // Not JSON, or already consumed - fall through to the generic message.
-  }
-  return fallback;
+function engine() {
+  return getEngine();
 }
 
 export const api = {
-  /**
-   * Get OpenRouter credits balance.
-   */
-  async getCredits() {
-    const response = await fetch(`${API_BASE}/api/credits`);
-    if (!response.ok) {
-      throw new Error('Failed to fetch credits');
-    }
-    return response.json();
+  getCredits() {
+    return engine().getCredits();
   },
 
-  /**
-   * Get pricing information for council models.
-   */
-  async getPricing() {
-    const response = await fetch(`${API_BASE}/api/pricing`);
-    if (!response.ok) {
-      throw new Error('Failed to fetch pricing');
-    }
-    return response.json();
+  getPricing() {
+    return engine().getPricing();
   },
 
-  /**
-   * Get all available models from OpenRouter.
-   */
-  async getAvailableModels() {
-    const response = await fetch(`${API_BASE}/api/models`);
-    if (!response.ok) {
-      throw new Error('Failed to fetch models');
-    }
-    return response.json();
+  getAvailableModels() {
+    return engine().getAvailableModels();
   },
 
-  /**
-   * Get current council settings.
-   */
-  async getSettings() {
-    const response = await fetch(`${API_BASE}/api/settings`);
-    if (!response.ok) {
-      throw new Error('Failed to fetch settings');
-    }
-    return response.json();
+  getSettings() {
+    return engine().getSettings();
   },
 
-  /**
-   * Update council settings.
-   * @param {Object} settings - Settings to update
-   * @param {string[]} [settings.council_models] - List of model IDs
-   * @param {number} [settings.n_samples] - Number of samples per model
-   * @param {string} [settings.chairman_model] - Chairman model ID
-   * @param {number} [settings.top_k] - Candidates passed to the chairman
-   * @param {boolean} [settings.self_exclusion] - Judges skip their own family
-   * @param {string} [settings.red_team_model] - Red-team model (empty = chairman)
-   */
-  async updateSettings(settings) {
-    const response = await fetch(`${API_BASE}/api/settings`, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(settings),
-    });
-    if (!response.ok) {
-      throw new Error('Failed to update settings');
-    }
-    return response.json();
+  updateSettings(settings) {
+    return engine().updateSettings(settings);
   },
 
-  /**
-   * Reset council settings to defaults.
-   */
-  async resetSettings() {
-    const response = await fetch(`${API_BASE}/api/settings/reset`, {
-      method: 'POST',
-    });
-    if (!response.ok) {
-      throw new Error('Failed to reset settings');
-    }
-    return response.json();
+  resetSettings() {
+    return engine().resetSettings();
   },
 
-  /**
-   * List all conversations.
-   */
-  async listConversations() {
-    const response = await fetch(`${API_BASE}/api/conversations`);
-    if (!response.ok) {
-      throw new Error('Failed to list conversations');
+  forgetApiKey() {
+    const current = engine();
+    if (typeof current.forgetApiKey !== 'function') {
+      throw new Error('This engine does not store an API key in the browser');
     }
-    return response.json();
+    return current.forgetApiKey();
   },
 
-  /**
-   * Create a new conversation.
-   */
-  async createConversation() {
-    const response = await fetch(`${API_BASE}/api/conversations`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({}),
-    });
-    if (!response.ok) {
-      throw new Error('Failed to create conversation');
-    }
-    return response.json();
+  listConversations() {
+    return engine().listConversations();
   },
 
-  /**
-   * Get a specific conversation.
-   */
-  async getConversation(conversationId) {
-    const response = await fetch(
-      `${API_BASE}/api/conversations/${conversationId}`
+  createConversation() {
+    return engine().createConversation();
+  },
+
+  getConversation(conversationId) {
+    return engine().getConversation(conversationId);
+  },
+
+  removeConversation(conversationId) {
+    return engine().removeConversation(conversationId);
+  },
+
+  exportConversations() {
+    return engine().exportConversations();
+  },
+
+  importConversations(payload) {
+    return engine().importConversations(payload);
+  },
+
+  sendMessageStream(conversationId, content, images, files, onEvent) {
+    return engine().sendMessageStream(
+      conversationId,
+      content,
+      images,
+      files,
+      onEvent,
     );
-    if (!response.ok) {
-      throw new Error('Failed to get conversation');
-    }
-    return response.json();
   },
 
-  /**
-   * Remove a conversation (soft delete).
-   */
-  async removeConversation(conversationId) {
-    const response = await fetch(
-      `${API_BASE}/api/conversations/${conversationId}`,
-      { method: 'DELETE' }
-    );
-    if (!response.ok) {
-      throw new Error('Failed to remove conversation');
-    }
-    return response.json();
-  },
-
-  /**
-   * Send a message and receive streaming updates.
-   * @param {string} conversationId - The conversation ID
-   * @param {string} content - The message content
-   * @param {string[]} images - Optional array of base64 image data URLs
-   * @param {{name: string, content: string}[]} files - Optional attached text files
-   * @param {function} onEvent - Callback function for each event: (eventType, data) => void
-   * @returns {Promise<void>}
-   */
-  async sendMessageStream(
-    conversationId,
-    content,
-    images = [],
-    files = [],
-    onEvent,
-  ) {
-    const response = await fetch(
-      `${API_BASE}/api/conversations/${conversationId}/message/stream`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          content,
-          images,
-          files,
-        }),
-      }
-    );
-
-    if (!response.ok) {
-      throw new Error('Failed to send message');
-    }
-
-    await this._processSSEStream(response, onEvent);
-  },
-
-  /**
-   * Retry a failed stage.
-   * @param {string} conversationId - The conversation ID
-   * @param {number} stage - The stage number to retry (1, 2, or 3)
-   * @param {number} messageIndex - The index of the assistant message to retry
-   * @param {function} onEvent - Callback function for each event
-   * @returns {Promise<void>}
-   */
-  async retryStage(conversationId, stage, messageIndex, onEvent) {
-    const response = await fetch(
-      `${API_BASE}/api/conversations/${conversationId}/retry/stage${stage}/stream`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ message_index: messageIndex }),
-      }
-    );
-
-    if (!response.ok) {
-      throw new Error(
-        await errorDetail(response, `Failed to retry stage ${stage}`)
-      );
-    }
-
-    await this._processSSEStream(response, onEvent);
-  },
-
-  /**
-   * Process an SSE stream response.
-   * @private
-   */
-  async _processSSEStream(response, onEvent) {
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      // Append new chunk to buffer
-      buffer += decoder.decode(value, { stream: true });
-      
-      // Process complete lines from buffer
-      const lines = buffer.split('\n');
-      
-      // Keep the last potentially incomplete line in the buffer
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const data = line.slice(6);
-          if (data.trim()) {
-            try {
-              const event = JSON.parse(data);
-              onEvent(event.type, event);
-            } catch (e) {
-              console.error('Failed to parse SSE event:', e, 'Data:', data.substring(0, 100));
-            }
-          }
-        }
-      }
-    }
-    
-    // Process any remaining data in the buffer
-    if (buffer.startsWith('data: ')) {
-      const data = buffer.slice(6);
-      if (data.trim()) {
-        try {
-          const event = JSON.parse(data);
-          onEvent(event.type, event);
-        } catch (e) {
-          console.error('Failed to parse final SSE event:', e);
-        }
-      }
-    }
+  retryStage(conversationId, stage, messageIndex, onEvent) {
+    return engine().retryStage(conversationId, stage, messageIndex, onEvent);
   },
 };

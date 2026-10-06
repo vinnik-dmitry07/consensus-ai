@@ -29,6 +29,7 @@ from .council import (
 )
 from .openrouter import (
     CatalogueUnavailable,
+    catalogue_model_id,
     get_credits,
     get_key_info,
     get_models_pricing,
@@ -469,7 +470,12 @@ async def get_openrouter_credits():
 async def list_available_models():
     """List all available models from OpenRouter."""
     models_data = await get_models_pricing()
-    
+    if not models_data:
+        raise HTTPException(
+            status_code=503,
+            detail='Model catalogue unavailable',
+        )
+
     # Return models sorted by name
     models_list = [
         {
@@ -525,6 +531,16 @@ async def update_settings(request: UpdateSettingsRequest):
 
     council = update_data.get('council_models', settings.council_models)
     chairman = update_data.get('chairman_model', settings.chairman_model)
+    if not council:
+        raise HTTPException(
+            status_code=400,
+            detail='Select at least one council model',
+        )
+    if not chairman or not str(chairman).strip():
+        raise HTTPException(
+            status_code=400,
+            detail='Select a chairman model',
+        )
     red_team = update_data.get('red_team_model', settings.red_team_model)
     to_check = list(council) + [chairman]
     if red_team:
@@ -561,16 +577,12 @@ async def get_council_pricing():
     # Get all models we use (council + chairman)
     all_models = set()
     for model in settings.council_models:
-        # Strip reasoning suffixes to get base model
-        base_model = model.replace('-reasoning-high', '').replace('-reasoning', '')
-        all_models.add(base_model)
-    
-    chairman_base = settings.chairman_model.replace('-reasoning-high', '').replace('-reasoning', '')
-    all_models.add(chairman_base)
+        all_models.add(catalogue_model_id(model))
+
+    all_models.add(catalogue_model_id(settings.chairman_model))
 
     red_team_id = settings.red_team_model or settings.chairman_model
-    red_team_base = red_team_id.replace('-reasoning-high', '').replace('-reasoning', '')
-    all_models.add(red_team_base)
+    all_models.add(catalogue_model_id(red_team_id))
     
     # Build response with pricing for each model
     pricing_data = {}
@@ -602,6 +614,24 @@ async def create_conversation(request: CreateConversationRequest):
     conversation_id = str(uuid.uuid4())
     conversation = storage.create_conversation(conversation_id)
     return conversation
+
+
+@app.get('/api/conversations/export')
+async def export_conversations():
+    """Download every conversation that has not been removed."""
+    return {'version': 1, 'conversations': storage.export_conversations()}
+
+
+class ImportConversationsRequest(BaseModel):
+    """Conversations previously exported from either engine."""
+    version: int = 1
+    conversations: List[Dict[str, Any]]
+
+
+@app.post('/api/conversations/import')
+async def import_conversations(request: ImportConversationsRequest):
+    """Insert or replace conversations by id."""
+    return {'imported': storage.import_conversations(request.conversations)}
 
 
 @app.get("/api/conversations/{conversation_id}", response_model=Conversation)
@@ -872,6 +902,10 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
     messages = conversation.get("messages", [])
     if request.message_index < 0 or request.message_index >= len(messages):
         raise HTTPException(status_code=400, detail="Invalid message index")
+
+    assistant = messages[request.message_index]
+    if assistant.get("role") != "assistant":
+        raise HTTPException(status_code=400, detail="Message is not an assistant message")
 
     # Get the user message before the assistant message
     user_msg_index = request.message_index - 1

@@ -2,6 +2,13 @@ import { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } fr
 import ReactMarkdown from 'react-markdown';
 import { markdownComponents, remarkGfmPlugin } from '../markdownComponents';
 import { api } from '../api';
+import { catalogueModelId, modelFamily } from '../engine/browser/openrouter.js';
+import {
+  composeFollowUpQuery,
+  findLatestFollowUpTarget,
+  getEffectiveText,
+  usableFinalAnswer,
+} from '../engine/browser/query.js';
 import Stage1 from './Stage1';
 import Stage2 from './Stage2';
 import Stage3 from './Stage3';
@@ -76,17 +83,16 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
     self_exclusion = true,
     red_team_model,
   } = pricingData;
+  const hasPrice = (model) => Boolean(pricing[catalogueModelId(model)]?.pricing);
+  if (!council_models.some(hasPrice) && !hasPrice(chairman_model)) return null;
   
   const inputTokens = estimateTokens(inputText);
   const numModels = council_models.length;
   const totalStage1Responses = n_samples * numModels;
   const topK = Math.max(1, Math.min(top_k, totalStage1Responses || 1));
-  const baseModelId = (model) => (
-    String(model || '').replace('-reasoning-high', '').replace('-reasoning', '')
-  );
   const familySizes = {};
   for (const model of council_models) {
-    const family = baseModelId(model);
+    const family = modelFamily(model);
     familySizes[family] = (familySizes[family] || 0) + 1;
   }
   
@@ -101,13 +107,19 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
   const redTeamOutputTokens = 1500;
   
   // Stage 1 prompt: just user input
+  const isReasoningHigh = (model) => String(model || '').endsWith('-reasoning-high');
+  const isReasoningModel = (model) => (
+    isReasoningHigh(model) || String(model || '').endsWith('-reasoning')
+  );
   const stage1PromptTokens = inputTokens;
   
   const othersForJudge = (model) => {
     if (!self_exclusion) return totalStage1Responses;
-    const family = baseModelId(model);
+    const family = modelFamily(model);
     const excluded = (familySizes[family] || 1) * n_samples;
-    return Math.max(1, totalStage1Responses - excluded);
+    const remaining = totalStage1Responses - excluded;
+    if (remaining <= 0) return totalStage1Responses;
+    return remaining;
   };
   
   // Stage 3: top-K answers + consensus/red-team overhead
@@ -124,8 +136,8 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
 
   // Stage 1: N_SAMPLES calls per model
   for (const model of council_models) {
-    const baseModel = baseModelId(model);
-    const isReasoning = model.includes('reasoning');
+    const baseModel = catalogueModelId(model);
+    const isReasoning = isReasoningModel(model);
     const modelPricing = pricing[baseModel]?.pricing || {};
     
     const promptPrice = parseFloat(modelPricing.prompt || '0');
@@ -153,8 +165,8 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
   let stage2TotalPrompt = 0;
   // Stage 2: One call per model, but evaluating ALL N_SAMPLES×MODELS responses
   for (const model of council_models) {
-    const baseModel = baseModelId(model);
-    const isReasoning = model.includes('reasoning');
+    const baseModel = catalogueModelId(model);
+    const isReasoning = isReasoningModel(model);
     const modelPricing = pricing[baseModel]?.pricing || {};
     
     const promptPrice = parseFloat(modelPricing.prompt || '0');
@@ -178,9 +190,9 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
   }
 
   // Stage 3: Chairman model synthesizes final answer
-  const chairmanBase = baseModelId(chairman_model);
-  const isChairmanReasoning = chairman_model.includes('reasoning');
-  const isHighEffort = chairman_model.includes('-reasoning-high');
+  const chairmanBase = catalogueModelId(chairman_model);
+  const isChairmanReasoning = isReasoningModel(chairman_model);
+  const isHighEffort = isReasoningHigh(chairman_model);
   const chairmanPricing = pricing[chairmanBase]?.pricing || {};
   
   const promptPrice = parseFloat(chairmanPricing.prompt || '0');
@@ -200,8 +212,8 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
   totalCost += stage3Cost;
 
   const redTeamId = red_team_model || chairman_model;
-  const redTeamBase = baseModelId(redTeamId);
-  const isRedTeamReasoning = redTeamId.includes('reasoning');
+  const redTeamBase = catalogueModelId(redTeamId);
+  const isRedTeamReasoning = isReasoningModel(redTeamId);
   const redTeamPricing = pricing[redTeamBase]?.pricing || {};
   const redPromptPrice = parseFloat(redTeamPricing.prompt || '0');
   const redCompletionPrice = parseFloat(redTeamPricing.completion || '0');
@@ -240,18 +252,6 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
   };
 
   return { totalCost, breakdown, n_samples, estimatedTokens };
-}
-
-function hasFinalAnswer(stage3) {
-  if (!stage3 || stage3.model === 'error') return false;
-  const text = stage3.response;
-  if (typeof text !== 'string') return false;
-  const stripped = text.trim();
-  return (
-    Boolean(stripped)
-    && !stripped.startsWith('Error:')
-    && stripped !== 'All models failed to respond. Please try again.'
-  );
 }
 
 // Calculate actual usage from message data
@@ -362,10 +362,22 @@ export default function ChatInterface({
   // Calculate estimated cost when input or attachments change
   const estimatedCost = useMemo(() => {
     if (!input.trim() && attachments.length === 0) return null;
-    const textForCost = input + getAttachmentText(attachments);
     const numImages = attachments.filter((item) => item.kind === 'image').length;
+    let textForCost = input + getAttachmentText(attachments);
+    if (numImages === 0) {
+      const target = findLatestFollowUpTarget(conversation);
+      const prior = target == null
+        ? null
+        : usableFinalAnswer(conversation?.messages?.[target]?.stage3);
+      if (prior) {
+        const files = attachments
+          .filter((item) => item.kind === 'file')
+          .map((item) => ({ name: item.name, content: item.content }));
+        textForCost = composeFollowUpQuery(prior, getEffectiveText(input, files));
+      }
+    }
     return calculateEstimatedCost(textForCost, numImages, pricingData);
-  }, [input, attachments, pricingData]);
+  }, [input, attachments, pricingData, conversation]);
 
   const [showScrollBtn, setShowScrollBtn] = useState(false);
   const [scrollDirection, setScrollDirection] = useState('down');
@@ -680,6 +692,24 @@ export default function ChatInterface({
                       </button>
                     </div>
                   )}
+                  {msg.error && msg.error.stage == null && (
+                    <div className="stage-error">
+                      <div className="error-content">
+                        <span className="error-icon">⚠️</span>
+                        <div className="error-details">
+                          <strong>Run stopped</strong>
+                          <p>{msg.error.message}</p>
+                        </div>
+                      </div>
+                      <button
+                        className="retry-button"
+                        onClick={() => onRetryStage(index, 1)}
+                        disabled={isLoading}
+                      >
+                        Retry Stage 1
+                      </button>
+                    </div>
+                  )}
                   {msg.error?.stage === 1 && (
                     <div className="stage-error">
                       <div className="error-content">
@@ -770,7 +800,7 @@ export default function ChatInterface({
                       <span>Running Stage 3: Final synthesis...</span>
                     </div>
                   )}
-                  {hasFinalAnswer(msg.stage3) && (
+                  {usableFinalAnswer(msg.stage3) && (
                     <Stage3
                       finalResponse={msg.stage3}
                       consensus={msg.metadata?.consensus}
@@ -778,7 +808,7 @@ export default function ChatInterface({
                       topKIndices={msg.metadata?.top_k_indices}
                     />
                   )}
-                  {(msg.error?.stage === 3 || (msg.stage3 && !hasFinalAnswer(msg.stage3))) && (
+                  {(msg.error?.stage === 3 || (msg.stage3 && !usableFinalAnswer(msg.stage3))) && (
                     <div className="stage-error">
                       <div className="error-content">
                         <span className="error-icon">⚠️</span>

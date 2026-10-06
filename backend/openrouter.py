@@ -1,5 +1,6 @@
 """OpenRouter API client for making LLM requests."""
 import asyncio
+import re
 import time
 import traceback
 from datetime import datetime, timezone
@@ -28,7 +29,7 @@ def resolve_max_tokens(model: str, override: Optional[int] = None) -> int:
     """Return the completion cap OpenRouter should reserve for this model."""
     if override is not None:
         return max(1, int(override))
-    if 'reasoning-high' in model:
+    if str(model).endswith('-reasoning-high'):
         return OPENROUTER_MAX_TOKENS_HIGH
     return OPENROUTER_MAX_TOKENS
 
@@ -71,8 +72,8 @@ def parse_retry_after(raw: Optional[str], fallback: float) -> float:
 
 
 def catalogue_model_id(model: str) -> str:
-    """Strip local reasoning suffixes so the id matches the OpenRouter catalogue."""
-    return model.replace('-reasoning-high', '').replace('-reasoning', '')
+    """Strip a trailing reasoning suffix so the id matches the OpenRouter catalogue."""
+    return re.sub(r'-reasoning(?:-high)?$', '', model)
 
 
 def model_family(model: str) -> str:
@@ -249,18 +250,18 @@ async def query_model_result(
         'Content-Type': 'application/json',
     }
 
-    base_model = model.replace('-reasoning-high', '').replace('-reasoning', '')
-    is_anthropic = base_model.lstrip('~').startswith('anthropic/')
+    base_model = catalogue_model_id(model)
+    is_anthropic = model_family(model) == 'anthropic'
 
     payload = {
         'model': base_model,
         'messages': messages,
         'max_tokens': resolve_max_tokens(model, max_tokens),
     }
-    if 'reasoning-high' in model:
+    if str(model).endswith('-reasoning-high'):
         # Anthropic supports 'xhigh' (extra high); use it for R+. Others use 'high'.
         payload['reasoning'] = {'effort': 'xhigh' if is_anthropic else 'high'}
-    elif 'reasoning' in model:
+    elif str(model).endswith('-reasoning'):
         payload['reasoning'] = {'effort': 'high'}
 
     max_retries = 5
@@ -273,7 +274,10 @@ async def query_model_result(
                 response.raise_for_status()
 
                 data = response.json()
-                message = data['choices'][0]['message']
+                try:
+                    message = data['choices'][0]['message']
+                except (KeyError, IndexError, TypeError):
+                    return _fail_result('Empty model response')
                 usage = data.get('usage', {})
                 content = message.get('content')
                 if not has_visible_content(content):

@@ -47,6 +47,25 @@ Fork of [karpathy/llm-council](https://github.com/karpathy/llm-council) with a s
 - **Credits display** — OpenRouter balance in the sidebar
 - **Attachments** — Paste or attach images and small text files with your prompt
 - **Dark mode** — Toggle in the sidebar
+- **Serverless** — The council runs in the browser by default, so the built site needs no Python server
+
+## Serverless mode
+
+The default engine calls [openrouter.ai](https://openrouter.ai/) directly from the browser. Conversations live in IndexedDB and settings (including the API key) live in localStorage on that device. Nothing is sent to a backend you host.
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open **http://localhost:5173**, then set your OpenRouter key in **Settings**. The key stays in this browser's localStorage and is sent only to OpenRouter. localStorage is per origin, so a GitHub Pages project site (`https://<user>.github.io/consensus-ai/`) shares that storage with every other Pages site on the account. **Forget key** in Settings removes it.
+
+**Settings → Engine** switches to the local Python backend (`http://localhost:8001` by default). That mode is for `npm run dev`: a site served over https cannot call `http://localhost`. The two engines keep separate conversations. **Export JSON** / **Import JSON** in Settings moves them.
+
+A production build is a static `frontend/dist` folder (`npm run build`). GitHub Pages builds it with `VITE_BASE=/consensus-ai/` via `.github/workflows/pages.yml`. That host is one origin for the whole account, so the API key and conversations are readable by the account's other Pages sites. The same `dist` deploys to Vercel, Netlify, or Cloudflare Pages at the site root without that prefix, each on its own origin. Routing is `?c=<conversation id>`, so the host does not need SPA rewrites.
+
+Closing the tab mid-run leaves that message marked in progress. Retry Stage 1 resumes samples that already succeeded.
 
 ## Setup
 
@@ -129,7 +148,7 @@ On Linux/macOS you can also use `./start.sh` (requires `uv` and `npm` on PATH).
 
 - **Backend:** FastAPI, async httpx, OpenRouter API (port 8001)
 - **Frontend:** React + Vite, react-markdown + GFM tables
-- **Storage:** JSON files in `data/conversations/`
+- **Storage:** IndexedDB in the browser, or JSON files in `data/conversations/` when the local Python backend is selected
 - **Package management:** uv or pip + `.venv` for Python, npm for JavaScript
 
 ## Credits

@@ -1096,7 +1096,7 @@ async def stage3_synthesize_final(
     disputed_text = '\n'.join(f'- {c}' for c in disputed) or '- none'
 
     if red_team:
-        verdict = red_team.get('verdict', 'n/a')
+        verdict = red_team.get('verdict') or 'n/a'
         conf = red_team.get('confidence')
         conf_text = f'{conf}/10' if conf is not None else 'n/a'
         red_team_block = (

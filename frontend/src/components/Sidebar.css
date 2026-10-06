@@ -38,6 +38,12 @@
   margin-top: 2px;
 }
 
+.engine-indicator {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
 .theme-toggle {
   width: 32px;
   height: 32px;

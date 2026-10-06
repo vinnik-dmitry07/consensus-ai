@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { api } from '../api';
+import { engineLabel } from '../engine/index.js';
 import './Sidebar.css';
 
 export default function Sidebar({
@@ -11,6 +12,7 @@ export default function Sidebar({
   onOpenSettings,
   darkMode,
   onToggleDarkMode,
+  engineMode = 'browser',
 }) {
   const [credits, setCredits] = useState(null);
 
@@ -25,10 +27,10 @@ export default function Sidebar({
     };
 
     fetchCredits();
-    // Refresh credits every 30 seconds
+    // Refresh credits every 30 seconds, and when the engine changes.
     const interval = setInterval(fetchCredits, 30000);
     return () => clearInterval(interval);
-  }, []);
+  }, [engineMode]);
 
   return (
     <div className="sidebar">
@@ -37,6 +39,9 @@ export default function Sidebar({
           <div className="brand">
             <h1>consensus.ai</h1>
             <span className="slogan">Search Wide</span>
+            <span className="engine-indicator">
+              {engineLabel(engineMode)}
+            </span>
           </div>
           <button className="theme-toggle" onClick={onToggleDarkMode} title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}>
             {darkMode ? '☀️' : '🌙'}

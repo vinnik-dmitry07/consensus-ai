@@ -3,6 +3,7 @@ import Sidebar from './components/Sidebar';
 import ChatInterface from './components/ChatInterface';
 import Settings from './components/Settings';
 import { api } from './api';
+import { getEngineMode } from './engine/index.js';
 import './App.css';
 
 function App() {
@@ -13,18 +14,22 @@ function App() {
   });
   const [currentConversation, setCurrentConversation] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
-  const streamingConvIdRef = useRef(null);
+  const activeRunsRef = useRef(new Set());
+  const currentIdRef = useRef(currentConversationId);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [settingsVersion, setSettingsVersion] = useState(0);
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem('theme') === 'dark');
+  const [engineMode, setEngineMode] = useState(() => getEngineMode());
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', darkMode ? 'dark' : 'light');
     localStorage.setItem('theme', darkMode ? 'dark' : 'light');
   }, [darkMode]);
 
-  // Sync URL with conversation ID
+  // Sync URL with conversation ID, and remember which chat is on screen
+  // so a run that finishes in the background does not clear this chat's spinner.
   useEffect(() => {
+    currentIdRef.current = currentConversationId;
     const url = new URL(window.location);
     if (currentConversationId) {
       url.searchParams.set('c', currentConversationId);
@@ -65,23 +70,25 @@ function App() {
     }
   };
 
+  const finishRun = (runConvId) => {
+    activeRunsRef.current.delete(runConvId);
+    if (currentIdRef.current === runConvId) setIsLoading(false);
+  };
+
   const loadConversation = async (id) => {
-    // Don't reload if we're currently streaming to this conversation
-    if (streamingConvIdRef.current === id) return;
-    
     try {
       const conv = await api.getConversation(id);
-      setCurrentConversation(conv);
+      setCurrentConversation((prev) => (
+        prev?.id === id && activeRunsRef.current.has(id) ? prev : conv
+      ));
     } catch (error) {
       console.error('Failed to load conversation:', error);
     }
   };
 
   const handleNewConversation = () => {
-    // Reset loading if switching away from streaming conversation
-    if (streamingConvIdRef.current) {
-      setIsLoading(false);
-    }
+    currentIdRef.current = null;
+    setIsLoading(false);
     // Don't create on backend yet - wait for first message
     const url = new URL(window.location);
     url.searchParams.delete('c');
@@ -91,10 +98,8 @@ function App() {
   };
 
   const handleSelectConversation = (id) => {
-    // Reset loading if switching away from streaming conversation
-    if (streamingConvIdRef.current && id !== streamingConvIdRef.current) {
-      setIsLoading(false);
-    }
+    currentIdRef.current = id;
+    setIsLoading(activeRunsRef.current.has(id));
     const url = new URL(window.location);
     if (id) {
       url.searchParams.set('c', id);
@@ -118,16 +123,16 @@ function App() {
   };
 
   // Handle streaming events for both new messages and retries
-  const handleStreamEvent = (eventType, event, messageIndex = null) => {
+  const handleStreamEvent = (eventType, event, messageIndex, runConvId) => {
     // Helper to get the message to update
     const getTargetMsgIndex = (prev) => {
       return messageIndex !== null ? messageIndex : prev.messages.length - 1;
     };
 
-    // Helper to only update if we're on the streaming conversation
+    // Only the conversation that started this run accepts its events.
     const updateIfCurrentConv = (updater) => {
       setCurrentConversation((prev) => {
-        if (!prev || prev.id !== streamingConvIdRef.current) return prev;
+        if (!prev || prev.id !== runConvId) return prev;
         return updater(prev);
       });
     };
@@ -142,6 +147,9 @@ function App() {
             loading: { ...messages[idx].loading, stage1: true }, 
             stage1Progress: null,
             stage1_failures: [],
+            stage2: null,
+            stage3: null,
+            metadata: null,
             error: null 
           };
           return { ...prev, messages };
@@ -227,7 +235,7 @@ function App() {
           const progressResults = messages[idx].stage1Progress?.results;
           messages[idx] = { 
             ...messages[idx],
-            stage1: messages[idx].stage1 || progressResults || [],
+            stage1: progressResults ?? messages[idx].stage1 ?? [],
             stage1_failures: event.failures || messages[idx].stage1_failures || [],
             loading: { ...messages[idx].loading, stage1: false }, 
             stage1Progress: null,
@@ -235,8 +243,7 @@ function App() {
           };
           return { ...prev, messages };
         });
-        setIsLoading(false);
-        streamingConvIdRef.current = null;
+        finishRun(runConvId);
         break;
 
       case 'stage2_start':
@@ -248,6 +255,9 @@ function App() {
             loading: { ...messages[idx].loading, stage2: true },
             stage2Progress: null,
             stage2_failures: [],
+            stage2: null,
+            stage3: null,
+            metadata: null,
           };
           return { ...prev, messages };
         });
@@ -315,6 +325,7 @@ function App() {
           const idx = getTargetMsgIndex(prev);
           messages[idx] = {
             ...messages[idx],
+            stage3: null,
             loading: { ...messages[idx].loading, redteam: true },
           };
           return { ...prev, messages };
@@ -359,8 +370,7 @@ function App() {
           };
           return { ...prev, messages };
         });
-        setIsLoading(false);
-        streamingConvIdRef.current = null;
+        finishRun(runConvId);
         break;
 
       case 'stage3_start':
@@ -388,12 +398,15 @@ function App() {
           messages[idx] = { ...messages[idx], loading: { ...messages[idx].loading, stage3: false }, error: { stage: 3, message: event.message } };
           return { ...prev, messages };
         });
-        setIsLoading(false);
-        streamingConvIdRef.current = null;
+        finishRun(runConvId);
         break;
 
       case 'title_complete':
-        loadConversations();
+        setConversations((prev) => prev.map((conv) => (
+          conv.id === runConvId
+            ? { ...conv, title: event.data?.title || conv.title }
+            : conv
+        )));
         break;
 
       case 'complete':
@@ -407,8 +420,7 @@ function App() {
           return { ...prev, messages };
         });
         loadConversations();
-        setIsLoading(false);
-        streamingConvIdRef.current = null;
+        finishRun(runConvId);
         break;
 
       case 'error':
@@ -422,12 +434,14 @@ function App() {
             ...messages[idx],
             loading: { stage1: false, stage2: false, redteam: false, stage3: false },
             streaming: false,
-            ...(stagedError ? { error: { stage, message: event.message } } : {}),
+            error: {
+              stage: stagedError ? stage : null,
+              message: event.message,
+            },
           };
           return { ...prev, messages };
         });
-        setIsLoading(false);
-        streamingConvIdRef.current = null;
+        finishRun(runConvId);
         break;
 
       default:
@@ -442,36 +456,32 @@ function App() {
   ) => {
     if (!currentConversation) return;
 
+    let convId = currentConversationId;
     setIsLoading(true);
     try {
       // Create conversation on backend if this is a new conversation
-      let convId = currentConversationId;
       if (!convId) {
         const newConv = await api.createConversation();
         convId = newConv.id;
-        // Set streaming ref BEFORE setCurrentConversationId to prevent useEffect from reloading
-        streamingConvIdRef.current = convId;
+        // Mark the run before changing the id, so the load effect keeps
+        // the optimistic transcript instead of replacing it.
+        activeRunsRef.current.add(convId);
+        currentIdRef.current = convId;
         setCurrentConversationId(convId);
         setConversations((prev) => [
           { id: newConv.id, created_at: newConv.created_at, title: 'New Conversation', message_count: 0 },
           ...prev,
         ]);
-        setCurrentConversation((prev) => ({ ...prev, id: convId }));
+      } else {
+        activeRunsRef.current.add(convId);
       }
 
-      // Optimistically add user message to UI
       const userMessage = {
         role: 'user',
         content,
         images: images.length > 0 ? images : undefined,
         files: files.length > 0 ? files : undefined,
       };
-      setCurrentConversation((prev) => ({
-        ...prev,
-        messages: [...prev.messages, userMessage],
-      }));
-
-      // Create a partial assistant message that will be updated progressively
       const assistantMessage = {
         role: 'assistant',
         stage1: null,
@@ -481,49 +491,50 @@ function App() {
         error: null,
         stage1_failures: [],
         loading: {
-          stage1: true,  // Start with stage1 loading
+          stage1: true,
           stage2: false,
           redteam: false,
           stage3: false,
         },
       };
+      setCurrentConversation((prev) => {
+        if (!prev || (prev.id && prev.id !== convId)) return prev;
+        return {
+          ...prev,
+          id: convId,
+          messages: [...prev.messages, userMessage, assistantMessage],
+        };
+      });
 
-      // Add the partial assistant message
-      setCurrentConversation((prev) => ({
-        ...prev,
-        messages: [...prev.messages, assistantMessage],
-      }));
-
-      // Send message with streaming
-      streamingConvIdRef.current = convId;
       await api.sendMessageStream(
         convId,
         content,
         images,
         files,
         (eventType, event) => {
-          handleStreamEvent(eventType, event);
+          handleStreamEvent(eventType, event, null, convId);
         },
       );
     } catch (error) {
       console.error('Failed to send message:', error);
-      // Remove optimistic messages on error
-      setCurrentConversation((prev) => ({
-        ...prev,
-        messages: prev.messages.slice(0, -2),
-      }));
-      setIsLoading(false);
-      streamingConvIdRef.current = null;
+      setCurrentConversation((prev) => {
+        if (!prev || prev.id !== convId) return prev;
+        return { ...prev, messages: prev.messages.slice(0, -2) };
+      });
+      if (convId) finishRun(convId);
+      else setIsLoading(false);
     }
   };
 
   const handleRetryStage = async (messageIndex, stage) => {
-    if (!currentConversationId) return;
+    const convId = currentConversationId;
+    if (!convId) return;
 
+    activeRunsRef.current.add(convId);
     setIsLoading(true);
     try {
-      // Clear the error/streaming and set loading state for the retry
       setCurrentConversation((prev) => {
+        if (!prev || prev.id !== convId) return prev;
         const messages = [...prev.messages];
         const msg = messages[messageIndex];
         messages[messageIndex] = {
@@ -542,15 +553,15 @@ function App() {
         return { ...prev, messages };
       });
 
-      // Retry the stage
-      streamingConvIdRef.current = currentConversationId;
-      await api.retryStage(currentConversationId, stage, messageIndex, (eventType, event) => {
-        handleStreamEvent(eventType, event, messageIndex);
+      await api.retryStage(convId, stage, messageIndex, (eventType, event) => {
+        handleStreamEvent(eventType, event, messageIndex, convId);
       });
     } catch (error) {
       console.error(`Failed to retry stage ${stage}:`, error);
       setCurrentConversation((prev) => {
+        if (!prev || prev.id !== convId) return prev;
         const messages = [...prev.messages];
+        if (!messages[messageIndex]) return prev;
         messages[messageIndex] = {
           ...messages[messageIndex],
           loading: { stage1: false, stage2: false, redteam: false, stage3: false },
@@ -558,8 +569,7 @@ function App() {
         };
         return { ...prev, messages };
       });
-      setIsLoading(false);
-      streamingConvIdRef.current = null;
+      finishRun(convId);
     }
   };
 
@@ -574,6 +584,7 @@ function App() {
         onOpenSettings={() => setIsSettingsOpen(true)}
         darkMode={darkMode}
         onToggleDarkMode={() => setDarkMode(!darkMode)}
+        engineMode={engineMode}
       />
       <ChatInterface
         key={currentConversationId ?? 'new'}
@@ -588,6 +599,16 @@ function App() {
         onClose={() => setIsSettingsOpen(false)}
         onSettingsChange={() => {
           setSettingsVersion((v) => v + 1);
+        }}
+        onEngineChange={() => {
+          setEngineMode(getEngineMode());
+          setSettingsVersion((v) => v + 1);
+          handleNewConversation();
+          loadConversations();
+        }}
+        onConversationsChanged={() => {
+          loadConversations();
+          if (currentIdRef.current) loadConversation(currentIdRef.current);
         }}
       />
     </div>

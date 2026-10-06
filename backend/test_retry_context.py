@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from backend import storage
 from backend.council import Stage1AllFailed
 from backend.main import app
+from backend.settings import settings
 
 
 def _final(text):
@@ -196,6 +197,63 @@ class StaleStageClearingTests(unittest.TestCase):
         message = storage.get_conversation(self.conv_id)['messages'][1]
         self.assertEqual(message['stage3']['response'], 'STALE FINAL ANSWER')
         self.assertEqual(len(message['stage2']), 1)
+
+
+class Stage1ResumeWritebackTests(unittest.TestCase):
+    """A resume must persist the filtered Stage 1 set, not only rank it."""
+
+    def setUp(self):
+        self.saved_models = list(settings.council_models)
+        self.saved_n = settings.n_samples
+        self.tmp = TemporaryDirectory()
+        self.dir_patch = patch('backend.storage.DATA_DIR', self.tmp.name)
+        self.dir_patch.start()
+        self.conv_id = str(uuid.uuid4())
+        storage.create_conversation(self.conv_id)
+        storage.add_user_message(self.conv_id, 'hello')
+        storage.add_assistant_message(
+            self.conv_id,
+            [
+                {'model': 'a/keep', 'response': 'kept'},
+                {'model': 'gone/removed', 'response': 'stale'},
+            ],
+            [{'model': 'b', 'ranking': '1. Response 1'}],
+            _final('old'),
+            metadata={'label_to_model': {'Response 1': 'gone/removed'}},
+        )
+        settings.council_models = ['a/keep']
+        settings.n_samples = 1
+
+    def tearDown(self):
+        settings.council_models = self.saved_models
+        settings.n_samples = self.saved_n
+        self.dir_patch.stop()
+        self.tmp.cleanup()
+
+    def test_resume_writes_back_only_current_council_samples(self):
+        query = AsyncMock()
+
+        async def fake_stage2(*args, **kwargs):
+            yield 'data: {"type": "stage2_start"}\n\n'
+            raise RuntimeError('stop after stage 1')
+
+        with (
+            patch('backend.council.query_model_result', new=query),
+            patch('backend.main._emit_stage2_sse', new=fake_stage2),
+        ):
+            client = TestClient(app)
+            response = client.post(
+                f'/api/conversations/{self.conv_id}/retry/stage1/stream',
+                json={'message_index': 1},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        message = storage.get_conversation(self.conv_id)['messages'][1]
+        self.assertEqual(
+            message['stage1'],
+            [{'model': 'a/keep', 'response': 'kept'}],
+        )
+        query.assert_not_called()
 
 
 if __name__ == '__main__':

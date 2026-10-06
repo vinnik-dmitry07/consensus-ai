@@ -15,6 +15,7 @@ from backend.council import (
 )
 from backend.main import _usable_final_answer, app
 from backend.openrouter import (
+    catalogue_model_id,
     has_visible_content,
     parse_http_error,
     query_model_result,
@@ -218,6 +219,65 @@ class QueryModelResultTests(unittest.IsolatedAsyncioTestCase):
             patch('backend.openrouter.httpx.AsyncClient', return_value=FakeClient()),
         ):
             result = await query_model_result('~openai/gpt-latest', [{'role': 'user', 'content': 'q'}])
+
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['error']['message'], 'Empty model response')
+
+    async def test_phi4_reasoning_plus_is_not_a_suffix(self):
+        captured = {}
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, *args, **kwargs):
+                captured['json'] = kwargs.get('json')
+                return httpx.Response(
+                    200,
+                    json={'choices': [{'message': {'content': 'yes'}}], 'usage': {}},
+                    request=httpx.Request('POST', 'https://openrouter.ai/api/v1/chat/completions'),
+                )
+
+        with (
+            patch('backend.openrouter.get_api_key', return_value='sk-test'),
+            patch('backend.openrouter.httpx.AsyncClient', return_value=FakeClient()),
+        ):
+            result = await query_model_result(
+                'microsoft/phi-4-reasoning-plus',
+                [{'role': 'user', 'content': 'q'}],
+            )
+
+        self.assertTrue(result['ok'])
+        self.assertEqual(catalogue_model_id('microsoft/phi-4-reasoning-plus'), 'microsoft/phi-4-reasoning-plus')
+        self.assertEqual(captured['json']['model'], 'microsoft/phi-4-reasoning-plus')
+        self.assertNotIn('reasoning', captured['json'])
+        self.assertEqual(captured['json']['max_tokens'], OPENROUTER_MAX_TOKENS)
+
+    async def test_missing_choices_is_empty_response(self):
+        response = httpx.Response(
+            200,
+            json={'usage': {}},
+            request=httpx.Request('POST', 'https://openrouter.ai/api/v1/chat/completions'),
+        )
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, *args, **kwargs):
+                return response
+
+        with (
+            patch('backend.openrouter.get_api_key', return_value='sk-test'),
+            patch('backend.openrouter.httpx.AsyncClient', return_value=FakeClient()),
+        ):
+            result = await query_model_result('openai/gpt-real', [{'role': 'user', 'content': 'q'}])
 
         self.assertFalse(result['ok'])
         self.assertEqual(result['error']['message'], 'Empty model response')

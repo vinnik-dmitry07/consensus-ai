@@ -1,0 +1,144 @@
+{
+  "cases": [
+    {
+      "name": "bold markdown headers and scores",
+      "kind": "parse",
+      "text": "\n**Response 1:**\n**Correctness:** 8/10\nIssues: none\n\n**Response 2**\nCorrectness: **7**/10\nIssues: none\n\nFINAL RANKING:\n1. **Response 2**\n2. **Response 1**\n",
+      "correctness": {"Response 1": 8.0, "Response 2": 7.0},
+      "ranking": ["Response 2", "Response 1"]
+    },
+    {
+      "name": "in-prose response mention does not split the block",
+      "kind": "parse",
+      "text": "\nResponse 1:\nThis is stronger than Response 2 on facts.\nCorrectness: 8/10\nIssues: none\n\nResponse 2:\nCorrectness: 4/10\nIssues: none\n\nFINAL RANKING:\n1. Response 1\n2. Response 2\n",
+      "correctness": {"Response 1": 8.0, "Response 2": 4.0},
+      "ranking": ["Response 1", "Response 2"]
+    },
+    {
+      "name": "colon outside bold headings",
+      "kind": "parse",
+      "text": "\n**Response 1:**\n**Correctness**: 8/10\nIssues: none\n\n**DISPUTED CLAIMS**:\n- the sky color\n\n**FINAL RANKING**:\n1. **Response 1**\n",
+      "correctness": {"Response 1": 8.0},
+      "ranking": ["Response 1"],
+      "disputed_claims": ["the sky color"]
+    },
+    {
+      "name": "lowercase response labels are not rankings",
+      "kind": "parse",
+      "text": "\nresponse 1:\nCorrectness: 8/10\nIssues: none\n\nresponse 2:\nCorrectness: 4/10\nIssues: none\n\nFINAL RANKING:\n1. response 2\n2. response 1\n",
+      "correctness": {},
+      "ranking": []
+    },
+    {
+      "name": "shown set beats partial last place",
+      "kind": "aggregate",
+      "stage1": [
+        {"model": "m0", "response": "0"},
+        {"model": "m1", "response": "1"},
+        {"model": "m2", "response": "2"},
+        {"model": "m3", "response": "3"},
+        {"model": "m4", "response": "4"},
+        {"model": "m5", "response": "5"}
+      ],
+      "stage2": [
+        {
+          "label_to_index": {"Response 1": 0, "Response 2": 1, "Response 3": 2, "Response 4": 3, "Response 5": 4, "Response 6": 5},
+          "ranked_indices": [0, 1, 2, 3, 4, 5]
+        },
+        {
+          "label_to_index": {"Response 1": 0, "Response 2": 1, "Response 3": 2, "Response 4": 3, "Response 5": 4, "Response 6": 5},
+          "ranked_indices": [0, 1, 2]
+        },
+        {
+          "label_to_index": {"Response 1": 0, "Response 2": 1, "Response 3": 2, "Response 4": 3, "Response 5": 4, "Response 6": 5},
+          "ranked_indices": [0, 1, 2]
+        }
+      ],
+      "fallback": false,
+      "score_greater": [2, 3]
+    },
+    {
+      "name": "family top1 survives sample split",
+      "kind": "consensus",
+      "response_rankings": [
+        {"index": 0, "model": "~openai/gpt-sol-latest", "score": 0.8, "mean_correctness": 9.0, "top1_votes": 3},
+        {"index": 1, "model": "~openai/gpt-sol-latest", "score": 0.7, "mean_correctness": 8.5, "top1_votes": 2},
+        {"index": 2, "model": "~openai/gpt-sol-latest", "score": 0.6, "mean_correctness": 8.0, "top1_votes": 1},
+        {"index": 3, "model": "~x-ai/grok-latest", "score": 0.1, "mean_correctness": 5.0, "top1_votes": 0}
+      ],
+      "stage2": [
+        {"label_to_index": {"Response 1": 0, "Response 2": 1, "Response 3": 2, "Response 4": 3}, "ranked_indices": [0, 3], "disputed_claims": []},
+        {"label_to_index": {"Response 1": 0, "Response 2": 1, "Response 3": 2, "Response 4": 3}, "ranked_indices": [0, 3], "disputed_claims": []},
+        {"label_to_index": {"Response 1": 0, "Response 2": 1, "Response 3": 2, "Response 4": 3}, "ranked_indices": [0, 3], "disputed_claims": []},
+        {"label_to_index": {"Response 1": 0, "Response 2": 1, "Response 3": 2, "Response 4": 3}, "ranked_indices": [1, 3], "disputed_claims": []},
+        {"label_to_index": {"Response 1": 0, "Response 2": 1, "Response 3": 2, "Response 4": 3}, "ranked_indices": [1, 3], "disputed_claims": []},
+        {"label_to_index": {"Response 1": 0, "Response 2": 1, "Response 3": 2, "Response 4": 3}, "ranked_indices": [2, 3], "disputed_claims": []}
+      ],
+      "red_team": {"verdict": "UPHELD"},
+      "level": "HIGH",
+      "top1_agreement": 1.0
+    },
+    {
+      "name": "blind judges excluded from the denominator",
+      "kind": "consensus",
+      "response_rankings": [
+        {"index": 0, "model": "~openai/gpt-sol-latest", "score": 0.9, "mean_correctness": 9.0, "top1_votes": 6},
+        {"index": 1, "model": "~x-ai/grok-latest", "score": 0.2, "mean_correctness": 6.0, "top1_votes": 2}
+      ],
+      "stage2": [
+        {"label_to_index": {"Response 1": 0, "Response 2": 1}, "ranked_indices": [0, 1], "disputed_claims": []},
+        {"label_to_index": {"Response 1": 0, "Response 2": 1}, "ranked_indices": [0, 1], "disputed_claims": []},
+        {"label_to_index": {"Response 1": 0, "Response 2": 1}, "ranked_indices": [0, 1], "disputed_claims": []},
+        {"label_to_index": {"Response 1": 0, "Response 2": 1}, "ranked_indices": [0, 1], "disputed_claims": []},
+        {"label_to_index": {"Response 1": 0, "Response 2": 1}, "ranked_indices": [0, 1], "disputed_claims": []},
+        {"label_to_index": {"Response 1": 0, "Response 2": 1}, "ranked_indices": [0, 1], "disputed_claims": []},
+        {"label_to_index": {"Response 1": 1}, "ranked_indices": [1], "disputed_claims": []},
+        {"label_to_index": {"Response 1": 1}, "ranked_indices": [1], "disputed_claims": []}
+      ],
+      "red_team": {"verdict": "UPHELD"},
+      "level": "HIGH",
+      "top1_agreement": 1.0
+    },
+    {
+      "name": "missing red team cannot reach high",
+      "kind": "consensus",
+      "response_rankings": [
+        {"index": 0, "model": "a/one", "score": 0.9, "mean_correctness": 9.5, "top1_votes": 1}
+      ],
+      "stage2": [
+        {"label_to_index": {"Response 1": 0}, "ranked_indices": [0], "disputed_claims": []}
+      ],
+      "red_team": null,
+      "level": "MEDIUM",
+      "reason_includes": "Red-team review was unavailable"
+    },
+    {
+      "name": "seven point three five to one decimal",
+      "kind": "format",
+      "value": 7.35,
+      "digits": 1,
+      "expected": "7.3"
+    },
+    {
+      "name": "seven point two five to one decimal",
+      "kind": "format",
+      "value": 7.25,
+      "digits": 1,
+      "expected": "7.2"
+    },
+    {
+      "name": "two point six seven five to two decimals",
+      "kind": "format",
+      "value": 2.675,
+      "digits": 2,
+      "expected": "2.67"
+    },
+    {
+      "name": "sixty two point five to zero decimals",
+      "kind": "format",
+      "value": 62.5,
+      "digits": 0,
+      "expected": "62"
+    }
+  ]
+}

@@ -1,9 +1,21 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { api } from '../api';
+import { getApiBase, getEngineMode, setApiBase, setEngineMode } from '../engine/index.js';
+import { catalogueModelId } from '../engine/browser/openrouter.js';
+import {
+  DEFAULT_CHAIRMAN_MODEL,
+  DEFAULT_COUNCIL_MODELS,
+  DEFAULT_N_SAMPLES,
+} from '../engine/browser/settings.js';
 import './Settings.css';
 
-export default function Settings({ isOpen, onClose, onSettingsChange }) {
-  const [settings, setSettings] = useState(null);
+export default function Settings({
+  isOpen,
+  onClose,
+  onSettingsChange,
+  onEngineChange,
+  onConversationsChanged,
+}) {
   const [availableModels, setAvailableModels] = useState([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(true);
@@ -20,6 +32,11 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
   const [apiKey, setApiKey] = useState('');
   const [hasApiKey, setHasApiKey] = useState(false);
   const [maskedApiKey, setMaskedApiKey] = useState('');
+  const [engineMode, setEngineModeState] = useState('browser');
+  const [apiBase, setApiBaseState] = useState('http://localhost:8001');
+  const [transferMessage, setTransferMessage] = useState(null);
+  const [loadedFrom, setLoadedFrom] = useState(null);
+  const importInputRef = useRef(null);
 
   // Load settings and available models
   useEffect(() => {
@@ -39,13 +56,16 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
   const loadData = async () => {
     setLoading(true);
     setError(null);
+    const mode = getEngineMode();
+    const base = getApiBase();
+    setEngineModeState(mode);
+    setApiBaseState(base);
     try {
       const [settingsData, modelsData] = await Promise.all([
         api.getSettings(),
         api.getAvailableModels(),
       ]);
       
-      setSettings(settingsData);
       setNSamples(settingsData.n_samples);
       setCouncilModels(settingsData.council_models);
       setChairmanModel(settingsData.chairman_model);
@@ -55,8 +75,11 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
       setHasApiKey(settingsData.has_api_key || false);
       setMaskedApiKey(settingsData.masked_api_key || '');
       setApiKey(''); // Clear any previous input
+      setLoadedFrom({ mode, base });
+      setTransferMessage(null);
       setAvailableModels(modelsData.models || []);
     } catch (err) {
+      setLoadedFrom(null);
       setError('Failed to load settings');
       console.error(err);
     } finally {
@@ -102,18 +125,6 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
     return match ? match[0] : slug;
   };
 
-  // Top 8 paid models (from config.py defaults; ~*-latest aliases)
-  const TOP_8_PAID = [
-    '~openai/gpt-sol-latest',
-    '~google/gemini-pro-latest',
-    '~anthropic/claude-opus-latest',
-    '~x-ai/grok-latest',
-    '~openai/gpt-sol-latest-reasoning',
-    '~google/gemini-pro-latest-reasoning',
-    '~anthropic/claude-opus-latest-reasoning',
-    '~x-ai/grok-latest-reasoning',
-  ];
-
   // Select 10 largest free models, one per family; chairman is the largest as R+
   const selectTopFreeModels = () => {
     const specialized = /code|coder|codestral|devstral|starcoder|safety|guard|omni|-fin(?=:|$)|-sante(?=:|$)/i;
@@ -145,9 +156,9 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
 
   // Select top 8 paid models
   const selectTopPaidModels = () => {
-    setCouncilModels(TOP_8_PAID);
-    setNSamples(3);
-    setChairmanModel('~anthropic/claude-fable-latest-reasoning-high');
+    setCouncilModels([...DEFAULT_COUNCIL_MODELS]);
+    setNSamples(DEFAULT_N_SAMPLES);
+    setChairmanModel(DEFAULT_CHAIRMAN_MODEL);
   };
 
   // Group models by provider
@@ -167,8 +178,8 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
   const sortedCouncilModels = useMemo(() => {
     return [...councilModels].sort((a, b) => {
       // Parse base IDs
-      let baseA = a.replace('-reasoning-high', '').replace('-reasoning', '');
-      let baseB = b.replace('-reasoning-high', '').replace('-reasoning', '');
+      const baseA = catalogueModelId(a);
+      const baseB = catalogueModelId(b);
       
       // Get display names
       const modelA = availableModels.find(m => m.id === baseA);
@@ -210,47 +221,121 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
 
   // Set chairman model variant
   const setChairmanVariant = (modelId, variant) => {
-    const baseId = modelId.replace('-reasoning-high', '').replace('-reasoning', '');
+    const baseId = catalogueModelId(modelId);
     const fullModelId = variant === 'base' ? baseId : `${baseId}-${variant}`;
     setChairmanModel(fullModelId);
   };
 
   // Get chairman variant
   const getChairmanVariant = () => {
-    if (chairmanModel.includes('-reasoning-high')) return 'reasoning-high';
-    if (chairmanModel.includes('-reasoning')) return 'reasoning';
+    if (chairmanModel.endsWith('-reasoning-high')) return 'reasoning-high';
+    if (chairmanModel.endsWith('-reasoning')) return 'reasoning';
     return 'base';
   };
 
   const getChairmanBaseId = () => {
-    return chairmanModel.replace('-reasoning-high', '').replace('-reasoning', '');
+    return catalogueModelId(chairmanModel);
   };
 
   const handleSave = async () => {
     setSaving(true);
     setError(null);
+    const previousMode = getEngineMode();
+    const previousBase = getApiBase();
+    const nextBase = apiBase.trim().replace(/\/$/, '') || previousBase;
+    const sameEngine = loadedFrom
+      && loadedFrom.mode === engineMode
+      && (engineMode !== 'local' || loadedFrom.base === nextBase);
     try {
-      const updateData = {
+      setEngineMode(engineMode);
+      setApiBase(nextBase);
+      const updateData = sameEngine ? {
         n_samples: nSamples,
         council_models: councilModels,
         chairman_model: chairmanModel,
         top_k: topK,
         self_exclusion: selfExclusion,
         red_team_model: redTeamModel,
-      };
+      } : {};
       // Only include API key if user entered a new one
       if (apiKey.trim()) {
         updateData.api_key = apiKey.trim();
       }
-      const updatedSettings = await api.updateSettings(updateData);
-      setSettings(updatedSettings);
-      setHasApiKey(updatedSettings.has_api_key || false);
-      setMaskedApiKey(updatedSettings.masked_api_key || '');
-      setApiKey(''); // Clear the input after save
-      onSettingsChange?.(updatedSettings);
+      const updatedSettings = Object.keys(updateData).length
+        ? await api.updateSettings(updateData)
+        : null;
+      if (updatedSettings) {
+        setHasApiKey(updatedSettings.has_api_key || false);
+        setMaskedApiKey(updatedSettings.masked_api_key || '');
+        setApiKey('');
+        onSettingsChange?.(updatedSettings);
+      }
+      if (engineMode !== previousMode || nextBase !== previousBase) {
+        onEngineChange?.();
+      }
       onClose();
     } catch (err) {
-      setError('Failed to save settings');
+      setEngineMode(previousMode);
+      setApiBase(previousBase);
+      setEngineModeState(previousMode);
+      setApiBaseState(previousBase);
+      const unknown = err.unknown_models;
+      setError(unknown?.length
+        ? `Unknown models: ${unknown.join(', ')}`
+        : (err.message || 'Failed to save settings'));
+      console.error(err);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleExport = async () => {
+    setTransferMessage(null);
+    setError(null);
+    try {
+      const payload = await api.exportConversations();
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'consensus-ai-conversations.json';
+      link.click();
+      URL.revokeObjectURL(url);
+      const count = payload.conversations?.length || 0;
+      setTransferMessage(`Exported ${count} conversation${count === 1 ? '' : 's'}.`);
+    } catch (err) {
+      setError(err.message || 'Failed to export conversations');
+    }
+  };
+
+  const handleImportFile = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    setTransferMessage(null);
+    setError(null);
+    try {
+      const parsed = JSON.parse(await file.text());
+      const result = await api.importConversations(parsed);
+      const count = result.imported?.length || 0;
+      setTransferMessage(`Imported ${count} conversation${count === 1 ? '' : 's'}.`);
+      onConversationsChanged?.();
+    } catch (err) {
+      setError(err.message || 'Failed to import conversations');
+    }
+  };
+
+  const handleForgetKey = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await api.forgetApiKey();
+      setHasApiKey(updated.has_api_key || false);
+      setMaskedApiKey(updated.masked_api_key || '');
+      setApiKey('');
+      onSettingsChange?.(updated);
+    } catch (err) {
+      setError(err.message || 'Failed to forget API key');
       console.error(err);
     } finally {
       setSaving(false);
@@ -262,7 +347,6 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
     setError(null);
     try {
       const resetSettings = await api.resetSettings();
-      setSettings(resetSettings);
       setNSamples(resetSettings.n_samples);
       setCouncilModels(resetSettings.council_models);
       setChairmanModel(resetSettings.chairman_model);
@@ -280,6 +364,11 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
       setSaving(false);
     }
   };
+
+  const nextBasePreview = apiBase.trim().replace(/\/$/, '') || getApiBase();
+  const switchOnly = !loadedFrom
+    || loadedFrom.mode !== engineMode
+    || (engineMode === 'local' && loadedFrom.base !== nextBasePreview);
 
   if (!isOpen) return null;
 
@@ -301,11 +390,82 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
             {error && <div className="settings-error">{error}</div>}
 
             <div className="settings-content">
+              <div className="settings-section">
+                <h3>Engine</h3>
+                <p className="settings-description">
+                  In-browser mode runs the council in this tab and stores conversations on this device. Local mode keeps the Python backend. A deployed https site cannot reach http://localhost:8001, so local mode is for <code>npm run dev</code>.
+                </p>
+                <div className="engine-options">
+                  <label className="toggle-row">
+                    <input
+                      type="radio"
+                      name="engine-mode"
+                      checked={engineMode === 'browser'}
+                      onChange={() => setEngineModeState('browser')}
+                    />
+                    <span>In-browser (serverless)</span>
+                  </label>
+                  <label className="toggle-row">
+                    <input
+                      type="radio"
+                      name="engine-mode"
+                      checked={engineMode === 'local'}
+                      onChange={() => setEngineModeState('local')}
+                    />
+                    <span>Local Python backend</span>
+                  </label>
+                </div>
+                {engineMode === 'local' && (
+                  <input
+                    type="url"
+                    value={apiBase}
+                    onChange={(e) => setApiBaseState(e.target.value)}
+                    className="api-key-input engine-url-input"
+                    placeholder="http://localhost:8001"
+                    spellCheck={false}
+                  />
+                )}
+                {switchOnly && (
+                  <p className="settings-description">
+                    Saving will switch the engine only. Council settings stay where they were loaded.
+                  </p>
+                )}
+              </div>
+
+              <div className="settings-section">
+                <h3>Conversations</h3>
+                <p className="settings-description">
+                  Export or import conversations for the saved engine. Save an engine switch before moving that engine&apos;s conversations. Same ids are replaced.
+                </p>
+                <div className="quick-actions">
+                  <button type="button" className="quick-action-btn" onClick={handleExport}>
+                    Export JSON
+                  </button>
+                  <button
+                    type="button"
+                    className="quick-action-btn"
+                    onClick={() => importInputRef.current?.click()}
+                  >
+                    Import JSON
+                  </button>
+                  <input
+                    ref={importInputRef}
+                    type="file"
+                    accept="application/json,.json"
+                    onChange={handleImportFile}
+                    hidden
+                  />
+                </div>
+                {transferMessage && <div className="n-samples-info">{transferMessage}</div>}
+              </div>
+
               {/* API Key Setting */}
               <div className="settings-section">
                 <h3>OpenRouter API Key</h3>
                 <p className="settings-description">
-                  Your OpenRouter API key is required to query the AI models.
+                  {engineMode === 'browser'
+                    ? 'Stored in this browser\'s localStorage, which is shared by every site on this origin, and sent only to openrouter.ai. A github.io project site shares that origin with the account\'s other Pages sites. '
+                    : 'Sent to the local Python backend and kept in its memory until that process restarts. '}
                   Get your key at <a href="https://openrouter.ai/keys" target="_blank" rel="noopener noreferrer">openrouter.ai/keys</a>
                 </p>
                 <div className="api-key-control">
@@ -330,6 +490,16 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
                     className="api-key-input"
                     autoComplete="off"
                   />
+                  {engineMode === 'browser' && loadedFrom?.mode === 'browser' && hasApiKey && (
+                    <button
+                      type="button"
+                      className="quick-action-btn"
+                      onClick={handleForgetKey}
+                      disabled={saving}
+                    >
+                      Forget key
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -411,15 +581,10 @@ export default function Settings({ isOpen, onClose, onSettingsChange }) {
                     <div className="selected-models-list">
                       {sortedCouncilModels.map((modelId) => {
                         // Parse variant from model ID
-                        let baseId = modelId;
+                        const baseId = catalogueModelId(modelId);
                         let variant = 'base';
-                        if (modelId.endsWith('-reasoning-high')) {
-                          baseId = modelId.replace('-reasoning-high', '');
-                          variant = 'reasoning-high';
-                        } else if (modelId.endsWith('-reasoning')) {
-                          baseId = modelId.replace('-reasoning', '');
-                          variant = 'reasoning';
-                        }
+                        if (modelId.endsWith('-reasoning-high')) variant = 'reasoning-high';
+                        else if (modelId.endsWith('-reasoning')) variant = 'reasoning';
                         
                         const modelInfo = availableModels.find(m => m.id === baseId);
                         const displayName = modelInfo?.name || baseId.split('/').pop();

@@ -231,6 +231,44 @@ def update_conversation_title(conversation_id: str, title: str):
     save_conversation(conversation)
 
 
+def export_conversations() -> List[Dict[str, Any]]:
+    """Return full conversations that have not been removed, newest first."""
+    ensure_data_dir()
+    exported = []
+    for path in Path(DATA_DIR).glob('*.json'):
+        if path.name.endswith('.tmp.json'):
+            continue
+        data = get_conversation(path.stem)
+        if data is None or data.get('removed'):
+            continue
+        exported.append(data)
+    exported.sort(key=lambda row: row['created_at'], reverse=True)
+    return exported
+
+
+def import_conversations(conversations: List[Dict[str, Any]]) -> List[str]:
+    """Insert or replace conversations by id. Invalid records are skipped."""
+    imported = []
+    for conversation in conversations or []:
+        if not isinstance(conversation, dict):
+            continue
+        conversation_id = conversation.get('id')
+        try:
+            get_conversation_path(conversation_id)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(conversation.get('messages'), list):
+            conversation['messages'] = []
+        if not conversation.get('created_at'):
+            conversation['created_at'] = datetime.now(timezone.utc).isoformat()
+        if not conversation.get('title'):
+            conversation['title'] = 'New Conversation'
+        conversation['removed'] = bool(conversation.get('removed'))
+        save_conversation(conversation)
+        imported.append(conversation_id)
+    return imported
+
+
 def remove_conversation(conversation_id: str):
     """Flag a conversation as removed (soft delete)."""
     conversation = get_conversation(conversation_id)

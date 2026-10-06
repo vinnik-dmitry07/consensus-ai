@@ -37,7 +37,7 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
   - Prompt asks for correctness 0–10, issues, disputed claims, then `FINAL RANKING:`
   - Canonical `label_to_model` stays `Response i+1` → model in Stage 1 order
 - `calculate_aggregate_rankings()`: Per-response normalized Borda + mean correctness + top-1 votes; per-model macro average
-- `red_team_review()`: Adversarial pass vs the leader (`VERDICT` / `CONFIDENCE`); non-fatal on failure
+- `red_team_review()`: Adversarial pass vs the leader (`VERDICT` / `CONFIDENCE`); non-fatal on failure. If the red-team model shares the leader's vendor (the default Anthropic chairman reviewing an Anthropic leader), the top-ranked council model from another vendor reviews instead
 - `compute_consensus()`: Council confidence `HIGH` / `MEDIUM` / `LOW` / `CONTESTED` (never "verified"). `HIGH` requires a red-team verdict — if the red team did not run, confidence is capped at `MEDIUM`
 - `run_post_ranking()`: Aggregation + red team + consensus used by every entry point
 - `stage3_synthesize_final()`: Chairman sees anonymized top-K only; Candidate #1 is the base draft
@@ -55,6 +55,7 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 **`main.py`**
 - FastAPI app with CORS enabled for localhost:5173 and localhost:3000
 - POST `/api/conversations/{id}/message` returns metadata in addition to stages
+- GET `/api/conversations/export` and POST `/api/conversations/import` move conversations between the local backend and the in-browser engine. The export route is registered before `/{conversation_id}` so `export` is not captured as an id
 - Streaming emits `redteam_start` / `redteam_complete` / `redteam_error` between Stage 2 and 3
 - Retry Stage 3 recomputes post-ranking (including red team)
 - `_rebuild_council_query()`: every retry endpoint rebuilds the *original* query. A message stored with `follow_up_to` is recomposed against that earlier final answer; if it is gone, the retry is refused with 400 rather than silently re-asking a bare fragment
@@ -65,6 +66,21 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 **`App.jsx`**
 - Main orchestration: manages conversations list and current conversation
 - Handles message sending, streaming events (including red-team), and metadata in UI state
+
+**`api.js`**
+- Stable method surface. Delegates to the engine selected in Settings
+- Default engine is in-browser (`engine/browser/`). `local` keeps this FastAPI backend
+- Both engines must emit the same event objects (`stage1_*`, `stage2_*`, `redteam_*`, `stage3_*`, `title_complete`, `complete`, `error`) with the same payload shapes. Do not fork that contract per engine
+- `App.jsx` binds each run's events to the conversation id that started it. Switching chats does not retarget a run that is still going
+
+**`engine/browser/`**
+- Port of `council.py`, `openrouter.py`, `storage.py`, and `settings.py`
+- IndexedDB conversations (same JSON as `data/conversations/`). Each update is one readwrite transaction, so two tabs cannot clobber each other. localStorage settings reload when another tab writes them
+- `catalogueModelId` / `catalogue_model_id` strip only a trailing `-reasoning` or `-reasoning-high`. A name like `phi-4-reasoning-plus` is a real catalogue id
+- Stage 2 `Response N` labels are case-sensitive, matching Python. Headings such as `FINAL RANKING` stay case-insensitive
+- Displayed scores use `pyFixed`, which matches Python `format` (half to even on an exact tie). `round()` is `Number(pyFixed(...))`
+- `label_to_index` is stored per judge. The seeded shuffle does not need to match Python's RNG
+- Shared cases in `tests/fixtures/stage2_cases.json` run under Vitest and `backend/test_parity_fixtures.py`, including parse, aggregate, consensus, and `format` cases
 
 **`components/ChatInterface.jsx`**
 - Multiline textarea (3 rows, resizable)
