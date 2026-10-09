@@ -37,7 +37,17 @@ from .openrouter import (
 )
 from .settings import settings
 
+API_KEY_REQUIRED = (
+    'Add an OpenRouter API key in Settings before running the council.'
+)
+
 app = FastAPI(title="LLM Council API")
+
+def _require_api_key():
+    """Refuse a council run before it writes anything when no key is set."""
+    if not settings.has_api_key:
+        raise HTTPException(status_code=400, detail=API_KEY_REQUIRED)
+
 
 # Enable CORS for local development
 app.add_middleware(
@@ -663,6 +673,7 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
     conversation = storage.get_conversation(conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    _require_api_key()
 
     # Check if this is the first message
     is_first_message = len(conversation["messages"]) == 0
@@ -730,6 +741,7 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
     conversation = storage.get_conversation(conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    _require_api_key()
 
     # Check if this is the first message
     is_first_message = len(conversation["messages"]) == 0
@@ -898,6 +910,7 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
     conversation = storage.get_conversation(conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    _require_api_key()
 
     messages = conversation.get("messages", [])
     if request.message_index < 0 or request.message_index >= len(messages):
@@ -1035,6 +1048,7 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
     conversation = storage.get_conversation(conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    _require_api_key()
 
     messages = conversation.get("messages", [])
     if request.message_index < 0 or request.message_index >= len(messages):
@@ -1137,6 +1151,7 @@ async def retry_stage3_stream(conversation_id: str, request: RetryStageRequest):
     conversation = storage.get_conversation(conversation_id)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    _require_api_key()
 
     messages = conversation.get("messages", [])
     if request.message_index < 0 or request.message_index >= len(messages):

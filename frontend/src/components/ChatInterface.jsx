@@ -312,8 +312,10 @@ export default function ChatInterface({
   onRetryStage,
   isLoading,
   settingsVersion = 0,
+  onOpenSettings,
 }) {
   const [input, setInput] = useState('');
+  const [hasApiKey, setHasApiKey] = useState(null);
   const [attachments, setAttachments] = useState([]);
   const [pricingData, setPricingData] = useState(null);
   const [costExpanded, setCostExpanded] = useState(false);
@@ -345,6 +347,22 @@ export default function ChatInterface({
     observer.observe(node);
     wrapObserverRef.current = observer;
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.resolve(api.getSettings())
+      .then((data) => {
+        if (!cancelled) setHasApiKey(Boolean(data?.has_api_key));
+      })
+      .catch(() => {
+        if (!cancelled) setHasApiKey(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [settingsVersion]);
+
+  const runBlocked = isLoading || hasApiKey !== true;
 
   // Fetch pricing data on mount and when settings change
   useEffect(() => {
@@ -433,7 +451,8 @@ export default function ChatInterface({
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    if ((input.trim() || attachments.length > 0) && !isLoading) {
+    if (runBlocked) return;
+    if (input.trim() || attachments.length > 0) {
       const images = attachments
         .filter((item) => item.kind === 'image')
         .map((item) => item.data);
@@ -639,7 +658,7 @@ export default function ChatInterface({
                       <button 
                         className="retry-button"
                         onClick={() => onRetryStage(index, 1)}
-                        disabled={isLoading}
+                        disabled={runBlocked}
                       >
                         Resume from Stage 1
                       </button>
@@ -659,14 +678,14 @@ export default function ChatInterface({
                         <button 
                           className="retry-button"
                           onClick={() => onRetryStage(index, 1)}
-                          disabled={isLoading}
+                          disabled={runBlocked}
                         >
                           Resume Stage 1
                         </button>
                         <button 
                           className="retry-button secondary"
                           onClick={() => onRetryStage(index, 2)}
-                          disabled={isLoading}
+                          disabled={runBlocked}
                         >
                           Skip to Stage 2
                         </button>
@@ -686,7 +705,7 @@ export default function ChatInterface({
                       <button 
                         className="retry-button"
                         onClick={() => onRetryStage(index, 2)}
-                        disabled={isLoading}
+                        disabled={runBlocked}
                       >
                         Resume from Stage 2
                       </button>
@@ -704,7 +723,7 @@ export default function ChatInterface({
                       <button
                         className="retry-button"
                         onClick={() => onRetryStage(index, 1)}
-                        disabled={isLoading}
+                        disabled={runBlocked}
                       >
                         Retry Stage 1
                       </button>
@@ -722,7 +741,7 @@ export default function ChatInterface({
                       <button 
                         className="retry-button"
                         onClick={() => onRetryStage(index, 1)}
-                        disabled={isLoading}
+                        disabled={runBlocked}
                       >
                         Retry Stage 1
                       </button>
@@ -787,7 +806,7 @@ export default function ChatInterface({
                       <button 
                         className="retry-button"
                         onClick={() => onRetryStage(index, 2)}
-                        disabled={isLoading}
+                        disabled={runBlocked}
                       >
                         Retry Stage 2
                       </button>
@@ -826,7 +845,7 @@ export default function ChatInterface({
                       <button 
                         className="retry-button"
                         onClick={() => onRetryStage(index, 3)}
-                        disabled={isLoading}
+                        disabled={runBlocked}
                       >
                         Retry Stage 3
                       </button>
@@ -845,7 +864,7 @@ export default function ChatInterface({
                       <button 
                         className="retry-button"
                         onClick={() => onRetryStage(index, 3)}
-                        disabled={isLoading}
+                        disabled={runBlocked}
                       >
                         Resume from Stage 3
                       </button>
@@ -907,6 +926,20 @@ export default function ChatInterface({
       </div>
 
       <form className="input-form" onSubmit={handleSubmit}>
+          {hasApiKey === false && (
+            <div className="api-key-required" role="status">
+              <span>Add an OpenRouter API key in Settings before running the council.</span>
+              {onOpenSettings && (
+                <button
+                  type="button"
+                  className="api-key-required-button"
+                  onClick={onOpenSettings}
+                >
+                  Open Settings
+                </button>
+              )}
+            </div>
+          )}
           {/* Cost Estimate Display */}
           {estimatedCost && (
             <div className={`cost-estimate ${costExpanded ? 'expanded' : 'collapsed'}`}>
@@ -1021,7 +1054,8 @@ export default function ChatInterface({
               <button
                 type="submit"
                 className="send-button"
-                disabled={(!input.trim() && attachments.length === 0) || isLoading}
+                disabled={runBlocked || (!input.trim() && attachments.length === 0)}
+                title={hasApiKey === false ? 'Add an OpenRouter API key in Settings' : undefined}
               >
                 Send
               </button>

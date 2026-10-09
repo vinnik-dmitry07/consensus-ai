@@ -1,6 +1,6 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { browserEngine, pipeline } from './engine.js';
+import { API_KEY_REQUIRED, browserEngine, pipeline } from './engine.js';
 import * as openrouter from './openrouter.js';
 import { composeFollowUpQuery } from './query.js';
 import { settings } from './settings.js';
@@ -51,6 +51,10 @@ async function staleThread() {
   );
   return id;
 }
+
+beforeEach(() => {
+  settings.apiKey = 'sk-test';
+});
 
 function collectEvents() {
   const events = [];
@@ -268,6 +272,25 @@ describe('retry errors', () => {
     const assistant = (await getConversation(id)).messages[1];
     expect(assistant.streaming).toBe(false);
     expect(assistant.error).toEqual({ stage: 2, message: 'boom' });
+  });
+});
+
+describe('api key required', () => {
+  it('does not send or store a turn when no key is configured', async () => {
+    settings.clearApiKey();
+    const created = await browserEngine.createConversation();
+    await expect(
+      browserEngine.sendMessageStream(created.id, 'hello', [], [], () => {}),
+    ).rejects.toThrow(API_KEY_REQUIRED);
+    expect((await getConversation(created.id)).messages).toEqual([]);
+  });
+
+  it('does not retry when no key is configured', async () => {
+    settings.clearApiKey();
+    const id = await staleThread();
+    const before = await getConversation(id);
+    await expect(browserEngine.retryStage(id, 1, 1, () => {})).rejects.toThrow(API_KEY_REQUIRED);
+    expect(await getConversation(id)).toEqual(before);
   });
 });
 

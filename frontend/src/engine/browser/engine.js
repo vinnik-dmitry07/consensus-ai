@@ -17,6 +17,14 @@ function errorText(exc) {
   return String(exc);
 }
 
+export const API_KEY_REQUIRED = 'Add an OpenRouter API key in Settings before running the council.';
+
+function requireApiKey() {
+  if (!settings.hasApiKey) {
+    throw new Error(API_KEY_REQUIRED);
+  }
+}
+
 function emitTo(onEvent, event) {
   if (typeof onEvent === 'function') onEvent(event.type, event);
 }
@@ -470,6 +478,7 @@ export const browserEngine = {
   },
 
   async sendMessageStream(conversationId, content, images = [], files = [], onEvent) {
+    requireApiKey();
     const conversation = await storage.getConversation(conversationId);
     if (!conversation) throw new Error('Conversation not found');
 
@@ -491,6 +500,7 @@ export const browserEngine = {
   },
 
   async retryStage(conversationId, stage, messageIndex, onEvent) {
+    requireApiKey();
     const conversation = await storage.getConversation(conversationId);
     if (!conversation) throw new Error('Conversation not found');
     const messages = conversation.messages || [];

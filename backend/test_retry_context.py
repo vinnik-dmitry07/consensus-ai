@@ -17,10 +17,18 @@ def _final(text):
     return {'model': 'chair', 'response': text, 'usage': {}}
 
 
+def _pin_api_key(test):
+    """Keep existing retry tests runnable when the process has no key."""
+    test.addCleanup(setattr, settings, '_api_key', settings._api_key)
+    if not settings.has_api_key:
+        settings.api_key = 'sk-test'
+
+
 class FollowUpRetryTests(unittest.TestCase):
     """Retrying a follow-up message must keep the prior answer in the prompt."""
 
     def setUp(self):
+        _pin_api_key(self)
         self.tmp = TemporaryDirectory()
         self.dir_patch = patch('backend.storage.DATA_DIR', self.tmp.name)
         self.dir_patch.start()
@@ -121,6 +129,7 @@ class StaleStageClearingTests(unittest.TestCase):
     """A retry that fails must not leave the previous run's answer behind."""
 
     def setUp(self):
+        _pin_api_key(self)
         self.tmp = TemporaryDirectory()
         self.dir_patch = patch('backend.storage.DATA_DIR', self.tmp.name)
         self.dir_patch.start()
@@ -203,6 +212,7 @@ class Stage1ResumeWritebackTests(unittest.TestCase):
     """A resume must persist the filtered Stage 1 set, not only rank it."""
 
     def setUp(self):
+        _pin_api_key(self)
         self.saved_models = list(settings.council_models)
         self.saved_n = settings.n_samples
         self.tmp = TemporaryDirectory()
@@ -254,6 +264,51 @@ class Stage1ResumeWritebackTests(unittest.TestCase):
             [{'model': 'a/keep', 'response': 'kept'}],
         )
         query.assert_not_called()
+
+
+class ApiKeyRequiredTests(unittest.TestCase):
+    """A missing key must fail before the run writes or clears anything."""
+
+    def setUp(self):
+        self.addCleanup(setattr, settings, '_api_key', settings._api_key)
+        settings._api_key = None
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir_patch = patch('backend.storage.DATA_DIR', self.tmp.name)
+        self.dir_patch.start()
+        self.addCleanup(self.dir_patch.stop)
+        self.conv_id = str(uuid.uuid4())
+        storage.create_conversation(self.conv_id)
+        storage.add_user_message(self.conv_id, 'hello')
+        storage.add_assistant_message(
+            self.conv_id,
+            [{'model': 'a', 'response': 'old'}],
+            [{'model': 'b', 'ranking': '1. Response 1'}],
+            _final('kept'),
+        )
+
+    def test_send_stream_does_not_append_a_turn(self):
+        client = TestClient(app)
+        response = client.post(
+            f'/api/conversations/{self.conv_id}/message/stream',
+            json={'content': 'new question'},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('API key', response.json()['detail'])
+        messages = storage.get_conversation(self.conv_id)['messages']
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[1]['stage3']['response'], 'kept')
+
+    def test_retry_does_not_clear_the_previous_answer(self):
+        client = TestClient(app)
+        response = client.post(
+            f'/api/conversations/{self.conv_id}/retry/stage1/stream',
+            json={'message_index': 1},
+        )
+        self.assertEqual(response.status_code, 400)
+        message = storage.get_conversation(self.conv_id)['messages'][1]
+        self.assertEqual(message['stage3']['response'], 'kept')
+        self.assertNotEqual(message.get('streaming'), True)
 
 
 if __name__ == '__main__':

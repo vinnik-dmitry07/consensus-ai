@@ -449,12 +449,23 @@ function App() {
     }
   };
 
+  const readHasApiKey = async () => {
+    try {
+      const data = await Promise.resolve(api.getSettings());
+      return Boolean(data?.has_api_key);
+    } catch (error) {
+      console.error('Failed to read settings:', error);
+      return false;
+    }
+  };
+
   const handleSendMessage = async (
     content,
     images = [],
     files = [],
   ) => {
     if (!currentConversation) return;
+    if (!(await readHasApiKey())) return;
 
     let convId = currentConversationId;
     setIsLoading(true);
@@ -529,6 +540,7 @@ function App() {
   const handleRetryStage = async (messageIndex, stage) => {
     const convId = currentConversationId;
     if (!convId) return;
+    if (!(await readHasApiKey())) return;
 
     activeRunsRef.current.add(convId);
     setIsLoading(true);
@@ -593,6 +605,7 @@ function App() {
         onRetryStage={handleRetryStage}
         isLoading={isLoading}
         settingsVersion={settingsVersion}
+        onOpenSettings={() => setIsSettingsOpen(true)}
       />
       <Settings
         isOpen={isSettingsOpen}

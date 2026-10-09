@@ -9,10 +9,14 @@ from fastapi.testclient import TestClient
 
 from backend import storage
 from backend.main import app
+from backend.settings import settings
 
 
 class RetryStage3Tests(unittest.TestCase):
     def setUp(self):
+        self.addCleanup(setattr, settings, '_api_key', settings._api_key)
+        if not settings.has_api_key:
+            settings.api_key = 'sk-test'
         self.tmp = TemporaryDirectory()
         self.dir_patch = patch('backend.storage.DATA_DIR', self.tmp.name)
         self.dir_patch.start()
@@ -84,6 +88,9 @@ class RetryStage3Tests(unittest.TestCase):
 
 class RetryStage12ErrorTests(unittest.TestCase):
     def setUp(self):
+        self.addCleanup(setattr, settings, '_api_key', settings._api_key)
+        if not settings.has_api_key:
+            settings.api_key = 'sk-test'
         self.tmp = TemporaryDirectory()
         self.dir_patch = patch('backend.storage.DATA_DIR', self.tmp.name)
         self.dir_patch.start()
