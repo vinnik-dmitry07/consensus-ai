@@ -6,6 +6,14 @@
 import * as council from './council.js';
 import * as openrouter from './openrouter.js';
 import {
+  pruneRoster,
+  readBlockedIds,
+  RosterEmpty,
+  selectedCatalogueIds,
+  stage1SampleLimit,
+  storePrunedRoster,
+} from './roster.js';
+import {
   prepareCouncilQuery,
   rebuildCouncilQuery,
 } from './query.js';
@@ -23,6 +31,26 @@ function requireApiKey() {
   if (!settings.hasApiKey) {
     throw new Error(API_KEY_REQUIRED);
   }
+}
+
+async function ensureServableRoster() {
+  const pricing = await openrouter.getModelsPricing();
+  if (pricing && Object.keys(pricing).length) {
+    const pruned = pruneRoster({
+      councilModels: settings.councilModels,
+      chairmanModel: settings.chairmanModel,
+      redTeamModel: settings.redTeamModel,
+    }, new Set(Object.keys(pricing)), readBlockedIds());
+    if (!pruned.councilModels.length) {
+      throw new RosterEmpty(pruned.removed.length ? pruned.removed : ['the selected models']);
+    }
+    const rosterChanged = pruned.removed.length > 0
+      || pruned.chairmanModel !== settings.chairmanModel
+      || (pruned.redTeamModel || null) !== (settings.redTeamModel || null);
+    if (rosterChanged) storePrunedRoster(pruned);
+  }
+  const capped = stage1SampleLimit(settings.councilModels, settings.nSamples);
+  if (capped !== settings.nSamples) settings.nSamples = capped;
 }
 
 function emitTo(onEvent, event) {
@@ -111,9 +139,10 @@ async function* emitStage1(
   existingFailures = null,
 ) {
   const councilModels = [...settings.councilModels];
+  const sampleLimit = stage1SampleLimit(councilModels, settings.nSamples);
   const pending = council.pendingStage1Slots(
     councilModels,
-    settings.nSamples,
+    sampleLimit,
     existingResults,
   );
   if (existingFailures?.length) {
@@ -140,7 +169,7 @@ async function* emitStage1(
       }
       yield { type: 'stage1_model_complete', data: eventData };
     } else if (eventType === 'model_failed') {
-      if (!eventData.existing) {
+      if (!eventData.existing && !eventData.skipped) {
         await storage.appendStage1Failure(conversationId, msgIndex, {
           model: eventData.model,
           error: eventData.error,
@@ -361,12 +390,7 @@ export const browserEngine = {
 
   async getPricing() {
     const modelsPricing = await openrouter.getModelsPricing();
-    const allModels = new Set();
-    const baseOf = (model) => openrouter.catalogueModelId(model);
-    for (const model of settings.councilModels) allModels.add(baseOf(model));
-    allModels.add(baseOf(settings.chairmanModel));
-    const redTeamId = settings.redTeamModel || settings.chairmanModel;
-    allModels.add(baseOf(redTeamId));
+    const allModels = selectedCatalogueIds();
 
     const pricing = {};
     for (const modelId of allModels) {
@@ -428,7 +452,13 @@ export const browserEngine = {
       error.unknown_models = unknown;
       throw error;
     }
-    settings.updateFromDict(data);
+    const next = { ...data };
+    const requested = next.n_samples ?? settings.nSamples;
+    const capped = stage1SampleLimit(councilModels, requested);
+    if (capped !== settings.nSamples || next.n_samples != null) {
+      next.n_samples = capped;
+    }
+    settings.updateFromDict(next);
     return settings.toDict();
   },
 
@@ -482,6 +512,7 @@ export const browserEngine = {
     const conversation = await storage.getConversation(conversationId);
     if (!conversation) throw new Error('Conversation not found');
 
+    await ensureServableRoster();
     const isFirst = conversation.messages.length === 0;
     const prepared = prepareCouncilQuery(conversation, content, images, files);
     const msgIndex = await storage.addUserTurn(
@@ -512,6 +543,8 @@ export const browserEngine = {
     if (assistant.role !== 'assistant') {
       throw new Error('Message is not an assistant message');
     }
+
+    await ensureServableRoster();
 
     if (stage === 1) {
       const rebuilt = requireUserQuery(conversation, messageIndex);

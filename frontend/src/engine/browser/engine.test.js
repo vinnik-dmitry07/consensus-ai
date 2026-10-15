@@ -3,7 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { API_KEY_REQUIRED, browserEngine, pipeline } from './engine.js';
 import * as openrouter from './openrouter.js';
 import { composeFollowUpQuery } from './query.js';
-import { settings } from './settings.js';
+import { selectedCatalogueIds } from './roster.js';
+import { resetSettingsState, settings } from './settings.js';
 import {
   addAssistantMessage,
   addUserMessage,
@@ -54,6 +55,11 @@ async function staleThread() {
 
 beforeEach(() => {
   settings.apiKey = 'sk-test';
+  vi.spyOn(openrouter, 'getModelsPricing').mockImplementation(async () => {
+    const pricing = {};
+    for (const id of selectedCatalogueIds()) pricing[id] = { name: id };
+    return pricing;
+  });
 });
 
 function collectEvents() {
@@ -347,5 +353,154 @@ describe('send', () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it('does not store a turn when every council model is delisted', async () => {
+    settings.councilModels = ['apodex/apodex-1.1-mini:free'];
+    settings.chairmanModel = 'apodex/apodex-1.1-mini:free-reasoning-high';
+    openrouter.getModelsPricing.mockResolvedValue({
+      'google/gemma-4-31b-it:free': { name: 'Gemma' },
+    });
+    const query = vi.spyOn(openrouter, 'queryModelResult');
+    const created = await browserEngine.createConversation();
+    await expect(
+      browserEngine.sendMessageStream(created.id, 'hello', [], [], () => {}),
+    ).rejects.toThrow(/OpenRouter will not serve apodex\/apodex-1\.1-mini:free/);
+    expect((await getConversation(created.id)).messages).toEqual([]);
+    expect(query).not.toHaveBeenCalled();
+    expect(settings.nSamples).toBe(3);
+    expect(settings.councilModels).toEqual(['apodex/apodex-1.1-mini:free']);
+  });
+});
+
+function priceCatalogue(ids) {
+  const pricing = {};
+  for (const id of ids) pricing[id] = { name: id };
+  openrouter.getModelsPricing.mockResolvedValue(pricing);
+}
+
+function answerQuery() {
+  return vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async () => ({
+    ok: true,
+    content: 'Correctness: 8/10\nFINAL RANKING:\n1. Response 1\n',
+    usage: {},
+  }));
+}
+
+describe('all-free sample cap', () => {
+  beforeEach(() => {
+    vi.spyOn(openrouter, 'unknownCatalogueIds').mockResolvedValue([]);
+  });
+
+  it('persists one sample for a saved all-free council', async () => {
+    settings.councilModels = ['a/one:free', 'b/two:free'];
+    settings.chairmanModel = 'openai/gpt-4.1';
+    settings.nSamples = 3;
+    const saved = await browserEngine.updateSettings({ n_samples: 3 });
+    expect(saved.n_samples).toBe(1);
+    resetSettingsState();
+    expect(settings.nSamples).toBe(1);
+    expect(settings.councilModels).toEqual(['a/one:free', 'b/two:free']);
+  });
+
+  it('forces one sample when the patch changes the roster and the count together', async () => {
+    priceCatalogue(['a/one:free', 'b/two:free', 'openai/gpt-4.1']);
+    const saved = await browserEngine.updateSettings({
+      council_models: ['a/one:free', 'b/two:free'],
+      chairman_model: 'openai/gpt-4.1',
+      n_samples: 3,
+    });
+    expect(saved.n_samples).toBe(1);
+    resetSettingsState();
+    expect(settings.nSamples).toBe(1);
+  });
+
+  it('keeps three samples for a mixed council', async () => {
+    priceCatalogue(['a/one:free', 'openai/gpt-4.1']);
+    const saved = await browserEngine.updateSettings({
+      council_models: ['a/one:free', 'openai/gpt-4.1'],
+      chairman_model: 'openai/gpt-4.1',
+      n_samples: 3,
+    });
+    expect(saved.n_samples).toBe(3);
+    resetSettingsState();
+    expect(settings.nSamples).toBe(3);
+  });
+
+  it('treats a reasoning suffix as the free catalogue id', async () => {
+    priceCatalogue(['google/gemma:free', 'openai/gpt-4.1']);
+    const saved = await browserEngine.updateSettings({
+      council_models: ['google/gemma:free-reasoning-high'],
+      chairman_model: 'openai/gpt-4.1',
+      n_samples: 3,
+    });
+    expect(saved.n_samples).toBe(1);
+    expect(saved.council_models).toEqual(['google/gemma:free-reasoning-high']);
+  });
+
+  it('caps samples after pruning leaves only free models', async () => {
+    settings.councilModels = ['gone/dead:free', 'google/gemma:free'];
+    settings.chairmanModel = 'openai/gpt-4.1';
+    settings.nSamples = 3;
+    priceCatalogue(['google/gemma:free', 'openai/gpt-4.1']);
+    answerQuery();
+    const created = await browserEngine.createConversation();
+    await browserEngine.sendMessageStream(created.id, 'q', [], [], () => {});
+    expect(settings.councilModels).toEqual(['google/gemma:free']);
+    expect(settings.nSamples).toBe(1);
+    const stage1 = (await getConversation(created.id)).messages[1].stage1;
+    expect(stage1).toEqual([{ model: 'google/gemma:free', response: expect.any(String), usage: {} }]);
+    expect(stage1).toHaveLength(1);
+  });
+
+  it('does not make an empty council valid', async () => {
+    settings.councilModels = ['gone/dead:free'];
+    settings.chairmanModel = 'gone/dead:free';
+    settings.nSamples = 3;
+    priceCatalogue(['google/gemma:free']);
+    const created = await browserEngine.createConversation();
+    await expect(
+      browserEngine.sendMessageStream(created.id, 'q', [], [], () => {}),
+    ).rejects.toThrow(/OpenRouter will not serve/);
+    expect(settings.nSamples).toBe(3);
+    expect(settings.councilModels).toEqual(['gone/dead:free']);
+    expect((await getConversation(created.id)).messages).toEqual([]);
+  });
+
+  it('resume keeps one stored sample for an all-free council', async () => {
+    settings.councilModels = ['google/gemma:free'];
+    settings.chairmanModel = 'openai/gpt-4.1';
+    settings.nSamples = 3;
+    priceCatalogue(['google/gemma:free', 'openai/gpt-4.1']);
+    const stage1Queries = [];
+    vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model, messages) => {
+      const content = messages?.[0]?.content;
+      if (content === 'q') stage1Queries.push(model);
+      return {
+        ok: true,
+        content: 'Correctness: 8/10\nFINAL RANKING:\n1. Response 1\n',
+        usage: {},
+      };
+    });
+    const id = crypto.randomUUID();
+    await createConversation(id);
+    await addUserMessage(id, 'q');
+    await addAssistantMessage(
+      id,
+      [
+        { model: 'google/gemma:free', response: 'first' },
+        { model: 'google/gemma:free', response: 'second' },
+        { model: 'google/gemma:free', response: 'third' },
+      ],
+      [{ model: 'google/gemma:free', ranking: '1. Response 1' }],
+      finalAnswer('old'),
+    );
+    await browserEngine.retryStage(id, 1, 1, () => {});
+    const stage1 = (await getConversation(id)).messages[1].stage1;
+    expect(stage1).toEqual([
+      { model: 'google/gemma:free', response: 'first' },
+    ]);
+    expect(stage1Queries).toEqual([]);
+    expect(settings.nSamples).toBe(1);
   });
 });

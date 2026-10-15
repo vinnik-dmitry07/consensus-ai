@@ -9,10 +9,16 @@ import {
   OPENROUTER_MAX_TOKENS_HIGH,
   parseHttpError,
   parseRetryAfter,
+  extendFreeCooldown,
+  FREE_MAX_STARTS_PER_MINUTE,
+  FREE_MINUTE_MS,
+  FREE_START_GAP_MS,
   queryModelResult,
+  resetFreeQueueForTests,
   resolveMaxTokens,
   unknownCatalogueIds,
 } from './openrouter.js';
+import { readBlockedIds } from './roster.js';
 import { settings } from './settings.js';
 
 function jsonResponse(status, body, headers = {}) {
@@ -128,8 +134,34 @@ describe('hasVisibleContent', () => {
   });
 });
 
+function useFreeClock() {
+  vi.useFakeTimers({
+    toFake: [
+      'setTimeout',
+      'clearTimeout',
+      'setInterval',
+      'clearInterval',
+      'Date',
+      'performance',
+    ],
+  });
+}
+
+function assertFreeSchedule(starts) {
+  starts.forEach((start, index) => {
+    if (index > 0) {
+      expect(start - starts[index - 1]).toBeGreaterThanOrEqual(FREE_START_GAP_MS);
+    }
+    const inWindow = starts.filter(
+      (time) => time > start - FREE_MINUTE_MS && time <= start,
+    );
+    expect(inWindow.length).toBeLessThanOrEqual(FREE_MAX_STARTS_PER_MINUTE);
+  });
+}
+
 describe('queryModelResult', () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -199,6 +231,370 @@ describe('queryModelResult', () => {
     ]);
     expect(result.ok).toBe(false);
     expect(result.error.message).toBe('Empty model response');
+  });
+
+  it('uses visible reasoning when content is empty', async () => {
+    settings.apiKey = 'sk-test';
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(200, {
+      choices: [{ message: { content: '', reasoning: 'the visible answer' } }],
+      usage: {},
+    })));
+    const result = await queryModelResult('nvidia/nemotron-3-ultra-550b-a55b:free', [
+      { role: 'user', content: 'q' },
+    ]);
+    expect(result.ok).toBe(true);
+    expect(result.content).toBe('the visible answer');
+  });
+
+  it('uses reasoning_details when content and reasoning are blank', async () => {
+    settings.apiKey = 'sk-test';
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(200, {
+      choices: [{
+        message: {
+          content: null,
+          reasoning_details: [{ text: 'from details' }],
+        },
+      }],
+      usage: {},
+    })));
+    const result = await queryModelResult('openai/gpt-4.1', [
+      { role: 'user', content: 'q' },
+    ]);
+    expect(result.ok).toBe(true);
+    expect(result.content).toBe('from details');
+  });
+
+  it('does not retry a harness-only 403 and remembers the id', async () => {
+    settings.apiKey = 'sk-test';
+    settings.councilModels = [
+      'thinkingmachines/inkling:free',
+      'google/gemma-4-31b-it:free',
+    ];
+    settings.chairmanModel = 'google/gemma-4-31b-it:free';
+    const fetchMock = vi.fn(async () => jsonResponse(403, {
+      error: {
+        message: 'thinkingmachines/inkling:free is only available on agentic harnesses.',
+      },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const first = await queryModelResult('thinkingmachines/inkling:free', [
+      { role: 'user', content: 'q' },
+    ]);
+    resetFreeQueueForTests();
+    const second = await queryModelResult('thinkingmachines/inkling:free', [
+      { role: 'user', content: 'q' },
+    ]);
+    expect(first.ok).toBe(false);
+    expect(first.skipped).toBeUndefined();
+    expect(second.skipped).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(readBlockedIds().has('thinkingmachines/inkling:free')).toBe(true);
+    expect(settings.councilModels).not.toContain('thinkingmachines/inkling:free');
+    expect(settings.councilModels).toContain('google/gemma-4-31b-it:free');
+  });
+
+  it('starts free calls at least 3 seconds apart', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    const starts = [];
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      starts.push(performance.now());
+      return jsonResponse(200, { choices: [{ message: { content: 'ok' } }] });
+    }));
+    const pending = Promise.all([
+      queryModelResult('a/one:free', [{ role: 'user', content: 'q' }]),
+      queryModelResult('b/two:free', [{ role: 'user', content: 'q' }]),
+    ]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(starts).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(2999);
+    expect(starts).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await pending;
+    expect(starts).toHaveLength(2);
+    expect(starts[1] - starts[0]).toBeGreaterThanOrEqual(3000);
+  });
+
+  it('waits out free-models-per-min and then succeeds', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    let calls = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return jsonResponse(429, {
+          error: { message: 'Rate limit exceeded: free-models-per-min' },
+        });
+      }
+      return jsonResponse(200, { choices: [{ message: { content: 'ok' } }] });
+    }));
+    const pending = queryModelResult('google/gemma-4-31b-it:free', [
+      { role: 'user', content: 'q' },
+    ]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(59999);
+    expect(calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(result.content).toBe('ok');
+    expect(calls).toBe(2);
+  });
+
+  it('does not queue a paid call behind a free call', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    let releaseFree;
+    const held = new Promise((resolve) => {
+      releaseFree = resolve;
+    });
+    const order = [];
+    vi.stubGlobal('fetch', vi.fn((_url, init) => {
+      const body = JSON.parse(init.body);
+      order.push(body.model);
+      if (String(body.model).endsWith(':free')) {
+        return held.then(() => jsonResponse(200, {
+          choices: [{ message: { content: 'ok' } }],
+        }));
+      }
+      return Promise.resolve(jsonResponse(200, {
+        choices: [{ message: { content: 'paid' } }],
+      }));
+    }));
+    const free = queryModelResult('google/gemma-4-31b-it:free', [
+      { role: 'user', content: 'q' },
+    ]);
+    await vi.advanceTimersByTimeAsync(0);
+    const paid = queryModelResult('openai/gpt-4.1', [
+      { role: 'user', content: 'q' },
+    ]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(order).toEqual(['google/gemma-4-31b-it:free', 'openai/gpt-4.1']);
+    releaseFree();
+    await free;
+    await paid;
+  });
+
+  it('keeps 18 free starts inside the minute window', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    const starts = [];
+    const messages = [{ role: 'user', content: 'q' }];
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      starts.push(performance.now());
+      return jsonResponse(200, { choices: [{ message: { content: 'ok' } }] });
+    }));
+    const pending = Promise.all(
+      Array.from({ length: 18 }, (_, index) => queryModelResult(`m${index}/x:free`, messages)),
+    );
+    await vi.advanceTimersByTimeAsync(63000);
+    await pending;
+    expect(starts).toEqual([
+      0, 3000, 6000, 9000, 12000, 15000, 18000, 21000,
+      24000, 27000, 30000, 33000, 36000, 39000, 42000, 45000,
+      60000, 63000,
+    ]);
+    assertFreeSchedule(starts);
+  });
+
+  it('keeps the gap and the window across a long run, then starts immediately after idle', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    const starts = [];
+    const messages = [{ role: 'user', content: 'q' }];
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      starts.push(performance.now());
+      return jsonResponse(200, { choices: [{ message: { content: 'ok' } }] });
+    }));
+    for (let index = 0; index < 34; index += 1) {
+      const pending = queryModelResult(`m${index}/x:free`, messages);
+      await vi.advanceTimersByTimeAsync(60000);
+      await pending;
+    }
+    assertFreeSchedule(starts);
+    expect(starts.length).toBe(34);
+    await vi.advanceTimersByTimeAsync(61000);
+    const idleAt = performance.now();
+    const idle = queryModelResult('idle/x:free', messages);
+    await vi.advanceTimersByTimeAsync(0);
+    await idle;
+    expect(starts.at(-1)).toBe(idleAt);
+    assertFreeSchedule(starts);
+  });
+
+  it('re-reads a cooldown that grew while a free retry was waiting', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    const starts = [];
+    let calls = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      calls += 1;
+      starts.push(performance.now());
+      if (calls === 1) {
+        return jsonResponse(429, {
+          error: { message: 'Rate limit exceeded: free-models-per-min' },
+        }, { 'Retry-After': '10' });
+      }
+      return jsonResponse(200, { choices: [{ message: { content: 'ok' } }] });
+    }));
+    const pending = queryModelResult('a/one:free', [{ role: 'user', content: 'q' }]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(calls).toBe(1);
+    extendFreeCooldown(25);
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(15000);
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(calls).toBe(2);
+    expect(starts).toEqual([0, 25000]);
+  });
+
+  it('does not make a paid call wait for a full free window', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    const freeStarts = [];
+    const paidStarts = [];
+    const messages = [{ role: 'user', content: 'q' }];
+    vi.stubGlobal('fetch', vi.fn(async (_url, init) => {
+      const model = JSON.parse(init.body).model;
+      if (String(model).endsWith(':free')) freeStarts.push(performance.now());
+      else paidStarts.push(performance.now());
+      return jsonResponse(200, { choices: [{ message: { content: 'ok' } }] });
+    }));
+    const filling = Promise.all(
+      Array.from({ length: 16 }, (_, index) => queryModelResult(`m${index}/x:free`, messages)),
+    );
+    await vi.advanceTimersByTimeAsync(45000);
+    await filling;
+    expect(freeStarts).toHaveLength(16);
+    const paidAt = performance.now();
+    const paid = queryModelResult('openai/gpt-4.1', messages);
+    await vi.advanceTimersByTimeAsync(0);
+    await paid;
+    expect(paidStarts).toEqual([paidAt]);
+    expect(freeStarts).toHaveLength(16);
+    const nextFree = queryModelResult('next/x:free', messages);
+    await vi.advanceTimersByTimeAsync(14999);
+    expect(freeStarts).toHaveLength(16);
+    await vi.advanceTimersByTimeAsync(1);
+    await nextFree;
+    expect(freeStarts.at(-1)).toBe(60000);
+  });
+
+  it('does not record a free start cancelled before dispatch', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    const starts = [];
+    const messages = [{ role: 'user', content: 'q' }];
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      starts.push(performance.now());
+      return jsonResponse(200, { choices: [{ message: { content: 'ok' } }] });
+    }));
+    const first = queryModelResult('a/one:free', messages);
+    const controller = new AbortController();
+    const second = queryModelResult('b/two:free', messages, { signal: controller.signal });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(starts).toEqual([0]);
+    controller.abort();
+    const cancelled = await second;
+    expect(cancelled.ok).toBe(false);
+    expect(cancelled.error.message).toBe('aborted');
+    expect(starts).toEqual([0]);
+    await first;
+    const third = queryModelResult('c/three:free', messages);
+    await vi.advanceTimersByTimeAsync(3000);
+    await third;
+    expect(starts).toEqual([0, 3000]);
+  });
+
+  it('keeps a start that was cancelled after dispatch and still serves the next call', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    const starts = [];
+    const messages = [{ role: 'user', content: 'q' }];
+    vi.stubGlobal('fetch', vi.fn((_url, init) => {
+      starts.push(performance.now());
+      if (starts.length === 1) {
+        return new Promise((_resolve, reject) => {
+          const fail = () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+          if (init.signal.aborted) {
+            fail();
+            return;
+          }
+          init.signal.addEventListener('abort', fail, { once: true });
+        });
+      }
+      return Promise.resolve(jsonResponse(200, {
+        choices: [{ message: { content: 'ok' } }],
+      }));
+    }));
+    const controller = new AbortController();
+    const first = queryModelResult('a/one:free', messages, { signal: controller.signal });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(starts).toEqual([0]);
+    controller.abort();
+    const cancelled = await first;
+    expect(cancelled.error.message).toBe('aborted');
+    expect(starts).toEqual([0]);
+    const second = queryModelResult('b/two:free', messages);
+    await vi.advanceTimersByTimeAsync(2999);
+    expect(starts).toEqual([0]);
+    await vi.advanceTimersByTimeAsync(1);
+    const result = await second;
+    expect(result.ok).toBe(true);
+    expect(starts).toEqual([0, 3000]);
+  });
+
+  it('releases the free queue after a transport error', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    const starts = [];
+    const messages = [{ role: 'user', content: 'q' }];
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      starts.push(performance.now());
+      if (starts.length === 1) throw new Error('network down');
+      return jsonResponse(200, { choices: [{ message: { content: 'ok' } }] });
+    }));
+    const first = await queryModelResult('a/one:free', messages);
+    expect(first.ok).toBe(false);
+    expect(first.error.message).toBe('network down');
+    const second = queryModelResult('b/two:free', messages);
+    await vi.advanceTimersByTimeAsync(3000);
+    const result = await second;
+    expect(result.ok).toBe(true);
+    expect(starts).toEqual([0, 3000]);
+  });
+
+  it('holds the next free start after the final free-models-per-min 429', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    const starts = [];
+    let calls = 0;
+    const messages = [{ role: 'user', content: 'q' }];
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      calls += 1;
+      starts.push(performance.now());
+      if (calls <= 5) {
+        return jsonResponse(429, {
+          error: { message: 'Rate limit exceeded: free-models-per-min' },
+        }, { 'Retry-After': '10' });
+      }
+      return jsonResponse(200, { choices: [{ message: { content: 'ok' } }] });
+    }));
+    const failed = queryModelResult('a/one:free', messages);
+    await vi.advanceTimersByTimeAsync(40000);
+    const result = await failed;
+    expect(result.ok).toBe(false);
+    expect(starts).toEqual([0, 10000, 20000, 30000, 40000]);
+    const next = queryModelResult('b/two:free', messages);
+    await vi.advanceTimersByTimeAsync(9999);
+    expect(starts).toHaveLength(5);
+    await vi.advanceTimersByTimeAsync(1);
+    const followed = await next;
+    expect(followed.ok).toBe(true);
+    expect(starts.at(-1)).toBe(50000);
   });
 });
 

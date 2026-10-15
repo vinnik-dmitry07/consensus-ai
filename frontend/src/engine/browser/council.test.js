@@ -315,10 +315,103 @@ describe('stage 1 streaming', () => {
     expect(complete.failures).toEqual([]);
   });
 
+  it('does not keep a skipped harness sample as a failure', async () => {
+    settings.councilModels = ['thinkingmachines/inkling:free', 'openai/gpt-4.1'];
+    settings.nSamples = 2;
+    const calls = [];
+    vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model) => {
+      calls.push(model);
+      if (!String(model).endsWith(':free')) {
+        return { ok: true, content: 'ok', usage: {} };
+      }
+      const freeCalls = calls.filter((item) => String(item).endsWith(':free')).length;
+      if (freeCalls === 1) {
+        return {
+          ok: false,
+          error: { status: 403, message: 'harness', detail: 'harness' },
+        };
+      }
+      return {
+        ok: false,
+        skipped: true,
+        error: { status: 403, message: 'Skipped', detail: '' },
+      };
+    });
+    const events = [];
+    for await (const event of stage1CollectResponsesStreaming('q', { n: 2 })) {
+      events.push(event);
+    }
+    const failed = events.filter((event) => event[0] === 'model_failed' && !event[1].existing);
+    expect(failed).toHaveLength(2);
+    expect(failed.filter((event) => event[1].skipped)).toHaveLength(1);
+    const complete = events.find((event) => event[0] === 'all_complete')[1];
+    expect(complete.failures).toHaveLength(1);
+  });
+
   it('keeps failures on Stage1AllFailed', () => {
     const failures = [{ model: 'a', error: { message: '402: cannot afford reserved tokens' } }];
     const exc = new Stage1AllFailed(failures);
     expect(exc.failures).toEqual(failures);
     expect(String(exc)).toContain('All models failed');
+  });
+
+  it('uses one sample for an all-free council even when n is 3', async () => {
+    settings.councilModels = ['a/one:free', 'b/two:free'];
+    settings.nSamples = 3;
+    const queried = [];
+    vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model) => {
+      queried.push(model);
+      return { ok: true, content: `ok ${model}`, usage: {} };
+    });
+    const events = [];
+    for await (const event of stage1CollectResponsesStreaming('q', { n: 3 })) {
+      events.push(event);
+    }
+    expect(queried).toEqual(['a/one:free', 'b/two:free']);
+    const init = events.find((event) => event[0] === 'init')[1];
+    expect(init.total_models).toBe(2);
+    const complete = events.find((event) => event[0] === 'all_complete')[1];
+    expect(complete.results).toHaveLength(2);
+  });
+
+  it('keeps an explicit sample count for a mixed council', async () => {
+    settings.councilModels = ['a/one:free', 'openai/gpt-4.1'];
+    settings.nSamples = 1;
+    const queried = [];
+    vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model) => {
+      queried.push(model);
+      return { ok: true, content: 'ok', usage: {} };
+    });
+    for await (const event of stage1CollectResponsesStreaming('q', { n: 3 })) {
+      void event;
+    }
+    expect(queried.filter((model) => model === 'a/one:free')).toHaveLength(3);
+    expect(queried.filter((model) => model === 'openai/gpt-4.1')).toHaveLength(3);
+  });
+
+  it('drops stored samples beyond the all-free limit on resume', async () => {
+    settings.councilModels = ['a/one:free'];
+    settings.nSamples = 3;
+    const queried = [];
+    vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model) => {
+      queried.push(model);
+      return { ok: true, content: 'new', usage: {} };
+    });
+    const events = [];
+    for await (const event of stage1CollectResponsesStreaming('q', {
+      n: 3,
+      existingResults: [
+        { model: 'a/one:free', response: 'first' },
+        { model: 'a/one:free', response: 'second' },
+        { model: 'a/one:free', response: 'third' },
+      ],
+    })) {
+      events.push(event);
+    }
+    expect(queried).toEqual([]);
+    const complete = events.find((event) => event[0] === 'all_complete')[1];
+    expect(complete.results).toEqual([
+      { model: 'a/one:free', response: 'first' },
+    ]);
   });
 });

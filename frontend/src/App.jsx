@@ -201,7 +201,9 @@ function App() {
           const isExisting = event.data.existing;
           messages[idx] = {
             ...messages[idx],
-            stage1_failures: [...(messages[idx].stage1_failures || []), event.data],
+            stage1_failures: event.data.skipped
+              ? (messages[idx].stage1_failures || [])
+              : [...(messages[idx].stage1_failures || []), event.data],
             ...(progress && {
               stage1Progress: {
                 ...progress,

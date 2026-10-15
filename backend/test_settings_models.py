@@ -62,6 +62,62 @@ class SettingsCatalogueTests(unittest.TestCase):
         self.assertEqual(settings.council_models, before)
         self.assertEqual(settings.n_samples, 3)
 
+    def test_all_free_council_persists_one_sample(self):
+        with patch(
+            'backend.main.unknown_catalogue_ids',
+            new=AsyncMock(return_value=[]),
+        ):
+            client = TestClient(app)
+            saved = client.put('/api/settings', json={
+                'council_models': ['a/one:free', 'b/two:free'],
+                'chairman_model': 'openai/gpt-4.1',
+                'n_samples': 3,
+            })
+            again = client.get('/api/settings')
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json()['n_samples'], 1)
+        self.assertEqual(settings.n_samples, 1)
+        self.assertEqual(again.json()['n_samples'], 1)
+        self.assertEqual(
+            again.json()['council_models'],
+            ['a/one:free', 'b/two:free'],
+        )
+
+    def test_partial_sample_patch_stays_at_one_for_all_free(self):
+        with patch(
+            'backend.main.unknown_catalogue_ids',
+            new=AsyncMock(return_value=[]),
+        ):
+            client = TestClient(app)
+            client.put('/api/settings', json={
+                'council_models': ['google/gemma:free-reasoning-high'],
+                'chairman_model': 'openai/gpt-4.1',
+                'n_samples': 3,
+            })
+            patched = client.put('/api/settings', json={'n_samples': 3})
+        self.assertEqual(patched.status_code, 200)
+        self.assertEqual(patched.json()['n_samples'], 1)
+        self.assertEqual(settings.n_samples, 1)
+        self.assertEqual(
+            settings.council_models,
+            ['google/gemma:free-reasoning-high'],
+        )
+
+    def test_mixed_council_keeps_requested_samples(self):
+        with patch(
+            'backend.main.unknown_catalogue_ids',
+            new=AsyncMock(return_value=[]),
+        ):
+            client = TestClient(app)
+            saved = client.put('/api/settings', json={
+                'council_models': ['a/one:free', 'openai/gpt-4.1'],
+                'chairman_model': 'openai/gpt-4.1',
+                'n_samples': 3,
+            })
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json()['n_samples'], 3)
+        self.assertEqual(settings.n_samples, 3)
+
 
 class UnknownCatalogueIdsTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_pricing_raises(self):

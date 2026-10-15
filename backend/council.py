@@ -13,6 +13,7 @@ from .openrouter import (
     query_model,
     query_model_result,
 )
+from .roster import ensure_servable_roster, stage1_sample_limit
 from .settings import settings
 
 # Colon may sit inside or outside bold: **LABEL:** or **LABEL**:
@@ -483,6 +484,8 @@ async def stage1_collect_responses(
     if n is None:
         n = settings.n_samples
 
+    await ensure_servable_roster()
+    n = stage1_sample_limit(settings.council_models, n)
     messages = [{'role': 'user', 'content': user_query}]
     models_expanded = pending_stage1_slots(settings.council_models, n)
 
@@ -498,6 +501,8 @@ async def stage1_collect_responses(
                 'response': response.get('content', ''),
                 'usage': response.get('usage', {}),
             })
+        elif response.get('skipped'):
+            continue
         else:
             failures.append({'model': model, 'error': response['error']})
 
@@ -519,6 +524,8 @@ async def stage1_collect_responses_streaming(
     if n is None:
         n = settings.n_samples
 
+    await ensure_servable_roster()
+    n = stage1_sample_limit(settings.council_models, n)
     messages = [{'role': 'user', 'content': user_query}]
     council_models = list(settings.council_models)
     total_slots = len(council_models) * n
@@ -557,6 +564,12 @@ async def stage1_collect_responses_streaming(
                 }
                 all_results.append(result)
                 yield ('model_complete', {'result': result, 'existing': False})
+            elif response.get('skipped'):
+                yield ('model_failed', {
+                    'model': model,
+                    'error': response['error'],
+                    'skipped': True,
+                })
             else:
                 failure = {'model': model, 'error': response['error']}
                 failures.append(failure)

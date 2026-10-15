@@ -29,11 +29,16 @@ from .council import (
 )
 from .openrouter import (
     CatalogueUnavailable,
-    catalogue_model_id,
     get_credits,
     get_key_info,
     get_models_pricing,
     unknown_catalogue_ids,
+)
+from .roster import (
+    RosterEmpty,
+    _selected_catalogue_ids,
+    ensure_servable_roster,
+    stage1_sample_limit,
 )
 from .settings import settings
 
@@ -42,6 +47,13 @@ API_KEY_REQUIRED = (
 )
 
 app = FastAPI(title="LLM Council API")
+
+async def _require_servable_roster():
+    try:
+        await ensure_servable_roster()
+    except RosterEmpty as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
 
 def _require_api_key():
     """Refuse a council run before it writes anything when no key is set."""
@@ -290,7 +302,9 @@ async def _emit_stage1_sse(
     failures: List[Dict[str, Any]] = []
     council_models = list(settings.council_models)
     pending = pending_stage1_slots(
-        council_models, settings.n_samples, existing_results
+        council_models,
+        stage1_sample_limit(council_models, settings.n_samples),
+        existing_results,
     )
     if existing_failures:
         storage.update_streaming_message(
@@ -314,7 +328,7 @@ async def _emit_stage1_sse(
                 )
             yield f"data: {json.dumps({'type': 'stage1_model_complete', 'data': event_data})}\n\n"
         elif event_type == 'model_failed':
-            if not event_data.get('existing'):
+            if not event_data.get('existing') and not event_data.get('skipped'):
                 storage.append_stage1_failure(conversation_id, msg_index, {
                     'model': event_data['model'],
                     'error': event_data.get('error'),
@@ -568,6 +582,10 @@ async def update_settings(request: UpdateSettingsRequest):
             detail={'unknown_models': unknown},
         )
 
+    requested = update_data.get('n_samples', settings.n_samples)
+    capped = stage1_sample_limit(council, requested)
+    if capped != settings.n_samples or 'n_samples' in update_data:
+        update_data['n_samples'] = capped
     settings.update_from_dict(update_data)
     return settings.to_dict()
 
@@ -584,16 +602,8 @@ async def get_council_pricing():
     """Get pricing information for all council models."""
     models_pricing = await get_models_pricing()
     
-    # Get all models we use (council + chairman)
-    all_models = set()
-    for model in settings.council_models:
-        all_models.add(catalogue_model_id(model))
+    all_models = _selected_catalogue_ids()
 
-    all_models.add(catalogue_model_id(settings.chairman_model))
-
-    red_team_id = settings.red_team_model or settings.chairman_model
-    all_models.add(catalogue_model_id(red_team_id))
-    
     # Build response with pricing for each model
     pricing_data = {}
     for model_id in all_models:
@@ -674,6 +684,7 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
     _require_api_key()
+    await _require_servable_roster()
 
     # Check if this is the first message
     is_first_message = len(conversation["messages"]) == 0
@@ -742,6 +753,7 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
     if conversation is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
     _require_api_key()
+    await _require_servable_roster()
 
     # Check if this is the first message
     is_first_message = len(conversation["messages"]) == 0
@@ -926,6 +938,7 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
         raise HTTPException(status_code=400, detail="Could not find corresponding user message")
 
     user_message, query_text = _rebuild_council_query(conversation, user_msg_index)
+    await _require_servable_roster()
 
     msg_index = request.message_index
     
@@ -1068,6 +1081,7 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
         raise HTTPException(status_code=400, detail="Could not find corresponding user message")
 
     _, query_text = _rebuild_council_query(conversation, user_msg_index)
+    await _require_servable_roster()
     msg_index = request.message_index
 
     async def event_generator():
@@ -1175,6 +1189,7 @@ async def retry_stage3_stream(conversation_id: str, request: RetryStageRequest):
         raise HTTPException(status_code=400, detail="Could not find corresponding user message")
 
     _, query_text = _rebuild_council_query(conversation, user_msg_index)
+    await _require_servable_roster()
     msg_index = request.message_index
 
     async def event_generator():

@@ -85,7 +85,8 @@ export default function Stage1({ responses = [], progress, failures = [] }) {
               <div className='stage-error'>
                 <div className='error-details'>
                   <strong>{active.error.message || 'Request failed'}</strong>
-                  {active.error.detail && active.error.message !== active.error.detail && (
+                  {active.error.detail
+                    && !String(active.error.message || '').includes(String(active.error.detail)) && (
                     <p>{active.error.detail}</p>
                   )}
                 </div>

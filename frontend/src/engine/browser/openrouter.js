@@ -5,6 +5,13 @@
  * backoff clamped at 60s.
  */
 
+import {
+  catalogueId,
+  dropBlockedModel,
+  isFreeModel,
+  isHarnessOnlyMessage,
+  readBlockedIds,
+} from './roster.js';
 import { settings } from './settings.js';
 
 export const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
@@ -15,12 +22,64 @@ export const OPENROUTER_KEY_URL = 'https://openrouter.ai/api/v1/key';
 export const OPENROUTER_MAX_TOKENS = 16000;
 export const OPENROUTER_MAX_TOKENS_HIGH = 32000;
 export const MAX_RETRY_AFTER_SECONDS = 60;
+export const FREE_START_GAP_MS = 3000;
+export const FREE_MINUTE_MS = 60000;
+export const FREE_MAX_STARTS_PER_MINUTE = 16;
 
 const CACHE_TTL_SECONDS = 300;
 const APP_TITLE = 'consensus.ai';
 
 let modelsCache = null;
 let modelsCacheTime = 0;
+let freeTail = Promise.resolve();
+let freeStarts = [];
+let freeCooldownUntil = 0;
+
+export function resetFreeQueueForTests() {
+  freeTail = Promise.resolve();
+  freeStarts = [];
+  freeCooldownUntil = 0;
+}
+
+function monotonicNow() {
+  return performance.now();
+}
+
+export function extendFreeCooldown(seconds) {
+  const until = monotonicNow() + Math.max(0, seconds) * 1000;
+  freeCooldownUntil = Math.max(freeCooldownUntil, until);
+}
+
+function dropExpiredStarts(now) {
+  const cutoff = now - FREE_MINUTE_MS;
+  while (freeStarts.length && freeStarts[0] <= cutoff) freeStarts.shift();
+}
+
+async function admitFreePost(extraWaitMs, signal) {
+  const backoffUntil = monotonicNow() + Math.max(0, extraWaitMs || 0);
+  for (;;) {
+    if (signal?.aborted) {
+      throw signal.reason || new DOMException('Aborted', 'AbortError');
+    }
+    const now = monotonicNow();
+    dropExpiredStarts(now);
+    let earliest = now;
+    if (freeStarts.length) {
+      earliest = Math.max(earliest, freeStarts[freeStarts.length - 1] + FREE_START_GAP_MS);
+    }
+    if (freeStarts.length >= FREE_MAX_STARTS_PER_MINUTE) {
+      earliest = Math.max(earliest, freeStarts[0] + FREE_MINUTE_MS);
+    }
+    if (freeCooldownUntil) earliest = Math.max(earliest, freeCooldownUntil);
+    earliest = Math.max(earliest, backoffUntil);
+    if (earliest > now) {
+      await delay((earliest - now) / 1000, signal);
+      continue;
+    }
+    freeStarts.push(now);
+    return;
+  }
+}
 
 export class CatalogueUnavailable extends Error {
   constructor(message = 'OpenRouter model catalogue unavailable') {
@@ -61,7 +120,7 @@ export function parseRetryAfter(raw, fallback) {
 }
 
 export function catalogueModelId(model) {
-  return String(model).replace(/-reasoning(?:-high)?$/, '');
+  return catalogueId(String(model));
 }
 
 export function modelFamily(model) {
@@ -82,11 +141,44 @@ export function hasVisibleContent(content) {
   return typeof content === 'string' && Boolean(content.trim());
 }
 
+export function visibleReasoningText(message) {
+  if (!message || typeof message !== 'object') return '';
+  if (typeof message.reasoning === 'string' && message.reasoning.trim()) {
+    return message.reasoning.trim();
+  }
+  if (!Array.isArray(message.reasoning_details)) return '';
+  const parts = [];
+  for (const item of message.reasoning_details) {
+    if (!item || typeof item !== 'object') continue;
+    for (const key of ['text', 'summary', 'content']) {
+      if (typeof item[key] === 'string' && item[key].trim()) {
+        parts.push(item[key].trim());
+        break;
+      }
+    }
+  }
+  return parts.join('\n\n');
+}
+
 function failResult(message, status = null, detail = '') {
   return {
     ok: false,
     error: { status, message, detail },
   };
+}
+
+function skippedResult() {
+  return {
+    ok: false,
+    skipped: true,
+    error: { status: 403, message: 'Skipped', detail: '' },
+  };
+}
+
+function enqueueFree(task) {
+  const run = freeTail.then(() => task());
+  freeTail = run.then(() => {}, () => {});
+  return run;
 }
 
 export async function parseHttpError(response) {
@@ -222,7 +314,7 @@ function combinedSignal(timeoutSeconds, parent) {
   return timeout;
 }
 
-export async function queryModelResult(model, messages, options = {}) {
+async function queryModelAttempts(model, messages, options) {
   const timeout = options.timeout ?? 120;
   const maxTokens = options.maxTokens ?? null;
   const signal = options.signal ?? null;
@@ -254,8 +346,15 @@ export async function queryModelResult(model, messages, options = {}) {
   }
 
   const maxRetries = 5;
+  const free = isFreeModel(model);
+  let extraWaitMs = 0;
   for (let attempt = 0; attempt < maxRetries; attempt += 1) {
     try {
+      if (readBlockedIds().has(baseModel)) return skippedResult();
+      if (free) {
+        await admitFreePost(extraWaitMs, signal);
+        extraWaitMs = 0;
+      }
       const response = await fetch(OPENROUTER_API_URL, {
         method: 'POST',
         headers,
@@ -263,14 +362,22 @@ export async function queryModelResult(model, messages, options = {}) {
         signal: combinedSignal(timeout, signal),
       });
 
-      if (response.status === 429 && attempt < maxRetries - 1) {
-        const wait = parseRetryAfter(
-          response.headers.get('Retry-After'),
-          2 ** attempt,
-        );
-        console.error(`Rate limited for ${model}, retrying in ${wait}s...`);
-        await delay(wait, signal);
-        continue;
+      if (response.status === 429) {
+        const error = await parseHttpError(response);
+        const detail = `${error.message || ''} ${error.detail || ''}`;
+        const freeLimited = detail.includes('free-models-per-min');
+        const header = response.headers.get('Retry-After');
+        const wait = freeLimited
+          ? parseRetryAfter(header, FREE_MINUTE_MS / 1000)
+          : parseRetryAfter(header, 2 ** attempt);
+        if (freeLimited) extendFreeCooldown(wait);
+        if (attempt < maxRetries - 1) {
+          console.error(`Rate limited for ${model}, retrying in ${wait}s...`);
+          if (free && !freeLimited) extraWaitMs = wait * 1000;
+          else if (!free) await delay(wait, signal);
+          continue;
+        }
+        return { ok: false, error };
       }
 
       if (!response.ok) {
@@ -279,6 +386,12 @@ export async function queryModelResult(model, messages, options = {}) {
           console.error(`Payment required for ${model} (402): ${error.detail || error.message}`);
         } else if (response.status === 404) {
           console.error(`Model ${model} not found (404)`);
+        } else if (
+          response.status === 403
+          && isHarnessOnlyMessage(`${error.message || ''} ${error.detail || ''}`)
+        ) {
+          dropBlockedModel(model);
+          console.error(`Error querying model ${model}: HTTP 403`);
         } else {
           console.error(`Error querying model ${model}: HTTP ${response.status}`);
         }
@@ -289,7 +402,8 @@ export async function queryModelResult(model, messages, options = {}) {
       const message = data.choices?.[0]?.message;
       if (!message) return failResult('Empty model response');
       const usage = data.usage || {};
-      const content = message?.content;
+      let content = message?.content;
+      if (!hasVisibleContent(content)) content = visibleReasoningText(message);
       if (!hasVisibleContent(content)) return failResult('Empty model response');
 
       return {
@@ -308,7 +422,13 @@ export async function queryModelResult(model, messages, options = {}) {
       return failResult(exc instanceof Error ? exc.message : String(exc));
     }
   }
-  return failResult('HTTP 429: Rate limit exceeded', 429);
+}
+
+export async function queryModelResult(model, messages, options = {}) {
+  if (readBlockedIds().has(catalogueModelId(model))) return skippedResult();
+  const run = () => queryModelAttempts(model, messages, options);
+  if (isFreeModel(model)) return enqueueFree(run);
+  return run();
 }
 
 export async function queryModel(model, messages, options = {}) {

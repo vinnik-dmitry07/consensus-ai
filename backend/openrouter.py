@@ -17,6 +17,17 @@ from .config import (
     OPENROUTER_MAX_TOKENS_HIGH,
     OPENROUTER_MODELS_URL,
 )
+from .roster import (
+    FREE_MINUTE_SECONDS,
+    admit_free_post,
+    blocked_ids,
+    catalogue_id,
+    drop_blocked_model,
+    is_free_model,
+    is_harness_only_message,
+    pause_free_queue,
+    run_free_call,
+)
 from .settings import settings
 
 
@@ -100,7 +111,7 @@ async def unknown_catalogue_ids(models: List[str]) -> List[str]:
     for model in models:
         if not model or not str(model).strip():
             continue
-        cid = catalogue_model_id(str(model).strip())
+        cid = catalogue_id(model)
         if cid in seen:
             continue
         seen.add(cid)
@@ -219,6 +230,36 @@ def has_visible_content(content: Any) -> bool:
     return isinstance(content, str) and bool(content.strip())
 
 
+def visible_reasoning_text(message: Any) -> str:
+    """Text the model put in reasoning fields when content itself is blank."""
+    if not isinstance(message, dict):
+        return ''
+    reasoning = message.get('reasoning')
+    if isinstance(reasoning, str) and reasoning.strip():
+        return reasoning.strip()
+    details = message.get('reasoning_details')
+    if not isinstance(details, list):
+        return ''
+    parts = []
+    for item in details:
+        if not isinstance(item, dict):
+            continue
+        for key in ('text', 'summary', 'content'):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+                break
+    return '\n\n'.join(parts)
+
+
+def _skipped_result() -> Dict[str, Any]:
+    return {
+        'ok': False,
+        'skipped': True,
+        'error': {'status': 403, 'message': 'Skipped', 'detail': ''},
+    }
+
+
 def _fail_result(
     message: str, status: Optional[int] = None, detail: str = ''
 ) -> Dict[str, Any]:
@@ -228,18 +269,13 @@ def _fail_result(
     }
 
 
-async def query_model_result(
+async def _query_model_attempts(
     model: str,
     messages: List[Dict[str, str]],
     timeout: float = 120.0,
     max_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """
-    Query a single model and always return a result dict.
-
-    Success: {'ok': True, 'content', 'reasoning_details', 'usage'}
-    Failure: {'ok': False, 'error': {'status', 'message', 'detail'}}
-    """
+    """One model's HTTP attempts. Caller serializes :free models."""
     api_key = get_api_key()
     if not api_key:
         print(f'Error querying model {model}: No API key configured')
@@ -265,9 +301,16 @@ async def query_model_result(
         payload['reasoning'] = {'effort': 'high'}
 
     max_retries = 5
+    free = is_free_model(model)
+    extra_wait = 0.0
     for attempt in range(max_retries):
         try:
+            if base_model in blocked_ids():
+                return _skipped_result()
             async with httpx.AsyncClient(timeout=timeout) as client:
+                if free:
+                    await admit_free_post(extra_wait)
+                    extra_wait = 0.0
                 response = await client.post(
                     OPENROUTER_API_URL, headers=headers, json=payload
                 )
@@ -280,6 +323,8 @@ async def query_model_result(
                     return _fail_result('Empty model response')
                 usage = data.get('usage', {})
                 content = message.get('content')
+                if not has_visible_content(content):
+                    content = visible_reasoning_text(message)
                 if not has_visible_content(content):
                     return _fail_result('Empty model response')
 
@@ -295,19 +340,38 @@ async def query_model_result(
                 }
 
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 429 and attempt < max_retries - 1:
-                wait = parse_retry_after(
-                    e.response.headers.get('Retry-After'), 2**attempt
-                )
-                print(f'Rate limited for {model}, retrying in {wait:g}s...')
-                await asyncio.sleep(wait)
-                continue
+            if e.response.status_code == 429:
+                error = parse_http_error(e.response)
+                detail = f"{error.get('message', '')} {error.get('detail', '')}"
+                free_limited = 'free-models-per-min' in detail
+                header = e.response.headers.get('Retry-After')
+                if free_limited:
+                    wait = parse_retry_after(header, FREE_MINUTE_SECONDS)
+                    pause_free_queue(wait)
+                else:
+                    wait = parse_retry_after(header, 2**attempt)
+                if attempt < max_retries - 1:
+                    print(f'Rate limited for {model}, retrying in {wait:g}s...')
+                    if free and not free_limited:
+                        extra_wait = wait
+                    elif not free:
+                        await asyncio.sleep(wait)
+                    continue
+                return {'ok': False, 'error': error}
 
             error = parse_http_error(e.response)
             if e.response.status_code == 402:
                 print(f'Payment required for {model} (402): {error["detail"] or e}')
             elif e.response.status_code == 404:
                 print(f'Model {model} not found (404)')
+            elif (
+                e.response.status_code == 403
+                and is_harness_only_message(
+                    f"{error.get('message', '')} {error.get('detail', '')}"
+                )
+            ):
+                drop_blocked_model(model)
+                print(f'Error querying model {model}: {e}')
             else:
                 traceback.print_exc()
                 print(f'Error querying model {model}: {e}')
@@ -316,7 +380,35 @@ async def query_model_result(
             traceback.print_exc()
             print(f'Error querying model {model}: {e}')
             return _fail_result(str(e))
-    return _fail_result('HTTP 429: Rate limit exceeded', status=429)
+
+
+async def query_model_result(
+    model: str,
+    messages: List[Dict[str, str]],
+    timeout: float = 120.0,
+    max_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Query a single model and always return a result dict.
+
+    Success: {'ok': True, 'content', 'reasoning_details', 'usage'}
+    Failure: {'ok': False, 'error': {'status', 'message', 'detail'}}
+
+    Catalogue ids ending in :free share one queue: one call in flight,
+    at least three seconds between starts, and at most 16 starts in any
+    60-second window. Paid models stay parallel.
+    """
+    if catalogue_model_id(model) in blocked_ids():
+        return _skipped_result()
+
+    async def attempt():
+        return await _query_model_attempts(
+            model, messages, timeout=timeout, max_tokens=max_tokens
+        )
+
+    if is_free_model(model):
+        return await run_free_call(attempt)
+    return await attempt()
 
 
 async def query_model(

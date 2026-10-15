@@ -3,11 +3,21 @@ import { api } from '../api';
 import { getApiBase, getEngineMode, setApiBase, setEngineMode } from '../engine/index.js';
 import { catalogueModelId } from '../engine/browser/openrouter.js';
 import {
+  isAllFreeCouncil,
+  isFreeModel,
+  pruneRoster,
+  readBlockedIds,
+  removedModelsMessage,
+  stage1SampleLimit,
+} from '../engine/browser/roster.js';
+import {
   DEFAULT_CHAIRMAN_MODEL,
   DEFAULT_COUNCIL_MODELS,
   DEFAULT_N_SAMPLES,
 } from '../engine/browser/settings.js';
 import './Settings.css';
+
+const FREE_SAMPLE_NOTE = 'All-free councils use one sample per model to reduce requests. OpenRouter shares a 20-requests-per-minute limit across free models.';
 
 export default function Settings({
   isOpen,
@@ -37,6 +47,7 @@ export default function Settings({
   const [transferMessage, setTransferMessage] = useState(null);
   const [loadedFrom, setLoadedFrom] = useState(null);
   const importInputRef = useRef(null);
+  const failedMigration = useRef(null);
 
   // Load settings and available models
   useEffect(() => {
@@ -53,6 +64,21 @@ export default function Settings({
     return () => window.removeEventListener('keydown', handleEsc);
   }, [isOpen, onClose]);
 
+  useEffect(() => {
+    const held = failedMigration.current;
+    if (
+      held
+      && nSamples === held.samples
+      && councilModels.length === held.council.length
+      && councilModels.every((model, index) => model === held.council[index])
+    ) {
+      return;
+    }
+    failedMigration.current = null;
+    const capped = stage1SampleLimit(councilModels, nSamples);
+    if (capped !== nSamples) setNSamples(capped);
+  }, [councilModels, nSamples]);
+
   const loadData = async () => {
     setLoading(true);
     setError(null);
@@ -66,18 +92,73 @@ export default function Settings({
         api.getAvailableModels(),
       ]);
       
-      setNSamples(settingsData.n_samples);
-      setCouncilModels(settingsData.council_models);
-      setChairmanModel(settingsData.chairman_model);
       setTopK(settingsData.top_k ?? 3);
       setSelfExclusion(settingsData.self_exclusion !== false);
-      setRedTeamModel(settingsData.red_team_model || '');
       setHasApiKey(settingsData.has_api_key || false);
       setMaskedApiKey(settingsData.masked_api_key || '');
       setApiKey(''); // Clear any previous input
       setLoadedFrom({ mode, base });
       setTransferMessage(null);
-      setAvailableModels(modelsData.models || []);
+      const models = modelsData.models || [];
+      setAvailableModels(models);
+      const known = new Set(models.map((model) => model.id));
+      let samples = settingsData.n_samples;
+      let council = settingsData.council_models || [];
+      let chairman = settingsData.chairman_model || '';
+      let redTeam = settingsData.red_team_model || '';
+      let removed = [];
+      if (known.size) {
+        const pruned = pruneRoster({
+          councilModels: council,
+          chairmanModel: chairman,
+          redTeamModel: redTeam || null,
+        }, known, readBlockedIds());
+        council = pruned.councilModels;
+        chairman = pruned.chairmanModel;
+        redTeam = pruned.redTeamModel || '';
+        removed = pruned.removed;
+        if (removed.length && !council.length) {
+          council = [];
+          chairman = '';
+          redTeam = '';
+          setError(removedModelsMessage(removed, true));
+        }
+      }
+      samples = stage1SampleLimit(council, samples);
+      const samplesChanged = samples !== settingsData.n_samples;
+      const rosterChanged = removed.length > 0 && council.length > 0;
+      if (council.length && (rosterChanged || samplesChanged)) {
+        try {
+          const saved = await api.updateSettings({
+            council_models: council,
+            chairman_model: chairman,
+            red_team_model: redTeam || null,
+            n_samples: samples,
+          });
+          samples = saved.n_samples;
+          council = saved.council_models || council;
+          chairman = saved.chairman_model || chairman;
+          redTeam = saved.red_team_model || '';
+          if (removed.length) setError(removedModelsMessage(removed));
+          if (onSettingsChange) onSettingsChange();
+        } catch (saveErr) {
+          console.error(saveErr);
+          const storedCouncil = [...(settingsData.council_models || [])];
+          failedMigration.current = {
+            council: storedCouncil,
+            samples: settingsData.n_samples,
+          };
+          samples = settingsData.n_samples;
+          council = storedCouncil;
+          chairman = settingsData.chairman_model || '';
+          redTeam = settingsData.red_team_model || '';
+          setError(saveErr instanceof Error ? saveErr.message : 'Failed to save settings');
+        }
+      }
+      setNSamples(samples);
+      setCouncilModels(council);
+      setChairmanModel(chairman);
+      setRedTeamModel(redTeam);
     } catch (err) {
       setLoadedFrom(null);
       setError('Failed to load settings');
@@ -129,8 +210,14 @@ export default function Settings({
   const selectTopFreeModels = () => {
     const specialized = /code|coder|codestral|devstral|starcoder|safety|guard|omni|-fin(?=:|$)|-sante(?=:|$)/i;
 
+    const blocked = readBlockedIds();
+    const skipped = [];
     const freeModels = availableModels.filter((m) => {
-      if (!m.id.endsWith(':free')) return false;
+      if (!isFreeModel(m.id)) return false;
+      if (blocked.has(catalogueModelId(m.id))) {
+        skipped.push(catalogueModelId(m.id));
+        return false;
+      }
       return !specialized.test(m.id.toLowerCase());
     });
 
@@ -149,9 +236,12 @@ export default function Settings({
       .slice(0, 10)
       .map((m) => m.id);
     setCouncilModels(top);
+    setNSamples(1);
     if (top.length > 0) {
       setChairmanModel(`${top[0]}-reasoning-high`);
     }
+    const removed = [...new Set(skipped)];
+    setError(removed.length ? removedModelsMessage(removed) : null);
   };
 
   // Select top 8 paid models
@@ -265,6 +355,16 @@ export default function Settings({
         ? await api.updateSettings(updateData)
         : null;
       if (updatedSettings) {
+        if (typeof updatedSettings.n_samples === 'number') {
+          setNSamples(updatedSettings.n_samples);
+        }
+        if (Array.isArray(updatedSettings.council_models)) {
+          setCouncilModels(updatedSettings.council_models);
+        }
+        if (updatedSettings.chairman_model) {
+          setChairmanModel(updatedSettings.chairman_model);
+        }
+        setRedTeamModel(updatedSettings.red_team_model || '');
         setHasApiKey(updatedSettings.has_api_key || false);
         setMaskedApiKey(updatedSettings.masked_api_key || '');
         setApiKey('');
@@ -507,14 +607,15 @@ export default function Settings({
               <div className="settings-section">
                 <h3>Samples per Model</h3>
                 <p className="settings-description">
-                  Number of response samples to collect from each model in Stage 1.
-                  More samples = more diverse responses but higher cost.
+                  {isAllFreeCouncil(councilModels)
+                    ? FREE_SAMPLE_NOTE
+                    : 'Number of response samples to collect from each model in Stage 1. More samples = more diverse responses but higher cost.'}
                 </p>
                 <div className="n-samples-control">
                   <button
                     className="n-samples-btn"
                     onClick={() => setNSamples(Math.max(1, nSamples - 1))}
-                    disabled={nSamples <= 1}
+                    disabled={isAllFreeCouncil(councilModels) || nSamples <= 1}
                   >
                     −
                   </button>
@@ -525,11 +626,12 @@ export default function Settings({
                     value={nSamples}
                     onChange={(e) => setNSamples(Math.max(1, Math.min(10, parseInt(e.target.value) || 1)))}
                     className="n-samples-input"
+                    disabled={isAllFreeCouncil(councilModels)}
                   />
                   <button
                     className="n-samples-btn"
                     onClick={() => setNSamples(Math.min(10, nSamples + 1))}
-                    disabled={nSamples >= 10}
+                    disabled={isAllFreeCouncil(councilModels) || nSamples >= 10}
                   >
                     +
                   </button>

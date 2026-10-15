@@ -6,6 +6,7 @@
  */
 
 import * as openrouter from './openrouter.js';
+import { stage1SampleLimit } from './roster.js';
 import { settings, TITLE_MODEL } from './settings.js';
 
 const RESPONSE_N = '\\*{0,2}Response\\s+(\\d+)\\*{0,2}';
@@ -419,11 +420,11 @@ async function* asCompleted(factories) {
 }
 
 export async function* stage1CollectResponsesStreaming(userQuery, options = {}) {
-  const n = options.n ?? settings.nSamples;
   const existingResults = options.existingResults ?? null;
   const existingFailures = options.existingFailures ?? null;
   const messages = [{ role: 'user', content: userQuery }];
   const councilModels = [...settings.councilModels];
+  const n = stage1SampleLimit(councilModels, options.n ?? settings.nSamples);
   const totalSlots = councilModels.length * n;
   const allResults = usableStage1Results(councilModels, n, existingResults);
   const pendingModels = pendingStage1Slots(councilModels, n, allResults);
@@ -456,6 +457,8 @@ export async function* stage1CollectResponsesStreaming(userQuery, options = {}) 
         };
         allResults.push(result);
         yield ['model_complete', { result, existing: false }];
+      } else if (response.skipped) {
+        yield ['model_failed', { model, error: response.error, skipped: true }];
       } else {
         const failure = { model, error: response.error };
         failures.push(failure);
