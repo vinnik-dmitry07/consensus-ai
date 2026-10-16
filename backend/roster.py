@@ -9,6 +9,8 @@ FREE_MINUTE_SECONDS = 60.0
 FREE_MAX_STARTS_PER_MINUTE = 16
 
 _blocked = set()
+_blocked_errors = {}
+_model_cooldowns = {}
 _free_lock = None
 _free_lock_loop = None
 _free_starts = []
@@ -41,10 +43,12 @@ def is_harness_only_message(text: str) -> bool:
     return HARNESS_ONLY in str(text or '').lower()
 
 
-def remember_blocked_id(model: str) -> None:
+def remember_blocked_id(model: str, error=None) -> None:
     cid = catalogue_id(model)
     if cid:
         _blocked.add(cid)
+        if error is not None:
+            _blocked_errors[cid] = dict(error)
 
 
 def blocked_ids():
@@ -53,6 +57,60 @@ def blocked_ids():
 
 def clear_blocked_ids() -> None:
     _blocked.clear()
+    _blocked_errors.clear()
+
+
+def remember_model_cooldown(model: str, seconds: float, error=None) -> None:
+    """Sideline one catalogue id without changing its saved selection."""
+    cid = catalogue_id(model)
+    if not cid:
+        return
+    until = time.monotonic() + max(0.0, seconds)
+    previous = _model_cooldowns.get(cid)
+    if previous is None or until > previous['until']:
+        _model_cooldowns[cid] = {
+            'until': until,
+            'retry_at': time.time() + max(0.0, seconds),
+            'error': dict(error) if error is not None else {
+                'status': 429,
+                'message': 'Skipped while the provider cooldown is active',
+                'detail': '',
+            },
+        }
+
+
+def clear_model_cooldowns() -> None:
+    _model_cooldowns.clear()
+
+
+def model_unavailability(model: str):
+    """Return the active refusal, expiring provider cooldowns lazily."""
+    cid = catalogue_id(model)
+    if cid in _blocked:
+        return {
+            'reason': 'harness_only',
+            'error': dict(_blocked_errors.get(cid, {
+                'status': 403,
+                'message': (
+                    'Skipped: model is only available on agentic harnesses'
+                ),
+                'detail': '',
+            })),
+        }
+    cooldown = _model_cooldowns.get(cid)
+    if cooldown is not None:
+        if cooldown['until'] > time.monotonic():
+            return {
+                'reason': 'provider_cooldown',
+                'error': dict(cooldown['error']),
+                'retry_at': cooldown['retry_at'],
+            }
+        _model_cooldowns.pop(cid, None)
+    return None
+
+
+def is_model_unavailable(model: str) -> bool:
+    return model_unavailability(model) is not None
 
 
 def reset_free_queue_for_tests() -> None:
@@ -153,10 +211,10 @@ def _store_pruned(settings, pruned) -> None:
     settings.red_team_model = pruned['red_team_model']
 
 
-def drop_blocked_model(model: str) -> None:
+def drop_blocked_model(model: str, error=None) -> None:
     """Remember a harness-only id and take it off the current selection."""
     from .settings import settings
-    remember_blocked_id(model)
+    remember_blocked_id(model, error=error)
     pruned = prune_roster(
         settings.council_models,
         settings.chairman_model,
@@ -227,14 +285,17 @@ def pause_free_queue(seconds: float) -> None:
     )
 
 
-async def admit_free_post(extra_wait: float = 0.0) -> None:
+async def admit_free_post(extra_wait: float = 0.0, model=None) -> bool:
     """Reserve one :free HTTP start. Caller must already hold the free lock.
 
     The start is recorded on the monotonic clock immediately before the
     caller posts. A retry calls this again and does not re-enter the lock.
+    Return False without reserving a start if the model becomes unavailable.
     """
     backoff_until = time.monotonic() + max(0.0, extra_wait)
     while True:
+        if model is not None and is_model_unavailable(model):
+            return False
         now = time.monotonic()
         _drop_expired_starts(now)
         earliest = now
@@ -251,7 +312,7 @@ async def admit_free_post(extra_wait: float = 0.0) -> None:
             await asyncio.sleep(earliest - now)
             continue
         _free_starts.append(now)
-        return
+        return True
 
 
 async def run_free_call(task):

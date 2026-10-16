@@ -187,6 +187,75 @@ describe('stage 1 resume writeback', () => {
   });
 });
 
+describe('skipped model progress and storage', () => {
+  it.each([true, false])('preserves progress with skipped=%s and stores only real failures', async (skipped) => {
+    settings.councilModels = ['a/keep', 'b/refused:free'];
+    settings.chairmanModel = 'a/keep';
+    settings.nSamples = 1;
+    const id = await staleThread();
+    vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model) => {
+      if (model === 'b/refused:free') {
+        return {
+          ok: false,
+          skipped,
+          error: { status: skipped ? 429 : 500, message: 'unavailable', detail: '' },
+        };
+      }
+      return {
+        ok: true,
+        content: 'Response 1:\nCorrectness: 8/10\nFINAL RANKING:\n1. Response 1',
+        usage: {},
+      };
+    });
+    const { events, onEvent } = collectEvents();
+    await browserEngine.retryStage(id, 1, 1, onEvent);
+
+    const message = (await getConversation(id)).messages[1];
+    for (const stage of [1, 2]) {
+      const failed = events.find((item) => item.type === `stage${stage}_model_failed`);
+      expect(failed.event.data.model).toBe('b/refused:free');
+      expect(Boolean(failed.event.data.skipped)).toBe(skipped);
+      const progress = events.filter((item) => (
+        item.type === `stage${stage}_model_complete`
+        || item.type === `stage${stage}_model_failed`
+      ));
+      expect(progress).toHaveLength(2);
+      const expectedFailures = skipped ? [] : ['b/refused:free'];
+      const completion = events.find((item) => item.type === `stage${stage}_complete`);
+      expect(completion.event.failures.map((failure) => failure.model)).toEqual(expectedFailures);
+      expect(message[`stage${stage}_failures`].map((failure) => failure.model)).toEqual(expectedFailures);
+    }
+    expect(events.some((item) => item.type === 'complete')).toBe(true);
+    expect(message.stage3.response).toBeTruthy();
+    expect(message.streaming).toBe(false);
+  });
+
+  it('surfaces a Stage 2 error when every judge is skipped without creating failure rows', async () => {
+    settings.councilModels = ['a/keep'];
+    settings.chairmanModel = 'a/keep';
+    settings.nSamples = 1;
+    const id = await staleThread();
+    vi.spyOn(openrouter, 'queryModelResult').mockResolvedValue({
+      ok: false,
+      skipped: true,
+      error: { status: 429, message: 'cooling down', detail: '' },
+    });
+    const { events, onEvent } = collectEvents();
+    await browserEngine.retryStage(id, 2, 1, onEvent);
+
+    expect(events.find((item) => item.type === 'stage2_model_failed').event.data.skipped).toBe(true);
+    const error = events.find((item) => item.type === 'stage2_error').event;
+    expect(error.message).toBe('All models failed to respond in Stage 2');
+    expect(error.failures).toEqual([]);
+    expect(events.some((item) => item.type === 'stage2_complete')).toBe(false);
+    const message = (await getConversation(id)).messages[1];
+    expect(message.error.stage).toBe(2);
+    expect(message.stage2_failures).toEqual([]);
+    expect(message.stage3).toBeNull();
+    expect(message.streaming).toBe(false);
+  });
+});
+
 describe('retry errors', () => {
   it('stores a successful stage 3 retry and clears the error', async () => {
     settings.councilModels = ['a/keep'];

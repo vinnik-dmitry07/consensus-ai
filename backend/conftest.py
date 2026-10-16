@@ -5,9 +5,14 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def servable_catalogue(monkeypatch):
-    from backend.roster import clear_blocked_ids, reset_free_queue_for_tests
+    from backend.roster import (
+        clear_blocked_ids,
+        clear_model_cooldowns,
+        reset_free_queue_for_tests,
+    )
 
     clear_blocked_ids()
+    clear_model_cooldowns()
     reset_free_queue_for_tests()
 
     async def fake_pricing():

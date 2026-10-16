@@ -6,7 +6,7 @@
  */
 
 import * as openrouter from './openrouter.js';
-import { stage1SampleLimit } from './roster.js';
+import { catalogueId, isModelUnavailable, stage1SampleLimit } from './roster.js';
 import { settings, TITLE_MODEL } from './settings.js';
 
 const RESPONSE_N = '\\*{0,2}Response\\s+(\\d+)\\*{0,2}';
@@ -489,6 +489,8 @@ export async function* stage2CollectRankingsStreaming(userQuery, stage1Results) 
       const result = formatStage2Result(model, response, view);
       stage2Results.push(result);
       yield ['model_complete', { result }];
+    } else if (response.skipped) {
+      yield ['model_failed', { model, error: response.error, skipped: true }];
     } else {
       const failure = { model, error: response.error };
       failures.push(failure);
@@ -662,6 +664,7 @@ Meaning:
 - UPHELD = you could not find a concrete refutation
 `;
   const result = await openrouter.queryModelResult(model, [{ role: 'user', content: prompt }]);
+  if (result.skipped) return null;
   if (!result.ok) {
     return {
       model,
@@ -948,20 +951,39 @@ Your task:
 
 Provide a clear, well-reasoned final answer:`;
 
-  const result = await openrouter.queryModelResult(
-    settings.chairmanModel,
-    [{ role: 'user', content: chairmanPrompt }],
-  );
-  if (!result.ok) {
-    const detail = result.error?.message || 'failed to generate response';
-    throw new Error(`Chairman model (${settings.chairmanModel}) failed: ${detail}`);
+  // Only availability refusals permit a fallback; real failures stay visible.
+  // Snapshot candidates because a harness refusal can prune the live roster.
+  const candidates = [settings.chairmanModel, ...settings.councilModels];
+  const tried = new Set();
+  let result;
+  let chairmanModel;
+  for (const model of candidates) {
+    const cid = catalogueId(model);
+    if (!cid || tried.has(cid)) continue;
+    tried.add(cid);
+    if (isModelUnavailable(model)) continue;
+    const response = await openrouter.queryModelResult(
+      model,
+      [{ role: 'user', content: chairmanPrompt }],
+    );
+    if (response.skipped) continue;
+    if (!response.ok) {
+      const detail = response.error?.message || 'failed to generate response';
+      throw new Error(`Chairman model (${model}) failed: ${detail}`);
+    }
+    result = response;
+    chairmanModel = model;
+    break;
+  }
+  if (!result) {
+    throw new Error('No chairman model is available. Try again after the cooldown or choose another council model.');
   }
 
   let leaderIndex = consensus.leader_index;
   if (leaderIndex == null && topKIndices.length) leaderIndex = topKIndices[0];
 
   return {
-    model: settings.chairmanModel,
+    model: chairmanModel,
     response: result.content || '',
     usage: result.usage || {},
     based_on_index: leaderIndex,

@@ -418,7 +418,9 @@ class QueryModelResultTests(unittest.IsolatedAsyncioTestCase):
                     'thinkingmachines/inkling:free', messages
                 )
             self.assertFalse(first['ok'])
-            self.assertFalse(first.get('skipped'))
+            self.assertTrue(first.get('skipped'))
+            self.assertEqual(first['skip_reason'], 'harness_only')
+            self.assertEqual(first['error']['status'], 403)
             self.assertTrue(second.get('skipped'))
             self.assertEqual(calls['n'], 1)
             self.assertIn('thinkingmachines/inkling:free', blocked_ids())

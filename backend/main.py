@@ -336,7 +336,10 @@ async def _emit_stage1_sse(
             yield f"data: {json.dumps({'type': 'stage1_model_failed', 'data': event_data})}\n\n"
         elif event_type == 'all_complete':
             results = event_data['results']
-            failures = event_data.get('failures') or []
+            failures = [
+                failure for failure in event_data.get('failures') or []
+                if not failure.get('skipped')
+            ]
 
     collected['results'] = results
     collected['failures'] = failures
@@ -386,13 +389,19 @@ async def _emit_stage2_sse(
         elif event_type == 'model_complete':
             yield f"data: {json.dumps({'type': 'stage2_model_complete', 'data': event_data})}\n\n"
         elif event_type == 'model_failed':
-            failures.append(event_data)
+            if not event_data.get('skipped'):
+                failures.append(event_data)
             collected['failures'] = failures
             yield f"data: {json.dumps({'type': 'stage2_model_failed', 'data': event_data})}\n\n"
         elif event_type == 'all_complete':
             results = event_data['results']
             label_to_model = event_data['label_to_model']
-            failures = event_data.get('failures') or failures
+            reported_failures = event_data.get('failures')
+            if reported_failures is not None:
+                failures = [
+                    failure for failure in reported_failures
+                    if not failure.get('skipped')
+                ]
             collected['results'] = results
             collected['label_to_model'] = label_to_model
             collected['failures'] = failures
