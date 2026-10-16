@@ -13,7 +13,12 @@ from .openrouter import (
     query_model,
     query_model_result,
 )
-from .roster import ensure_servable_roster, stage1_sample_limit
+from .roster import (
+    catalogue_id,
+    ensure_servable_roster,
+    is_model_unavailable,
+    stage1_sample_limit,
+)
 from .settings import settings
 
 # Colon may sit inside or outside bold: **LABEL:** or **LABEL**:
@@ -613,6 +618,12 @@ async def stage2_collect_rankings_streaming(
             result = format_stage2_result(model, response, view)
             stage2_results.append(result)
             yield ('model_complete', {'result': result})
+        elif response.get('skipped'):
+            yield ('model_failed', {
+                'model': model,
+                'error': response.get('error'),
+                'skipped': True,
+            })
         else:
             failure = {'model': model, 'error': response['error']}
             failures.append(failure)
@@ -836,6 +847,8 @@ Meaning:
 '''
 
     result = await query_model_result(model, [{'role': 'user', 'content': prompt}])
+    if result.get('skipped'):
+        return None
     if not result.get('ok'):
         return {
             'model': model,
@@ -1166,13 +1179,32 @@ Your task:
 Provide a clear, well-reasoned final answer:'''
 
     messages = [{'role': 'user', 'content': chairman_prompt}]
-    result = await query_model_result(settings.chairman_model, messages)
-
-    if not result.get('ok'):
-        err = result.get('error') or {}
-        detail = err.get('message') or 'failed to generate response'
+    # Snapshot candidates: a harness refusal can prune the live roster.
+    candidates = [settings.chairman_model, *settings.council_models]
+    tried = set()
+    result = None
+    chairman_model = None
+    for model in candidates:
+        cid = catalogue_id(model)
+        if not cid or cid in tried:
+            continue
+        tried.add(cid)
+        if is_model_unavailable(model):
+            continue
+        response = await query_model_result(model, messages)
+        if response.get('skipped'):
+            continue
+        if not response.get('ok'):
+            err = response.get('error') or {}
+            detail = err.get('message') or 'failed to generate response'
+            raise Exception(f'Chairman model ({model}) failed: {detail}')
+        result = response
+        chairman_model = model
+        break
+    if result is None:
         raise Exception(
-            f'Chairman model ({settings.chairman_model}) failed: {detail}'
+            'No chairman model is available. Try again after the cooldown '
+            'or choose another council model.'
         )
 
     leader_index = consensus.get('leader_index')
@@ -1180,7 +1212,7 @@ Provide a clear, well-reasoned final answer:'''
         leader_index = top_k_indices[0]
 
     return {
-        'model': settings.chairman_model,
+        'model': chairman_model,
         'response': result.get('content', ''),
         'usage': result.get('usage', {}),
         'based_on_index': leader_index,

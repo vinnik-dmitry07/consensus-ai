@@ -1,7 +1,65 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { clearBlockedIds, dropBlockedModel, pruneRoster } from './roster.js';
+import {
+  clearBlockedIds,
+  dropBlockedModel,
+  isModelUnavailable,
+  pruneRoster,
+  readModelCooldown,
+  rememberBlockedId,
+  rememberModelCooldown,
+} from './roster.js';
 import { settings } from './settings.js';
+
+describe('model cooldowns', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('shares a cooldown across reasoning variants, without banning the vendor', () => {
+    const error = { status: 429, message: 'HTTP 429: Provider returned error', detail: 'busy' };
+    const entry = rememberModelCooldown('google/model:free-reasoning-high', 600, error);
+    expect(readModelCooldown('google/model:free')).toEqual(entry);
+    expect(isModelUnavailable('google/model:free-reasoning')).toBe(true);
+    expect(isModelUnavailable('google/other:free')).toBe(false);
+    expect(isModelUnavailable('google/paid')).toBe(false);
+    expect(rememberModelCooldown('google/paid', 600)).toBeNull();
+  });
+
+  it('does not shorten an existing cooldown', () => {
+    vi.useFakeTimers();
+    const first = rememberModelCooldown('a/one:free', 1800);
+    vi.advanceTimersByTime(10000);
+    expect(rememberModelCooldown('a/one:free', 600).retry_at).toBe(first.retry_at);
+  });
+
+  it('expires at the exact deadline without scheduling a background probe', () => {
+    vi.useFakeTimers();
+    rememberModelCooldown('a/one:free', 600);
+    vi.advanceTimersByTime(599999);
+    expect(isModelUnavailable('a/one:free')).toBe(true);
+    vi.advanceTimersByTime(1);
+    expect(isModelUnavailable('a/one:free')).toBe(false);
+    expect(readModelCooldown('a/one:free')).toBeNull();
+  });
+
+  it.each(['{', 'null', '[]', '{"a/one:free":{"retry_at":"tomorrow"}}'])('ignores malformed cooldown storage %s', (stored) => {
+    localStorage.setItem('llm-council-model-cooldowns', stored);
+    expect(readModelCooldown('a/one:free')).toBeNull();
+    expect(rememberModelCooldown('a/one:free', 600)).not.toBeNull();
+    expect(isModelUnavailable('a/one:free')).toBe(true);
+  });
+
+  it('keeps cooldowns and permanent blocks when storage cannot be read or written', () => {
+    vi.spyOn(localStorage, 'getItem').mockImplementation(() => { throw new Error('denied'); });
+    vi.spyOn(localStorage, 'setItem').mockImplementation(() => { throw new Error('full'); });
+    expect(() => rememberModelCooldown('a/one:free', 600)).not.toThrow();
+    expect(isModelUnavailable('a/one:free')).toBe(true);
+    expect(() => rememberBlockedId('b/two:free')).not.toThrow();
+    expect(isModelUnavailable('b/two:free-reasoning')).toBe(true);
+  });
+});
 
 describe('pruneRoster', () => {
   it('drops a delisted model and keeps the chairman reasoning suffix', () => {

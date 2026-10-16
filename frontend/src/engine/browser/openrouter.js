@@ -11,6 +11,9 @@ import {
   isFreeModel,
   isHarnessOnlyMessage,
   readBlockedIds,
+  readBlockedError,
+  readModelCooldown,
+  rememberModelCooldown,
 } from './roster.js';
 import { settings } from './settings.js';
 
@@ -55,12 +58,14 @@ function dropExpiredStarts(now) {
   while (freeStarts.length && freeStarts[0] <= cutoff) freeStarts.shift();
 }
 
-async function admitFreePost(extraWaitMs, signal) {
+async function admitFreePost(extraWaitMs, signal, model) {
   const backoffUntil = monotonicNow() + Math.max(0, extraWaitMs || 0);
   for (;;) {
     if (signal?.aborted) {
       throw signal.reason || new DOMException('Aborted', 'AbortError');
     }
+    const unavailable = unavailableResult(model);
+    if (unavailable) return unavailable;
     const now = monotonicNow();
     dropExpiredStarts(now);
     let earliest = now;
@@ -76,8 +81,7 @@ async function admitFreePost(extraWaitMs, signal) {
       await delay((earliest - now) / 1000, signal);
       continue;
     }
-    freeStarts.push(now);
-    return;
+    return null;
   }
 }
 
@@ -103,7 +107,7 @@ export function resolveMaxTokens(model, override = null) {
   return OPENROUTER_MAX_TOKENS;
 }
 
-export function parseRetryAfter(raw, fallback) {
+export function parseRetryAfter(raw, fallback, maxSeconds = MAX_RETRY_AFTER_SECONDS) {
   let wait = null;
   if (raw != null) {
     const text = String(raw).trim();
@@ -116,7 +120,7 @@ export function parseRetryAfter(raw, fallback) {
     }
   }
   if (wait == null) wait = fallback;
-  return Math.max(0, Math.min(Number(wait), MAX_RETRY_AFTER_SECONDS));
+  return Math.max(0, Math.min(Number(wait), maxSeconds));
 }
 
 export function catalogueModelId(model) {
@@ -167,12 +171,28 @@ function failResult(message, status = null, detail = '') {
   };
 }
 
-function skippedResult() {
+function skippedResult(error, skipReason, retryAt = null) {
   return {
     ok: false,
     skipped: true,
-    error: { status: 403, message: 'Skipped', detail: '' },
+    skip_reason: skipReason,
+    error,
+    ...(retryAt == null ? {} : { retry_at: retryAt }),
   };
+}
+
+function unavailableResult(model) {
+  if (readBlockedIds().has(catalogueModelId(model))) {
+    return skippedResult(readBlockedError(model) || {
+      status: 403,
+      message: 'Skipped: model is only available on agentic harnesses',
+      detail: '',
+    }, 'harness_only');
+  }
+  const cooldown = readModelCooldown(model);
+  return cooldown
+    ? skippedResult(cooldown.error, 'provider_cooldown', cooldown.retry_at)
+    : null;
 }
 
 function enqueueFree(task) {
@@ -184,12 +204,15 @@ function enqueueFree(task) {
 export async function parseHttpError(response) {
   const status = response.status;
   let detail = '';
+  let rawDetail = '';
   const text = await response.text();
   try {
     const data = JSON.parse(text);
     const err = data?.error;
     if (err && typeof err === 'object') {
       detail = String(err.message || JSON.stringify(err));
+      const raw = err.metadata?.raw;
+      if (raw != null) rawDetail = typeof raw === 'string' ? raw : JSON.stringify(raw);
     } else if (err) {
       detail = String(err);
     } else {
@@ -209,6 +232,7 @@ export async function parseHttpError(response) {
     if (detail) message = `${message}: ${detail}`;
   }
 
+  if (rawDetail && rawDetail !== detail) detail = `${detail}\n${rawDetail}`.trim();
   return { status, message, detail };
 }
 
@@ -350,23 +374,39 @@ async function queryModelAttempts(model, messages, options) {
   let extraWaitMs = 0;
   for (let attempt = 0; attempt < maxRetries; attempt += 1) {
     try {
-      if (readBlockedIds().has(baseModel)) return skippedResult();
+      const unavailable = unavailableResult(model);
+      if (unavailable) return unavailable;
       if (free) {
-        await admitFreePost(extraWaitMs, signal);
+        const skipped = await admitFreePost(extraWaitMs, signal, model);
+        if (skipped) return skipped;
         extraWaitMs = 0;
       }
+      // Admission awaits a timer: another tab may have refused this model while
+      // we waited. Only an actual transport attempt spends a free start.
+      const beforeDispatch = unavailableResult(model);
+      if (beforeDispatch) return beforeDispatch;
+      if (signal?.aborted) return failResult('aborted');
+      const requestSignal = combinedSignal(timeout, signal);
+      if (free) freeStarts.push(monotonicNow());
       const response = await fetch(OPENROUTER_API_URL, {
         method: 'POST',
         headers,
         body: JSON.stringify(payload),
-        signal: combinedSignal(timeout, signal),
+        signal: requestSignal,
       });
 
       if (response.status === 429) {
         const error = await parseHttpError(response);
-        const detail = `${error.message || ''} ${error.detail || ''}`;
+        const detail = `${error.message || ''} ${error.detail || ''}`.toLowerCase();
         const freeLimited = detail.includes('free-models-per-min');
         const header = response.headers.get('Retry-After');
+        const upstreamLimited = detail.includes('temporarily rate-limited upstream')
+          || /provider returned error/i.test(error.message);
+        if (free && !freeLimited && upstreamLimited) {
+          const wait = Math.max(600, parseRetryAfter(header, 600, 3600));
+          const cooldown = rememberModelCooldown(baseModel, wait, error);
+          return skippedResult(error, 'provider_cooldown', cooldown.retry_at);
+        }
         const wait = freeLimited
           ? parseRetryAfter(header, FREE_MINUTE_MS / 1000)
           : parseRetryAfter(header, 2 ** attempt);
@@ -390,8 +430,14 @@ async function queryModelAttempts(model, messages, options) {
           response.status === 403
           && isHarnessOnlyMessage(`${error.message || ''} ${error.detail || ''}`)
         ) {
-          dropBlockedModel(model);
-          console.error(`Error querying model ${model}: HTTP 403`);
+          try {
+            dropBlockedModel(model, error);
+          } catch (exc) {
+            // The refusal is already remembered in memory. A storage failure
+            // must not turn this known skip back into a Stage 1 error tab.
+            console.error('Could not persist the pruned council:', exc);
+          }
+          return skippedResult(error, 'harness_only');
         } else {
           console.error(`Error querying model ${model}: HTTP ${response.status}`);
         }
@@ -425,7 +471,8 @@ async function queryModelAttempts(model, messages, options) {
 }
 
 export async function queryModelResult(model, messages, options = {}) {
-  if (readBlockedIds().has(catalogueModelId(model))) return skippedResult();
+  const unavailable = unavailableResult(model);
+  if (unavailable) return unavailable;
   const run = () => queryModelAttempts(model, messages, options);
   if (isFreeModel(model)) return enqueueFree(run);
   return run();

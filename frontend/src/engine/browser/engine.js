@@ -178,7 +178,7 @@ async function* emitStage1(
       yield { type: 'stage1_model_failed', data: eventData };
     } else if (eventType === 'all_complete') {
       results = eventData.results;
-      failures = eventData.failures || [];
+      failures = (eventData.failures ?? []).filter((failure) => !failure.skipped);
     }
   }
 
@@ -210,13 +210,13 @@ async function* emitStage2(conversationId, msgIndex, queryText, stage1Results, c
     } else if (eventType === 'model_complete') {
       yield { type: 'stage2_model_complete', data: eventData };
     } else if (eventType === 'model_failed') {
-      failures.push(eventData);
+      if (!eventData.skipped) failures.push(eventData);
       collected.failures = failures;
       yield { type: 'stage2_model_failed', data: eventData };
     } else if (eventType === 'all_complete') {
       results = eventData.results;
       labelToModel = eventData.label_to_model;
-      failures = eventData.failures || failures;
+      failures = (eventData.failures ?? failures).filter((failure) => !failure.skipped);
       collected.results = results;
       collected.labelToModel = labelToModel;
       collected.failures = failures;

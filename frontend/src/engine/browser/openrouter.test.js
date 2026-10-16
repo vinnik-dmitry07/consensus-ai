@@ -18,7 +18,12 @@ import {
   resolveMaxTokens,
   unknownCatalogueIds,
 } from './openrouter.js';
-import { readBlockedIds } from './roster.js';
+import {
+  readBlockedIds,
+  readModelCooldown,
+  rememberBlockedId,
+  rememberModelCooldown,
+} from './roster.js';
 import { settings } from './settings.js';
 
 function jsonResponse(status, body, headers = {}) {
@@ -101,6 +106,20 @@ describe('parseHttpError', () => {
     const error = await parseHttpError(response);
     expect(error.status).toBe(500);
     expect(error.message).toContain('upstream exploded');
+  });
+
+  it.each([
+    'temporarily rate-limited upstream',
+    { error: { message: 'temporarily rate-limited upstream' } },
+    ['temporarily rate-limited upstream'],
+  ])('includes raw provider detail without changing the display message: %j', async (raw) => {
+    const error = await parseHttpError(jsonResponse(429, {
+      error: { message: 'Provider returned error', metadata: { raw } },
+    }));
+    expect(error.message).toBe('HTTP 429: Provider returned error');
+    expect(error.detail).toContain('Provider returned error');
+    expect(error.detail).toContain('temporarily rate-limited upstream');
+    expect(error.detail).not.toContain('[object Object]');
   });
 });
 
@@ -285,12 +304,217 @@ describe('queryModelResult', () => {
       { role: 'user', content: 'q' },
     ]);
     expect(first.ok).toBe(false);
-    expect(first.skipped).toBeUndefined();
+    expect(first.skipped).toBe(true);
+    expect(first.skip_reason).toBe('harness_only');
+    expect(first.error.status).toBe(403);
     expect(second.skipped).toBe(true);
+    expect(second.error).toEqual(first.error);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(readBlockedIds().has('thinkingmachines/inkling:free')).toBe(true);
     expect(settings.councilModels).not.toContain('thinkingmachines/inkling:free');
     expect(settings.councilModels).toContain('google/gemma-4-31b-it:free');
+  });
+
+  it('leaves a generic 403 visible and does not block its model', async () => {
+    settings.apiKey = 'sk-test';
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(403, {
+      error: { message: 'Forbidden by privacy settings' },
+    })));
+    const result = await queryModelResult('a/one:free', []);
+    expect(result.skipped).toBeUndefined();
+    expect(result.error.status).toBe(403);
+    expect(readBlockedIds().has('a/one:free')).toBe(false);
+  });
+
+  it('still skips a harness refusal when saving the pruned council fails', async () => {
+    settings.apiKey = 'sk-test';
+    settings.councilModels = ['a/one:free', 'b/two:free'];
+    vi.spyOn(localStorage, 'setItem').mockImplementation(() => { throw new Error('full'); });
+    const fetchMock = vi.fn(async () => jsonResponse(403, {
+      error: { message: 'This model is only available on agentic harnesses' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const first = await queryModelResult('a/one:free', []);
+    expect(first.skipped).toBe(true);
+    expect(first.error.status).toBe(403);
+    expect((await queryModelResult('a/one:free-reasoning', [])).skipped).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(settings.councilModels).toEqual(['b/two:free']);
+  });
+
+  it('skips queued provider-refused variants without retries or extra free starts', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    const model = 'google/gemma-4-31b-it:free';
+    settings.councilModels = [model, 'google/other:free'];
+    const starts = [];
+    const fetchMock = vi.fn(async (_url, init) => {
+      const cid = JSON.parse(init.body).model;
+      starts.push([cid, performance.now()]);
+      if (cid === model) {
+        return jsonResponse(429, {
+          error: {
+            message: 'Provider returned error',
+            metadata: { raw: 'temporarily rate-limited upstream' },
+          },
+        });
+      }
+      return jsonResponse(200, { choices: [{ message: { content: 'ok' } }] });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const pending = Promise.all([
+      queryModelResult(model, []),
+      queryModelResult(`${model}-reasoning`, []),
+      queryModelResult(`${model}-reasoning-high`, []),
+      queryModelResult('google/other:free', []),
+    ]);
+    await vi.advanceTimersByTimeAsync(3000);
+    const results = await pending;
+    expect(starts).toEqual([[model, 0], ['google/other:free', 3000]]);
+    for (const result of results.slice(0, 3)) {
+      expect(result).toMatchObject({
+        ok: false,
+        skipped: true,
+        skip_reason: 'provider_cooldown',
+        error: { status: 429 },
+      });
+      expect(result.error).toEqual(results[0].error);
+      expect(result.retry_at).toBe(results[0].retry_at);
+    }
+    expect(results[3].ok).toBe(true);
+    expect(settings.councilModels).toContain(model);
+    expect(readBlockedIds().has(model)).toBe(false);
+    await vi.advanceTimersByTimeAsync(600000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ['Provider returned error', null],
+    ['Rate limited', 'temporarily rate-limited upstream'],
+  ])('classifies a provider refusal: %s, %s', async (message, raw) => {
+    settings.apiKey = 'sk-test';
+    const fetchMock = vi.fn(async () => jsonResponse(429, {
+      error: { message, metadata: { raw } },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const result = await queryModelResult('a/one:free', []);
+    expect(result.skipped).toBe(true);
+    expect(result.error.status).toBe(429);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a paid provider 429 without a model cooldown', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(429, { error: { message: 'Provider returned error' } }))
+      .mockResolvedValueOnce(jsonResponse(200, { choices: [{ message: { content: 'ok' } }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const pending = queryModelResult('openai/paid', []);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect((await pending).ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(readModelCooldown('openai/paid')).toBeNull();
+  });
+
+  it('retries an unrelated 429 with the existing short backoff', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    const starts = [];
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      starts.push(performance.now());
+      return starts.length === 1
+        ? jsonResponse(429, { error: { message: 'Concurrent request limit' } })
+        : jsonResponse(200, { choices: [{ message: { content: 'ok' } }] });
+    }));
+    const pending = queryModelResult('a/one:free', []);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect((await pending).ok).toBe(true);
+    expect(starts).toEqual([0, 3000]);
+    expect(readModelCooldown('a/one:free')).toBeNull();
+  });
+
+  it('gives nested free-models-per-min priority over provider wording', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    const starts = [];
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      starts.push(performance.now());
+      return starts.length === 1 ? jsonResponse(429, {
+        error: {
+          message: 'Provider returned error',
+          metadata: { raw: { error: { message: 'Rate limit: free-models-per-min' } } },
+        },
+      }) : jsonResponse(200, { choices: [{ message: { content: 'ok' } }] });
+    }));
+    const pending = queryModelResult('a/one:free', []);
+    await vi.advanceTimersByTimeAsync(59999);
+    expect(starts).toEqual([0]);
+    expect(readModelCooldown('a/one:free')).toBeNull();
+    await vi.advanceTimersByTimeAsync(1);
+    expect((await pending).ok).toBe(true);
+    expect(starts).toEqual([0, 60000]);
+  });
+
+  it.each([
+    [undefined, 600],
+    ['bad', 600],
+    ['5', 600],
+    ['1200', 1200],
+    ['7200', 3600],
+    ['Thu, 01 Jan 2026 00:20:00 GMT', 1200],
+  ])('uses a bounded provider cooldown from Retry-After %s', async (header, seconds) => {
+    useFreeClock();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    settings.apiKey = 'sk-test';
+    const start = Date.now() / 1000;
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(429, {
+      error: { message: 'Provider returned error' },
+    }, header === undefined ? {} : { 'Retry-After': header })));
+    const result = await queryModelResult('a/one:free', []);
+    expect(result.retry_at).toBe(start + seconds);
+  });
+
+  it('keeps a provider cooldown across a module reload and retries only on demand at expiry', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(429, { error: { message: 'Provider returned error' } }))
+      .mockResolvedValueOnce(jsonResponse(200, { choices: [{ message: { content: 'ok' } }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const first = await queryModelResult('a/one:free', []);
+    vi.resetModules();
+    const reloaded = await import('./openrouter.js');
+    const second = await reloaded.queryModelResult('a/one:free-reasoning-high', []);
+    expect(second.error).toEqual(first.error);
+    expect(second.retry_at).toBe(first.retry_at);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(599999);
+    expect((await reloaded.queryModelResult('a/one:free', [])).skipped).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((await reloaded.queryModelResult('a/one:free', [])).ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['cooldown', 'harness'])('checks a %s introduced while waiting without spending a start', async (refusal) => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    const starts = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url, init) => {
+      starts.push([JSON.parse(init.body).model, performance.now()]);
+      return jsonResponse(200, { choices: [{ message: { content: 'ok' } }] });
+    }));
+    await queryModelResult('a/one:free', []);
+    const blocked = queryModelResult('b/two:free', []);
+    const next = queryModelResult('c/three:free', []);
+    await vi.advanceTimersByTimeAsync(1000);
+    if (refusal === 'cooldown') rememberModelCooldown('b/two:free', 600);
+    else rememberBlockedId('b/two:free');
+    await vi.advanceTimersByTimeAsync(2000);
+    expect((await blocked).skipped).toBe(true);
+    expect((await next).ok).toBe(true);
+    expect(starts).toEqual([['a/one:free', 0], ['c/three:free', 3000]]);
   });
 
   it('starts free calls at least 3 seconds apart', async () => {

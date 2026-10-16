@@ -27,6 +27,12 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
   self-exclusion and red-team selection — never compare raw model ids for this
 - `parse_retry_after()`: 429 backoff from the header; seconds or HTTP-date, and
   clamped to `MAX_RETRY_AFTER_SECONDS` so one header cannot stall a run
+- Refusals are distinct from failures: the first harness-only 403 permanently
+  prunes the model and returns `skipped`. A free provider 429 uses a per-catalogue
+  cooldown (10 minutes, or longer Retry-After up to 60 minutes), with no retry.
+  Browser cooldowns persist in localStorage; Python cooldowns last for the process.
+  Parse `error.metadata.raw` as well as the main message: `free-models-per-min`
+  takes precedence and still pauses/retries the shared free queue.
 
 **`council.py`** - The Core Logic
 - `stage1_collect_responses()`: Parallel queries to all council models
@@ -41,6 +47,10 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 - `compute_consensus()`: Council confidence `HIGH` / `MEDIUM` / `LOW` / `CONTESTED` (never "verified"). `HIGH` requires a red-team verdict — if the red team did not run, confidence is capped at `MEDIUM`
 - `run_post_ranking()`: Aggregation + red team + consensus used by every entry point
 - `stage3_synthesize_final()`: Chairman sees anonymized top-K only; Candidate #1 is the base draft
+- Skipped Stage 1/2 calls advance progress without failure rows. A skipped red
+  team is unavailable, so it cannot increase confidence. Stage 3 may use another
+  available council model for that call, trying each catalogue id once; temporary
+  fallback does not change the saved chairman, and genuine failures still surface.
 - `parse_ranking_from_text()` / `parse_correctness_scores()` / `parse_issues()` / `parse_disputed_claims()`
 
 **`storage.py`**

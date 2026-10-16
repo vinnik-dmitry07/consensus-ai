@@ -1,5 +1,7 @@
 """OpenRouter API client for making LLM requests."""
 import asyncio
+import json
+import math
 import re
 import time
 import traceback
@@ -20,12 +22,13 @@ from .config import (
 from .roster import (
     FREE_MINUTE_SECONDS,
     admit_free_post,
-    blocked_ids,
     catalogue_id,
     drop_blocked_model,
     is_free_model,
     is_harness_only_message,
+    model_unavailability,
     pause_free_queue,
+    remember_model_cooldown,
     run_free_call,
 )
 from .settings import settings
@@ -47,20 +50,26 @@ def resolve_max_tokens(model: str, override: Optional[int] = None) -> int:
 
 # Upper bound on an honoured Retry-After; a longer wait ties up a council slot.
 MAX_RETRY_AFTER_SECONDS = 60
+PROVIDER_COOLDOWN_SECONDS = 600
+MAX_PROVIDER_COOLDOWN_SECONDS = 3600
 
 
 class CatalogueUnavailable(Exception):
     """OpenRouter model list could not be loaded."""
 
 
-def parse_retry_after(raw: Optional[str], fallback: float) -> float:
+def parse_retry_after(
+    raw: Optional[str],
+    fallback: float,
+    max_seconds: float = MAX_RETRY_AFTER_SECONDS,
+) -> float:
     """
     Seconds to wait from a Retry-After header.
 
     RFC 9110 allows either a delta in seconds or an HTTP-date, and a proxy in
     front of OpenRouter may send either. Anything unparseable falls back to the
-    caller's backoff, and every value is clamped so one header cannot park a
-    request for an hour.
+    caller's backoff. The default cap limits retry waits; provider cooldowns
+    use a larger cap without holding a request open.
     """
     wait = None
     if raw is not None:
@@ -77,9 +86,9 @@ def parse_retry_after(raw: Optional[str], fallback: float) -> float:
                     if when.tzinfo is None:
                         when = when.replace(tzinfo=timezone.utc)
                     wait = (when - datetime.now(timezone.utc)).total_seconds()
-    if wait is None:
+    if wait is None or not math.isfinite(wait):
         wait = fallback
-    return max(0.0, min(float(wait), MAX_RETRY_AFTER_SECONDS))
+    return max(0.0, min(float(wait), max_seconds))
 
 
 def catalogue_model_id(model: str) -> str:
@@ -124,14 +133,24 @@ def parse_http_error(response: httpx.Response) -> Dict[str, Any]:
     """Extract status, user-facing message, and raw detail from an HTTP error."""
     status = response.status_code
     detail = ''
+    primary_detail = ''
     try:
         data = response.json()
     except ValueError:
         detail = response.text or ''
     else:
-        err = data.get('error')
+        err = data.get('error') if isinstance(data, dict) else None
         if isinstance(err, dict):
-            detail = str(err.get('message') or err)
+            message = err.get('message')
+            primary_detail = str(message or '')
+            metadata = err.get('metadata')
+            raw = metadata.get('raw') if isinstance(metadata, dict) else None
+            parts = [str(message)] if message else []
+            if raw is not None:
+                raw_text = raw if isinstance(raw, str) else json.dumps(raw)
+                if raw_text and raw_text not in parts:
+                    parts.append(raw_text)
+            detail = '\n'.join(parts) or json.dumps(err)
         elif err:
             detail = str(err)
         else:
@@ -143,8 +162,8 @@ def parse_http_error(response: httpx.Response) -> Dict[str, Any]:
         message = 'Model not found (404)'
     else:
         message = f'HTTP {status}'
-        if detail:
-            message = f'{message}: {detail}'
+        if primary_detail or detail:
+            message = f'{message}: {primary_detail or detail}'
 
     return {
         'status': status,
@@ -252,12 +271,16 @@ def visible_reasoning_text(message: Any) -> str:
     return '\n\n'.join(parts)
 
 
-def _skipped_result() -> Dict[str, Any]:
-    return {
+def _skipped_result(unavailable) -> Dict[str, Any]:
+    result = {
         'ok': False,
         'skipped': True,
-        'error': {'status': 403, 'message': 'Skipped', 'detail': ''},
+        'skip_reason': unavailable['reason'],
+        'error': unavailable['error'],
     }
+    if 'retry_at' in unavailable:
+        result['retry_at'] = unavailable['retry_at']
+    return result
 
 
 def _fail_result(
@@ -276,6 +299,9 @@ async def _query_model_attempts(
     max_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     """One model's HTTP attempts. Caller serializes :free models."""
+    unavailable = model_unavailability(model)
+    if unavailable:
+        return _skipped_result(unavailable)
     api_key = get_api_key()
     if not api_key:
         print(f'Error querying model {model}: No API key configured')
@@ -305,12 +331,22 @@ async def _query_model_attempts(
     extra_wait = 0.0
     for attempt in range(max_retries):
         try:
-            if base_model in blocked_ids():
-                return _skipped_result()
+            unavailable = model_unavailability(model)
+            if unavailable:
+                return _skipped_result(unavailable)
             async with httpx.AsyncClient(timeout=timeout) as client:
                 if free:
-                    await admit_free_post(extra_wait)
+                    while not await admit_free_post(extra_wait, model=model):
+                        unavailable = model_unavailability(model)
+                        if unavailable:
+                            return _skipped_result(unavailable)
+                        # A cooldown can expire between the two clock reads.
+                        extra_wait = 0.0
                     extra_wait = 0.0
+                else:
+                    unavailable = model_unavailability(model)
+                    if unavailable:
+                        return _skipped_result(unavailable)
                 response = await client.post(
                     OPENROUTER_API_URL, headers=headers, json=payload
                 )
@@ -342,12 +378,23 @@ async def _query_model_attempts(
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 429:
                 error = parse_http_error(e.response)
-                detail = f"{error.get('message', '')} {error.get('detail', '')}"
+                detail = error['detail'].lower()
                 free_limited = 'free-models-per-min' in detail
                 header = e.response.headers.get('Retry-After')
                 if free_limited:
                     wait = parse_retry_after(header, FREE_MINUTE_SECONDS)
                     pause_free_queue(wait)
+                elif free and (
+                    'temporarily rate-limited upstream' in detail
+                    or 'provider returned error' in detail
+                ):
+                    wait = max(PROVIDER_COOLDOWN_SECONDS, parse_retry_after(
+                        header,
+                        PROVIDER_COOLDOWN_SECONDS,
+                        max_seconds=MAX_PROVIDER_COOLDOWN_SECONDS,
+                    ))
+                    remember_model_cooldown(model, wait, error=error)
+                    return _skipped_result(model_unavailability(model))
                 else:
                     wait = parse_retry_after(header, 2**attempt)
                 if attempt < max_retries - 1:
@@ -370,8 +417,8 @@ async def _query_model_attempts(
                     f"{error.get('message', '')} {error.get('detail', '')}"
                 )
             ):
-                drop_blocked_model(model)
-                print(f'Error querying model {model}: {e}')
+                drop_blocked_model(model, error=error)
+                return _skipped_result(model_unavailability(model))
             else:
                 traceback.print_exc()
                 print(f'Error querying model {model}: {e}')
@@ -398,8 +445,9 @@ async def query_model_result(
     at least three seconds between starts, and at most 16 starts in any
     60-second window. Paid models stay parallel.
     """
-    if catalogue_model_id(model) in blocked_ids():
-        return _skipped_result()
+    unavailable = model_unavailability(model)
+    if unavailable:
+        return _skipped_result(unavailable)
 
     async def attempt():
         return await _query_model_attempts(

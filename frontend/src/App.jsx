@@ -222,7 +222,7 @@ function App() {
           messages[idx] = { 
             ...messages[idx], 
             stage1: event.data,
-            stage1_failures: event.failures || messages[idx].stage1_failures || [],
+            stage1_failures: event.failures ?? messages[idx].stage1_failures ?? [],
             stage1Progress: null,
             loading: { ...messages[idx].loading, stage1: false } 
           };
@@ -238,7 +238,7 @@ function App() {
           messages[idx] = { 
             ...messages[idx],
             stage1: progressResults ?? messages[idx].stage1 ?? [],
-            stage1_failures: event.failures || messages[idx].stage1_failures || [],
+            stage1_failures: event.failures ?? messages[idx].stage1_failures ?? [],
             loading: { ...messages[idx].loading, stage1: false }, 
             stage1Progress: null,
             error: { stage: 1, message: event.message } 
@@ -286,9 +286,9 @@ function App() {
           const messages = [...prev.messages];
           const idx = getTargetMsgIndex(prev);
           const progress = messages[idx].stage2Progress;
-          const nextFailures = eventType === 'stage2_model_failed'
+          const nextFailures = eventType === 'stage2_model_failed' && !event.data.skipped
             ? [...(messages[idx].stage2_failures || []), event.data]
-            : messages[idx].stage2_failures;
+            : (messages[idx].stage2_failures || []);
           if (progress) {
             messages[idx] = {
               ...messages[idx],
@@ -312,7 +312,7 @@ function App() {
           messages[idx] = { 
             ...messages[idx], 
             stage2: event.data,
-            stage2_failures: event.failures || messages[idx].stage2_failures || [],
+            stage2_failures: event.failures ?? messages[idx].stage2_failures ?? [],
             metadata: event.metadata, 
             loading: { ...messages[idx].loading, stage2: false },
             stage2Progress: null
