@@ -19,13 +19,17 @@ from .config import (
 )
 from .roster import (
     FREE_MINUTE_SECONDS,
+    MODEL_COOLDOWN_MAX_SECONDS,
+    MODEL_COOLDOWN_SECONDS,
     admit_free_post,
-    blocked_ids,
     catalogue_id,
     drop_blocked_model,
     is_free_model,
     is_harness_only_message,
+    is_upstream_limited,
+    model_unavailable,
     pause_free_queue,
+    remember_model_cooldown,
     run_free_call,
 )
 from .settings import settings
@@ -53,7 +57,11 @@ class CatalogueUnavailable(Exception):
     """OpenRouter model list could not be loaded."""
 
 
-def parse_retry_after(raw: Optional[str], fallback: float) -> float:
+def parse_retry_after(
+    raw: Optional[str],
+    fallback: float,
+    limit: float = MAX_RETRY_AFTER_SECONDS,
+) -> float:
     """
     Seconds to wait from a Retry-After header.
 
@@ -79,7 +87,7 @@ def parse_retry_after(raw: Optional[str], fallback: float) -> float:
                     wait = (when - datetime.now(timezone.utc)).total_seconds()
     if wait is None:
         wait = fallback
-    return max(0.0, min(float(wait), MAX_RETRY_AFTER_SECONDS))
+    return max(0.0, min(float(wait), limit))
 
 
 def catalogue_model_id(model: str) -> str:
@@ -131,7 +139,13 @@ def parse_http_error(response: httpx.Response) -> Dict[str, Any]:
     else:
         err = data.get('error')
         if isinstance(err, dict):
-            detail = str(err.get('message') or err)
+            message = str(err.get('message') or '')
+            metadata = err.get('metadata')
+            raw = ''
+            if isinstance(metadata, dict) and metadata.get('raw'):
+                raw = str(metadata.get('raw'))
+            parts = [part for part in (message, raw) if part]
+            detail = ' '.join(parts) if parts else str(err)
         elif err:
             detail = str(err)
         else:
@@ -305,7 +319,7 @@ async def _query_model_attempts(
     extra_wait = 0.0
     for attempt in range(max_retries):
         try:
-            if base_model in blocked_ids():
+            if model_unavailable(model):
                 return _skipped_result()
             async with httpx.AsyncClient(timeout=timeout) as client:
                 if free:
@@ -348,6 +362,14 @@ async def _query_model_attempts(
                 if free_limited:
                     wait = parse_retry_after(header, FREE_MINUTE_SECONDS)
                     pause_free_queue(wait)
+                elif is_upstream_limited(detail):
+                    wait = parse_retry_after(
+                        header,
+                        MODEL_COOLDOWN_SECONDS,
+                        MODEL_COOLDOWN_MAX_SECONDS,
+                    )
+                    remember_model_cooldown(model, wait)
+                    return _skipped_result()
                 else:
                     wait = parse_retry_after(header, 2**attempt)
                 if attempt < max_retries - 1:
@@ -372,6 +394,7 @@ async def _query_model_attempts(
             ):
                 drop_blocked_model(model)
                 print(f'Error querying model {model}: {e}')
+                return _skipped_result()
             else:
                 traceback.print_exc()
                 print(f'Error querying model {model}: {e}')
@@ -398,7 +421,7 @@ async def query_model_result(
     at least three seconds between starts, and at most 16 starts in any
     60-second window. Paid models stay parallel.
     """
-    if catalogue_model_id(model) in blocked_ids():
+    if model_unavailable(model):
         return _skipped_result()
 
     async def attempt():

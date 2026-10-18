@@ -102,6 +102,27 @@ describe('parseHttpError', () => {
     expect(error.status).toBe(500);
     expect(error.message).toContain('upstream exploded');
   });
+
+  it('keeps the provider raw text in the detail', async () => {
+    const error = await parseHttpError(jsonResponse(429, {
+      error: {
+        message: 'Provider returned error',
+        metadata: { raw: 'temporarily rate-limited upstream' },
+      },
+    }));
+    expect(error.detail).toContain('Provider returned error');
+    expect(error.detail).toContain('temporarily rate-limited upstream');
+  });
+
+  it('stringifies a non-string provider raw body', async () => {
+    const error = await parseHttpError(jsonResponse(429, {
+      error: {
+        message: 'upstream',
+        metadata: { raw: { error: 'temporarily rate-limited upstream' } },
+      },
+    }));
+    expect(error.detail).toContain('temporarily rate-limited upstream');
+  });
 });
 
 describe('resolveMaxTokens', () => {
@@ -285,12 +306,65 @@ describe('queryModelResult', () => {
       { role: 'user', content: 'q' },
     ]);
     expect(first.ok).toBe(false);
-    expect(first.skipped).toBeUndefined();
+    expect(first.skipped).toBe(true);
     expect(second.skipped).toBe(true);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(readBlockedIds().has('thinkingmachines/inkling:free')).toBe(true);
     expect(settings.councilModels).not.toContain('thinkingmachines/inkling:free');
     expect(settings.councilModels).toContain('google/gemma-4-31b-it:free');
+  });
+
+  it('cools an upstream-limited model without retrying', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    let calls = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return jsonResponse(429, {
+          error: {
+            message: 'Provider returned error',
+            metadata: {
+              raw: 'google/gemma-4-31b-it:free is temporarily rate-limited upstream.',
+            },
+          },
+        });
+      }
+      return jsonResponse(200, { choices: [{ message: { content: 'ok' } }] });
+    }));
+    const messages = [{ role: 'user', content: 'q' }];
+    const first = await queryModelResult('google/gemma-4-31b-it:free', messages);
+    const second = await queryModelResult('google/gemma-4-31b-it:free-reasoning-high', messages);
+    expect(first.skipped).toBe(true);
+    expect(second.skipped).toBe(true);
+    expect(calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+    const third = await queryModelResult('google/gemma-4-31b-it:free', messages);
+    expect(third.ok).toBe(true);
+    expect(calls).toBe(2);
+  });
+
+  it('still retries when provider text wraps free-models-per-min', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    let calls = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return jsonResponse(429, {
+          error: {
+            message: 'Provider returned error',
+            metadata: { raw: 'Rate limit exceeded: free-models-per-min' },
+          },
+        }, { 'Retry-After': '10' });
+      }
+      return jsonResponse(200, { choices: [{ message: { content: 'ok' } }] });
+    }));
+    const pending = queryModelResult('a/one:free', [{ role: 'user', content: 'q' }]);
+    await vi.advanceTimersByTimeAsync(10000);
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(calls).toBe(2);
   });
 
   it('starts free calls at least 3 seconds apart', async () => {

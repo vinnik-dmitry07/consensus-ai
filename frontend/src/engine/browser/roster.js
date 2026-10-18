@@ -7,7 +7,12 @@
 import { settings } from './settings.js';
 
 const BLOCKED_KEY = 'llm-council-blocked-models';
+const COOLDOWN_KEY = 'llm-council-model-cooldowns';
 const HARNESS_ONLY = 'only available on agentic harnesses';
+const UPSTREAM_LIMIT = 'temporarily rate-limited upstream';
+const PROVIDER_RETURNED = 'provider returned error';
+export const MODEL_COOLDOWN_MS = 10 * 60 * 1000;
+export const MODEL_COOLDOWN_MAX_MS = 60 * 60 * 1000;
 
 export function catalogueId(model) {
   return String(model || '').replace(/-reasoning(?:-high)?$/, '');
@@ -30,6 +35,59 @@ export function stage1SampleLimit(councilModels, requested) {
 
 export function isHarnessOnlyMessage(text) {
   return String(text || '').toLowerCase().includes(HARNESS_ONLY);
+}
+
+export function isUpstreamLimited(text) {
+  const lowered = String(text || '').toLowerCase();
+  if (lowered.includes('free-models-per-min')) return false;
+  if (lowered.includes(UPSTREAM_LIMIT)) return true;
+  return lowered.includes(PROVIDER_RETURNED);
+}
+
+function readCooldownMap() {
+  try {
+    const raw = localStorage.getItem(COOLDOWN_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return parsed;
+  } catch {
+    return {};
+  }
+}
+
+export function modelIsCooling(model) {
+  const cid = catalogueId(model);
+  const map = readCooldownMap();
+  const until = Number(map[cid]);
+  if (!cid || !Number.isFinite(until)) return false;
+  if (Date.now() >= until) {
+    delete map[cid];
+    localStorage.setItem(COOLDOWN_KEY, JSON.stringify(map));
+    return false;
+  }
+  return true;
+}
+
+export function rememberModelCooldown(model, seconds) {
+  const cid = catalogueId(model);
+  if (!cid) return;
+  const requested = Math.max(0, Number(seconds) || 0) * 1000;
+  const wait = Math.min(Math.max(requested, MODEL_COOLDOWN_MS), MODEL_COOLDOWN_MAX_MS);
+  const until = Date.now() + wait;
+  const map = readCooldownMap();
+  const previous = Number(map[cid]) || 0;
+  if (until > previous) map[cid] = until;
+  localStorage.setItem(COOLDOWN_KEY, JSON.stringify(map));
+}
+
+export function clearModelCooldowns() {
+  localStorage.removeItem(COOLDOWN_KEY);
+}
+
+export function modelUnavailable(model) {
+  const cid = catalogueId(model);
+  if (!cid) return false;
+  return readBlockedIds().has(cid) || modelIsCooling(model);
 }
 
 export function readBlockedIds() {

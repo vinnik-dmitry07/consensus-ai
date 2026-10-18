@@ -286,7 +286,8 @@ function App() {
           const messages = [...prev.messages];
           const idx = getTargetMsgIndex(prev);
           const progress = messages[idx].stage2Progress;
-          const nextFailures = eventType === 'stage2_model_failed'
+          const recordFailure = eventType === 'stage2_model_failed' && !event.data.skipped;
+          const nextFailures = recordFailure
             ? [...(messages[idx].stage2_failures || []), event.data]
             : messages[idx].stage2_failures;
           if (progress) {

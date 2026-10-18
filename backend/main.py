@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from . import storage
 from .council import (
+    MODELS_UNAVAILABLE,
     Stage1AllFailed,
     build_council_metadata,
     build_user_message,
@@ -360,7 +361,8 @@ def _stage2_fail_message(failures: List[Dict[str, Any]]) -> str:
         first = (failures[0].get('error') or {}).get('message') or ''
         if first:
             return first
-    return 'All models failed to respond in Stage 2'
+        return 'All models failed to respond in Stage 2'
+    return MODELS_UNAVAILABLE
 
 
 async def _emit_stage2_sse(
@@ -386,8 +388,9 @@ async def _emit_stage2_sse(
         elif event_type == 'model_complete':
             yield f"data: {json.dumps({'type': 'stage2_model_complete', 'data': event_data})}\n\n"
         elif event_type == 'model_failed':
-            failures.append(event_data)
-            collected['failures'] = failures
+            if not event_data.get('skipped'):
+                failures.append(event_data)
+                collected['failures'] = failures
             yield f"data: {json.dumps({'type': 'stage2_model_failed', 'data': event_data})}\n\n"
         elif event_type == 'all_complete':
             results = event_data['results']
@@ -721,7 +724,12 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
     stage1_failures = (metadata or {}).get('stage1_failures') or []
     error = None
     if not stage1_results:
-        error = {'stage': 1, 'message': 'All models failed to respond in Stage 1'}
+        message = (
+            'All models failed to respond in Stage 1'
+            if stage1_failures
+            else MODELS_UNAVAILABLE
+        )
+        error = {'stage': 1, 'message': message}
     storage.add_assistant_message(
         conversation_id,
         stage1_results,

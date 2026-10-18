@@ -126,8 +126,9 @@ function stage2FailMessage(failures) {
   if (failures?.length) {
     const first = failures[0].error?.message || '';
     if (first) return first;
+    return 'All models failed to respond in Stage 2';
   }
-  return 'All models failed to respond in Stage 2';
+  return council.MODELS_UNAVAILABLE;
 }
 
 async function* emitStage1(
@@ -210,8 +211,10 @@ async function* emitStage2(conversationId, msgIndex, queryText, stage1Results, c
     } else if (eventType === 'model_complete') {
       yield { type: 'stage2_model_complete', data: eventData };
     } else if (eventType === 'model_failed') {
-      failures.push(eventData);
-      collected.failures = failures;
+      if (!eventData.skipped) {
+        failures.push(eventData);
+        collected.failures = failures;
+      }
       yield { type: 'stage2_model_failed', data: eventData };
     } else if (eventType === 'all_complete') {
       results = eventData.results;

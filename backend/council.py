@@ -13,7 +13,12 @@ from .openrouter import (
     query_model,
     query_model_result,
 )
-from .roster import ensure_servable_roster, stage1_sample_limit
+from .roster import (
+    catalogue_id,
+    ensure_servable_roster,
+    model_unavailable,
+    stage1_sample_limit,
+)
 from .settings import settings
 
 # Colon may sit inside or outside bold: **LABEL:** or **LABEL**:
@@ -27,12 +32,21 @@ _RESPONSE_HEADER = re.compile(
 )
 
 
+MODELS_UNAVAILABLE = (
+    'OpenRouter will not serve the selected models right now.'
+)
+
+
 class Stage1AllFailed(Exception):
     """Every Stage 1 sample failed; per-model errors are on .failures."""
 
     def __init__(self, failures: List[Dict[str, Any]]):
-        super().__init__('All models failed to respond in Stage 1')
         self.failures = failures
+        if failures:
+            message = 'All models failed to respond in Stage 1'
+        else:
+            message = MODELS_UNAVAILABLE
+        super().__init__(message)
 
 
 def usable_stage1_results(
@@ -613,6 +627,12 @@ async def stage2_collect_rankings_streaming(
             result = format_stage2_result(model, response, view)
             stage2_results.append(result)
             yield ('model_complete', {'result': result})
+        elif response.get('skipped'):
+            yield ('model_failed', {
+                'model': model,
+                'error': response.get('error'),
+                'skipped': True,
+            })
         else:
             failure = {'model': model, 'error': response['error']}
             failures.append(failure)
@@ -836,6 +856,8 @@ Meaning:
 '''
 
     result = await query_model_result(model, [{'role': 'user', 'content': prompt}])
+    if result.get('skipped'):
+        return None
     if not result.get('ok'):
         return {
             'model': model,
@@ -1080,6 +1102,36 @@ def _format_candidate_block(
     )
 
 
+def _synthesis_candidates() -> List[str]:
+    """Chairman first, then the council models."""
+    ordered = []
+    if settings.chairman_model:
+        ordered.append(settings.chairman_model)
+    ordered.extend(settings.council_models or [])
+    return ordered
+
+
+async def _query_synthesis(messages: List[Dict[str, str]]):
+    """First synthesizer OpenRouter will serve. The saved chairman stays put."""
+    tried = set()
+    for model in _synthesis_candidates():
+        if not model or not str(model).strip():
+            continue
+        cid = catalogue_id(model)
+        if not cid or cid in tried or model_unavailable(model):
+            continue
+        tried.add(cid)
+        result = await query_model_result(model, messages)
+        if result.get('ok'):
+            return model, result
+        if result.get('skipped'):
+            continue
+        err = result.get('error') or {}
+        detail = err.get('message') or 'failed to generate response'
+        raise Exception(f'Chairman model ({model}) failed: {detail}')
+    raise Exception(MODELS_UNAVAILABLE)
+
+
 async def stage3_synthesize_final(
     user_query: str,
     stage1_results: List[Dict[str, Any]],
@@ -1166,21 +1218,14 @@ Your task:
 Provide a clear, well-reasoned final answer:'''
 
     messages = [{'role': 'user', 'content': chairman_prompt}]
-    result = await query_model_result(settings.chairman_model, messages)
-
-    if not result.get('ok'):
-        err = result.get('error') or {}
-        detail = err.get('message') or 'failed to generate response'
-        raise Exception(
-            f'Chairman model ({settings.chairman_model}) failed: {detail}'
-        )
+    chairman, result = await _query_synthesis(messages)
 
     leader_index = consensus.get('leader_index')
     if leader_index is None and top_k_indices:
         leader_index = top_k_indices[0]
 
     return {
-        'model': settings.chairman_model,
+        'model': chairman,
         'response': result.get('content', ''),
         'usage': result.get('usage', {}),
         'based_on_index': leader_index,

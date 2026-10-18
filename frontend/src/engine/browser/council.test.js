@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  MODELS_UNAVAILABLE,
   Stage1AllFailed,
   buildJudgeView,
   calculateAggregateRankings,
@@ -9,11 +10,15 @@ import {
   parseDisputedClaims,
   parseRankingFromText,
   pendingStage1Slots,
+  redTeamReview,
   retainedStage1Failures,
   stage1CollectResponsesStreaming,
+  stage2CollectRankingsStreaming,
+  stage3SynthesizeFinal,
   usableStage1Results,
 } from './council.js';
 import * as openrouter from './openrouter.js';
+import { rememberModelCooldown } from './roster.js';
 import { settings } from './settings.js';
 
 describe('stage 2 parsers', () => {
@@ -355,6 +360,11 @@ describe('stage 1 streaming', () => {
     expect(String(exc)).toContain('All models failed');
   });
 
+  it('says the models are unavailable when every sample was skipped', () => {
+    const exc = new Stage1AllFailed([]);
+    expect(exc.message).toBe(MODELS_UNAVAILABLE);
+  });
+
   it('uses one sample for an all-free council even when n is 3', async () => {
     settings.councilModels = ['a/one:free', 'b/two:free'];
     settings.nSamples = 3;
@@ -413,5 +423,108 @@ describe('stage 1 streaming', () => {
     expect(complete.results).toEqual([
       { model: 'a/one:free', response: 'first' },
     ]);
+  });
+});
+
+describe('skipped models in later stages', () => {
+  it('does not keep a skipped stage 2 judge as a failure', async () => {
+    settings.councilModels = ['a/one:free', 'openai/gpt-4.1'];
+    vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model) => {
+      if (String(model).endsWith(':free')) {
+        return { ok: false, skipped: true, error: { message: 'Skipped' } };
+      }
+      return { ok: true, content: 'FINAL RANKING:\n1. Response 1', usage: {} };
+    });
+    const events = [];
+    for await (const event of stage2CollectRankingsStreaming('q', [
+      { model: 'openai/gpt-4.1', response: 'answer' },
+    ])) {
+      events.push(event);
+    }
+    const complete = events.find((event) => event[0] === 'all_complete')[1];
+    expect(complete.failures).toEqual([]);
+    expect(complete.results).toHaveLength(1);
+    const skipped = events.filter((event) => event[0] === 'model_failed');
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0][1].skipped).toBe(true);
+  });
+
+  it('treats a skipped red team as a miss', async () => {
+    vi.spyOn(openrouter, 'queryModelResult').mockResolvedValue({
+      ok: false,
+      skipped: true,
+      error: { message: 'Skipped' },
+    });
+    const result = await redTeamReview(
+      'q',
+      'answer',
+      0,
+      [],
+      [{ model: 'openai/gpt-4.1', response: 'answer' }],
+    );
+    expect(result).toBeNull();
+  });
+
+  it('asks the next council model when the chairman is cooling', async () => {
+    settings.chairmanModel = 'google/gemma-4-31b-it:free';
+    settings.councilModels = ['google/gemma-4-31b-it:free', 'openai/gpt-4.1'];
+    rememberModelCooldown('google/gemma-4-31b-it:free', 1);
+    const called = [];
+    vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model) => {
+      called.push(model);
+      return { ok: true, content: 'final', usage: {} };
+    });
+    const result = await stage3SynthesizeFinal('q', [
+      { model: 'openai/gpt-4.1', response: 'a' },
+    ]);
+    expect(called).toEqual(['openai/gpt-4.1']);
+    expect(result.model).toBe('openai/gpt-4.1');
+    expect(settings.chairmanModel).toBe('google/gemma-4-31b-it:free');
+  });
+
+  it('tries the next council model when the chairman call is skipped', async () => {
+    settings.chairmanModel = 'google/gemma-4-31b-it:free-reasoning-high';
+    settings.councilModels = ['google/gemma-4-31b-it:free', 'openai/gpt-4.1'];
+    const called = [];
+    vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model) => {
+      called.push(model);
+      if (String(model).includes('gemma')) {
+        return { ok: false, skipped: true, error: { message: 'Skipped' } };
+      }
+      return { ok: true, content: 'final', usage: {} };
+    });
+    const result = await stage3SynthesizeFinal('q', [
+      { model: 'openai/gpt-4.1', response: 'a' },
+    ]);
+    expect(called).toEqual(['google/gemma-4-31b-it:free-reasoning-high', 'openai/gpt-4.1']);
+    expect(result.model).toBe('openai/gpt-4.1');
+    expect(settings.chairmanModel).toBe('google/gemma-4-31b-it:free-reasoning-high');
+  });
+
+  it('surfaces a real chairman failure without trying another model', async () => {
+    settings.chairmanModel = 'google/gemma-4-31b-it:free';
+    settings.councilModels = ['openai/gpt-4.1'];
+    const called = [];
+    vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model) => {
+      called.push(model);
+      return { ok: false, error: { message: '402: cannot afford reserved tokens' } };
+    });
+    await expect(stage3SynthesizeFinal('q', [
+      { model: 'openai/gpt-4.1', response: 'a' },
+    ])).rejects.toThrow('Chairman model (google/gemma-4-31b-it:free) failed: 402: cannot afford reserved tokens');
+    expect(called).toEqual(['google/gemma-4-31b-it:free']);
+  });
+
+  it('says the models are unavailable when every synthesizer is skipped', async () => {
+    settings.chairmanModel = 'google/gemma-4-31b-it:free';
+    settings.councilModels = ['openai/gpt-4.1'];
+    vi.spyOn(openrouter, 'queryModelResult').mockResolvedValue({
+      ok: false,
+      skipped: true,
+      error: { message: 'Skipped' },
+    });
+    await expect(stage3SynthesizeFinal('q', [
+      { model: 'openai/gpt-4.1', response: 'a' },
+    ])).rejects.toThrow(MODELS_UNAVAILABLE);
   });
 });

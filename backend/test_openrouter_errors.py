@@ -9,10 +9,14 @@ from fastapi.testclient import TestClient
 
 from backend.config import OPENROUTER_MAX_TOKENS, OPENROUTER_MAX_TOKENS_HIGH
 from backend.council import (
+    MODELS_UNAVAILABLE,
     Stage1AllFailed,
     pending_stage1_slots,
+    red_team_review,
     retained_stage1_failures,
     stage1_collect_responses_streaming,
+    stage2_collect_rankings_streaming,
+    stage3_synthesize_final,
 )
 from backend.main import _usable_final_answer, app
 from backend.openrouter import (
@@ -106,6 +110,17 @@ class ParseHttpErrorTests(unittest.TestCase):
         error = parse_http_error(response)
         self.assertEqual(error['status'], 500)
         self.assertIn('upstream exploded', error['message'])
+
+    def test_detail_includes_provider_raw(self):
+        response = httpx.Response(429, json={
+            'error': {
+                'message': 'Provider returned error',
+                'metadata': {'raw': 'temporarily rate-limited upstream'},
+            },
+        })
+        error = parse_http_error(response)
+        self.assertIn('Provider returned error', error['detail'])
+        self.assertIn('temporarily rate-limited upstream', error['detail'])
 
 
 class ResolveMaxTokensTests(unittest.TestCase):
@@ -418,7 +433,7 @@ class QueryModelResultTests(unittest.IsolatedAsyncioTestCase):
                     'thinkingmachines/inkling:free', messages
                 )
             self.assertFalse(first['ok'])
-            self.assertFalse(first.get('skipped'))
+            self.assertTrue(first.get('skipped'))
             self.assertTrue(second.get('skipped'))
             self.assertEqual(calls['n'], 1)
             self.assertIn('thinkingmachines/inkling:free', blocked_ids())
@@ -433,6 +448,85 @@ class QueryModelResultTests(unittest.IsolatedAsyncioTestCase):
             settings.council_models = original
             settings.chairman_model = original_chairman
             settings.n_samples = original_samples
+
+    async def test_upstream_429_cools_that_model(self):
+        clock = _MonoClock()
+        calls = {'n': 0}
+
+        def handler(*args, **kwargs):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                return _response(429, {
+                    'error': {
+                        'message': 'Provider returned error',
+                        'metadata': {
+                            'raw': (
+                                'google/gemma-4-31b-it:free is temporarily '
+                                'rate-limited upstream.'
+                            ),
+                        },
+                    },
+                })
+            return _response(200, {
+                'choices': [{'message': {'content': 'ok'}}],
+                'usage': {},
+            })
+
+        messages = [{'role': 'user', 'content': 'q'}]
+        with (
+            patch('backend.openrouter.get_api_key', return_value='sk-test'),
+            patch(
+                'backend.openrouter.httpx.AsyncClient',
+                return_value=_fake_client(handler),
+            ),
+            patch('backend.roster.time.monotonic', new=clock.monotonic),
+            patch('backend.roster.asyncio.sleep', new=clock.sleep),
+        ):
+            first = await query_model_result('google/gemma-4-31b-it:free', messages)
+            second = await query_model_result(
+                'google/gemma-4-31b-it:free-reasoning-high', messages
+            )
+            self.assertTrue(first.get('skipped'))
+            self.assertTrue(second.get('skipped'))
+            self.assertEqual(calls['n'], 1)
+            clock.now += 600
+            third = await query_model_result('google/gemma-4-31b-it:free', messages)
+        self.assertTrue(third['ok'])
+        self.assertEqual(calls['n'], 2)
+
+    async def test_provider_text_with_free_minute_still_retries(self):
+        clock = _MonoClock()
+        calls = {'n': 0}
+
+        def handler(*args, **kwargs):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                return _response(429, {
+                    'error': {
+                        'message': 'Provider returned error',
+                        'metadata': {
+                            'raw': 'Rate limit exceeded: free-models-per-min',
+                        },
+                    },
+                }, headers={'Retry-After': '10'})
+            return _response(200, {
+                'choices': [{'message': {'content': 'ok'}}],
+                'usage': {},
+            })
+
+        messages = [{'role': 'user', 'content': 'q'}]
+        with (
+            patch('backend.openrouter.get_api_key', return_value='sk-test'),
+            patch(
+                'backend.openrouter.httpx.AsyncClient',
+                return_value=_fake_client(handler),
+            ),
+            patch('backend.roster.time.monotonic', new=clock.monotonic),
+            patch('backend.roster.asyncio.sleep', new=clock.sleep),
+        ):
+            result = await query_model_result('a/one:free', messages)
+        self.assertTrue(result['ok'])
+        self.assertEqual(calls['n'], 2)
 
     async def test_free_calls_start_at_least_3_seconds_apart(self):
         clock = _MonoClock()
@@ -651,6 +745,166 @@ class Stage1FailureEventTests(unittest.IsolatedAsyncioTestCase):
         exc = Stage1AllFailed(failures)
         self.assertEqual(list(exc.failures), failures)
         self.assertIn('All models failed', str(exc))
+
+    def test_all_skipped_stage1_says_the_models_are_unavailable(self):
+        exc = Stage1AllFailed([])
+        self.assertEqual(str(exc), MODELS_UNAVAILABLE)
+
+
+class SkippedLaterStageTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.models = list(settings.council_models)
+        self.chairman = settings.chairman_model
+
+    def tearDown(self):
+        settings.council_models = self.models
+        settings.chairman_model = self.chairman
+
+    async def test_stage2_skips_without_a_failure_row(self):
+        settings.council_models = ['a/one:free', 'openai/gpt-4.1']
+        stage1 = [{'model': 'openai/gpt-4.1', 'response': 'answer'}]
+
+        async def fake(model, messages, **kwargs):
+            if str(model).endswith(':free'):
+                return {
+                    'ok': False,
+                    'skipped': True,
+                    'error': {'message': 'Skipped'},
+                }
+            return {
+                'ok': True,
+                'content': 'FINAL RANKING:\n1. Response 1',
+                'usage': {},
+            }
+
+        events = []
+        with patch('backend.council.query_model_result', new=fake):
+            async for event in stage2_collect_rankings_streaming('q', stage1):
+                events.append(event)
+        complete = next(data for kind, data in events if kind == 'all_complete')
+        self.assertEqual(complete['failures'], [])
+        self.assertEqual(len(complete['results']), 1)
+        skipped = [data for kind, data in events if kind == 'model_failed']
+        self.assertEqual(len(skipped), 1)
+        self.assertTrue(skipped[0]['skipped'])
+
+    async def test_skipped_red_team_is_a_miss(self):
+        async def fake(model, messages, **kwargs):
+            return {
+                'ok': False,
+                'skipped': True,
+                'error': {'message': 'Skipped'},
+            }
+
+        with patch('backend.council.query_model_result', new=fake):
+            result = await red_team_review(
+                'q',
+                'answer',
+                0,
+                [],
+                [{'model': 'openai/gpt-4.1', 'response': 'answer'}],
+            )
+        self.assertIsNone(result)
+
+    async def test_cooled_chairman_uses_the_next_council_model(self):
+        from backend.roster import remember_model_cooldown
+
+        settings.chairman_model = 'google/gemma-4-31b-it:free'
+        settings.council_models = [
+            'google/gemma-4-31b-it:free',
+            'openai/gpt-4.1',
+        ]
+        remember_model_cooldown('google/gemma-4-31b-it:free', 1)
+        called = []
+
+        async def fake(model, messages, **kwargs):
+            called.append(model)
+            return {'ok': True, 'content': 'final', 'usage': {}}
+
+        with patch('backend.council.query_model_result', new=fake):
+            result = await stage3_synthesize_final(
+                'q',
+                [{'model': 'openai/gpt-4.1', 'response': 'a'}],
+            )
+        self.assertEqual(called, ['openai/gpt-4.1'])
+        self.assertEqual(result['model'], 'openai/gpt-4.1')
+        self.assertEqual(
+            settings.chairman_model,
+            'google/gemma-4-31b-it:free',
+        )
+
+    async def test_skipped_chairman_call_uses_the_next_council_model(self):
+        settings.chairman_model = 'google/gemma-4-31b-it:free-reasoning-high'
+        settings.council_models = [
+            'google/gemma-4-31b-it:free',
+            'openai/gpt-4.1',
+        ]
+        called = []
+
+        async def fake(model, messages, **kwargs):
+            called.append(model)
+            if 'gemma' in model:
+                return {
+                    'ok': False,
+                    'skipped': True,
+                    'error': {'message': 'Skipped'},
+                }
+            return {'ok': True, 'content': 'final', 'usage': {}}
+
+        with patch('backend.council.query_model_result', new=fake):
+            result = await stage3_synthesize_final(
+                'q',
+                [{'model': 'openai/gpt-4.1', 'response': 'a'}],
+            )
+        self.assertEqual(called, [
+            'google/gemma-4-31b-it:free-reasoning-high',
+            'openai/gpt-4.1',
+        ])
+        self.assertEqual(result['model'], 'openai/gpt-4.1')
+        self.assertEqual(
+            settings.chairman_model,
+            'google/gemma-4-31b-it:free-reasoning-high',
+        )
+
+    async def test_real_chairman_failure_does_not_try_another_model(self):
+        settings.chairman_model = 'google/gemma-4-31b-it:free'
+        settings.council_models = ['openai/gpt-4.1']
+        called = []
+
+        async def fake(model, messages, **kwargs):
+            called.append(model)
+            return {
+                'ok': False,
+                'error': {'message': '402: cannot afford reserved tokens'},
+            }
+
+        with patch('backend.council.query_model_result', new=fake):
+            with self.assertRaises(Exception) as raised:
+                await stage3_synthesize_final(
+                    'q',
+                    [{'model': 'openai/gpt-4.1', 'response': 'a'}],
+                )
+        self.assertIn('402: cannot afford reserved tokens', str(raised.exception))
+        self.assertEqual(called, ['google/gemma-4-31b-it:free'])
+
+    async def test_every_skipped_synthesizer_says_the_models_are_unavailable(self):
+        settings.chairman_model = 'google/gemma-4-31b-it:free'
+        settings.council_models = ['openai/gpt-4.1']
+
+        async def fake(model, messages, **kwargs):
+            return {
+                'ok': False,
+                'skipped': True,
+                'error': {'message': 'Skipped'},
+            }
+
+        with patch('backend.council.query_model_result', new=fake):
+            with self.assertRaises(Exception) as raised:
+                await stage3_synthesize_final(
+                    'q',
+                    [{'model': 'openai/gpt-4.1', 'response': 'a'}],
+                )
+        self.assertEqual(str(raised.exception), MODELS_UNAVAILABLE)
 
 
 if __name__ == '__main__':

@@ -10,7 +10,11 @@ import {
   dropBlockedModel,
   isFreeModel,
   isHarnessOnlyMessage,
-  readBlockedIds,
+  isUpstreamLimited,
+  MODEL_COOLDOWN_MAX_MS,
+  MODEL_COOLDOWN_MS,
+  modelUnavailable,
+  rememberModelCooldown,
 } from './roster.js';
 import { settings } from './settings.js';
 
@@ -103,7 +107,7 @@ export function resolveMaxTokens(model, override = null) {
   return OPENROUTER_MAX_TOKENS;
 }
 
-export function parseRetryAfter(raw, fallback) {
+export function parseRetryAfter(raw, fallback, limit = MAX_RETRY_AFTER_SECONDS) {
   let wait = null;
   if (raw != null) {
     const text = String(raw).trim();
@@ -116,7 +120,7 @@ export function parseRetryAfter(raw, fallback) {
     }
   }
   if (wait == null) wait = fallback;
-  return Math.max(0, Math.min(Number(wait), MAX_RETRY_AFTER_SECONDS));
+  return Math.max(0, Math.min(Number(wait), limit));
 }
 
 export function catalogueModelId(model) {
@@ -189,7 +193,21 @@ export async function parseHttpError(response) {
     const data = JSON.parse(text);
     const err = data?.error;
     if (err && typeof err === 'object') {
-      detail = String(err.message || JSON.stringify(err));
+      const message = err.message ? String(err.message) : '';
+      let raw = '';
+      if (err.metadata && typeof err.metadata === 'object' && err.metadata.raw != null && err.metadata.raw !== '') {
+        if (typeof err.metadata.raw === 'string') {
+          raw = err.metadata.raw;
+        } else {
+          try {
+            raw = JSON.stringify(err.metadata.raw);
+          } catch {
+            raw = String(err.metadata.raw);
+          }
+        }
+      }
+      const parts = [message, raw].filter(Boolean);
+      detail = parts.length ? parts.join(' ') : JSON.stringify(err);
     } else if (err) {
       detail = String(err);
     } else {
@@ -350,7 +368,7 @@ async function queryModelAttempts(model, messages, options) {
   let extraWaitMs = 0;
   for (let attempt = 0; attempt < maxRetries; attempt += 1) {
     try {
-      if (readBlockedIds().has(baseModel)) return skippedResult();
+      if (modelUnavailable(model)) return skippedResult();
       if (free) {
         await admitFreePost(extraWaitMs, signal);
         extraWaitMs = 0;
@@ -367,10 +385,21 @@ async function queryModelAttempts(model, messages, options) {
         const detail = `${error.message || ''} ${error.detail || ''}`;
         const freeLimited = detail.includes('free-models-per-min');
         const header = response.headers.get('Retry-After');
-        const wait = freeLimited
-          ? parseRetryAfter(header, FREE_MINUTE_MS / 1000)
-          : parseRetryAfter(header, 2 ** attempt);
-        if (freeLimited) extendFreeCooldown(wait);
+        let wait;
+        if (freeLimited) {
+          wait = parseRetryAfter(header, FREE_MINUTE_MS / 1000);
+          extendFreeCooldown(wait);
+        } else if (isUpstreamLimited(detail)) {
+          wait = parseRetryAfter(
+            header,
+            MODEL_COOLDOWN_MS / 1000,
+            MODEL_COOLDOWN_MAX_MS / 1000,
+          );
+          rememberModelCooldown(model, wait);
+          return skippedResult();
+        } else {
+          wait = parseRetryAfter(header, 2 ** attempt);
+        }
         if (attempt < maxRetries - 1) {
           console.error(`Rate limited for ${model}, retrying in ${wait}s...`);
           if (free && !freeLimited) extraWaitMs = wait * 1000;
@@ -392,6 +421,7 @@ async function queryModelAttempts(model, messages, options) {
         ) {
           dropBlockedModel(model);
           console.error(`Error querying model ${model}: HTTP 403`);
+          return skippedResult();
         } else {
           console.error(`Error querying model ${model}: HTTP ${response.status}`);
         }
@@ -425,7 +455,7 @@ async function queryModelAttempts(model, messages, options) {
 }
 
 export async function queryModelResult(model, messages, options = {}) {
-  if (readBlockedIds().has(catalogueModelId(model))) return skippedResult();
+  if (modelUnavailable(model)) return skippedResult();
   const run = () => queryModelAttempts(model, messages, options);
   if (isFreeModel(model)) return enqueueFree(run);
   return run();

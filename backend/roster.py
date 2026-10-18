@@ -4,11 +4,16 @@ import asyncio
 import time
 
 HARNESS_ONLY = 'only available on agentic harnesses'
+UPSTREAM_LIMIT = 'temporarily rate-limited upstream'
+PROVIDER_RETURNED = 'provider returned error'
 FREE_START_GAP_SECONDS = 3.0
 FREE_MINUTE_SECONDS = 60.0
 FREE_MAX_STARTS_PER_MINUTE = 16
+MODEL_COOLDOWN_SECONDS = 600.0
+MODEL_COOLDOWN_MAX_SECONDS = 3600.0
 
 _blocked = set()
+_cooled_until = {}
 _free_lock = None
 _free_lock_loop = None
 _free_starts = []
@@ -41,6 +46,49 @@ def is_harness_only_message(text: str) -> bool:
     return HARNESS_ONLY in str(text or '').lower()
 
 
+def is_upstream_limited(text: str) -> bool:
+    """A provider 429 for this model, not the shared free-model minute cap."""
+    lowered = str(text or '').lower()
+    if 'free-models-per-min' in lowered:
+        return False
+    if UPSTREAM_LIMIT in lowered:
+        return True
+    return PROVIDER_RETURNED in lowered
+
+
+def remember_model_cooldown(model: str, seconds: float) -> None:
+    """Leave this catalogue id alone until the upstream limit can lift."""
+    cid = catalogue_id(model)
+    if not cid:
+        return
+    wait = min(
+        max(float(seconds), MODEL_COOLDOWN_SECONDS),
+        MODEL_COOLDOWN_MAX_SECONDS,
+    )
+    deadline = time.monotonic() + wait
+    previous = _cooled_until.get(cid, 0.0)
+    if deadline > previous:
+        _cooled_until[cid] = deadline
+
+
+def model_is_cooling(model: str) -> bool:
+    cid = catalogue_id(model)
+    until = _cooled_until.get(cid)
+    if until is None:
+        return False
+    if time.monotonic() >= until:
+        _cooled_until.pop(cid, None)
+        return False
+    return True
+
+
+def model_unavailable(model: str) -> bool:
+    cid = catalogue_id(model)
+    if not cid:
+        return False
+    return cid in _blocked or model_is_cooling(model)
+
+
 def remember_blocked_id(model: str) -> None:
     cid = catalogue_id(model)
     if cid:
@@ -61,6 +109,7 @@ def reset_free_queue_for_tests() -> None:
     _free_lock_loop = None
     _free_starts.clear()
     _free_paused_until = 0.0
+    _cooled_until.clear()
 
 
 class RosterEmpty(Exception):

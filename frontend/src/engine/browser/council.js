@@ -6,14 +6,18 @@
  */
 
 import * as openrouter from './openrouter.js';
-import { stage1SampleLimit } from './roster.js';
+import { catalogueId, modelUnavailable, stage1SampleLimit } from './roster.js';
 import { settings, TITLE_MODEL } from './settings.js';
 
 const RESPONSE_N = '\\*{0,2}Response\\s+(\\d+)\\*{0,2}';
 
+export const MODELS_UNAVAILABLE = 'OpenRouter will not serve the selected models right now.';
+
 export class Stage1AllFailed extends Error {
   constructor(failures) {
-    super('All models failed to respond in Stage 1');
+    super(failures?.length
+      ? 'All models failed to respond in Stage 1'
+      : MODELS_UNAVAILABLE);
     this.name = 'Stage1AllFailed';
     this.failures = failures;
   }
@@ -489,6 +493,8 @@ export async function* stage2CollectRankingsStreaming(userQuery, stage1Results) 
       const result = formatStage2Result(model, response, view);
       stage2Results.push(result);
       yield ['model_complete', { result }];
+    } else if (response.skipped) {
+      yield ['model_failed', { model, error: response.error, skipped: true }];
     } else {
       const failure = { model, error: response.error };
       failures.push(failure);
@@ -662,6 +668,7 @@ Meaning:
 - UPHELD = you could not find a concrete refutation
 `;
   const result = await openrouter.queryModelResult(model, [{ role: 'user', content: prompt }]);
+  if (result.skipped) return null;
   if (!result.ok) {
     return {
       model,
@@ -866,6 +873,29 @@ function formatCandidateBlock(ordinal, row, responseText) {
   );
 }
 
+function synthesisCandidates() {
+  const ordered = [];
+  if (settings.chairmanModel) ordered.push(settings.chairmanModel);
+  ordered.push(...(settings.councilModels || []));
+  return ordered;
+}
+
+async function querySynthesis(messages) {
+  const tried = new Set();
+  for (const model of synthesisCandidates()) {
+    if (!model || !String(model).trim()) continue;
+    const cid = catalogueId(model);
+    if (!cid || tried.has(cid) || modelUnavailable(model)) continue;
+    tried.add(cid);
+    const result = await openrouter.queryModelResult(model, messages);
+    if (result.ok) return { model, result };
+    if (result.skipped) continue;
+    const detail = result.error?.message || 'failed to generate response';
+    throw new Error(`Chairman model (${model}) failed: ${detail}`);
+  }
+  throw new Error(MODELS_UNAVAILABLE);
+}
+
 export async function stage3SynthesizeFinal(
   userQuery,
   stage1Results,
@@ -948,20 +978,14 @@ Your task:
 
 Provide a clear, well-reasoned final answer:`;
 
-  const result = await openrouter.queryModelResult(
-    settings.chairmanModel,
-    [{ role: 'user', content: chairmanPrompt }],
-  );
-  if (!result.ok) {
-    const detail = result.error?.message || 'failed to generate response';
-    throw new Error(`Chairman model (${settings.chairmanModel}) failed: ${detail}`);
-  }
+  const synthesized = await querySynthesis([{ role: 'user', content: chairmanPrompt }]);
+  const { model: chairman, result } = synthesized;
 
   let leaderIndex = consensus.leader_index;
   if (leaderIndex == null && topKIndices.length) leaderIndex = topKIndices[0];
 
   return {
-    model: settings.chairmanModel,
+    model: chairman,
     response: result.content || '',
     usage: result.usage || {},
     based_on_index: leaderIndex,
