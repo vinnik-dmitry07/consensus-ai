@@ -4,6 +4,8 @@ import ChatInterface from './components/ChatInterface';
 import Settings from './components/Settings';
 import { api } from './api';
 import { getEngineMode } from './engine/index.js';
+import { runAllowedBySettings } from './engine/browser/roster.js';
+import { SETTINGS_CHANGED_EVENT, STORAGE_KEY } from './engine/browser/settings.js';
 import './App.css';
 
 function App() {
@@ -25,6 +27,23 @@ function App() {
     document.documentElement.setAttribute('data-theme', darkMode ? 'dark' : 'light');
     localStorage.setItem('theme', darkMode ? 'dark' : 'light');
   }, [darkMode]);
+
+  useEffect(() => {
+    const bumpBrowserSettings = () => {
+      if (getEngineMode() !== 'browser') return;
+      setSettingsVersion((version) => version + 1);
+    };
+    const onStorage = (event) => {
+      if (event.key !== STORAGE_KEY) return;
+      bumpBrowserSettings();
+    };
+    window.addEventListener('storage', onStorage);
+    window.addEventListener(SETTINGS_CHANGED_EVENT, bumpBrowserSettings);
+    return () => {
+      window.removeEventListener('storage', onStorage);
+      window.removeEventListener(SETTINGS_CHANGED_EVENT, bumpBrowserSettings);
+    };
+  }, []);
 
   // Sync URL with conversation ID, and remember which chat is on screen
   // so a run that finishes in the background does not clear this chat's spinner.
@@ -452,14 +471,18 @@ function App() {
     }
   };
 
-  const readHasApiKey = async () => {
+  const readCanRun = async () => {
     try {
       const data = await Promise.resolve(api.getSettings());
-      return Boolean(data?.has_api_key);
+      return runAllowedBySettings(data);
     } catch (error) {
       console.error('Failed to read settings:', error);
       return false;
     }
+  };
+
+  const refuseRun = () => {
+    setSettingsVersion((version) => version + 1);
   };
 
   const handleSendMessage = async (
@@ -467,9 +490,20 @@ function App() {
     images = [],
     files = [],
   ) => {
-    if (!currentConversation) return;
-    if (!(await readHasApiKey())) return;
+    if (!currentConversation) return false;
+    if (!(await readCanRun())) {
+      refuseRun();
+      return false;
+    }
+    void sendAdmittedMessage(content, images, files);
+    return true;
+  };
 
+  const sendAdmittedMessage = async (
+    content,
+    images = [],
+    files = [],
+  ) => {
     let convId = currentConversationId;
     setIsLoading(true);
     try {
@@ -543,7 +577,10 @@ function App() {
   const handleRetryStage = async (messageIndex, stage) => {
     const convId = currentConversationId;
     if (!convId) return;
-    if (!(await readHasApiKey())) return;
+    if (!(await readCanRun())) {
+      refuseRun();
+      return;
+    }
 
     activeRunsRef.current.add(convId);
     setIsLoading(true);
@@ -600,6 +637,7 @@ function App() {
         darkMode={darkMode}
         onToggleDarkMode={() => setDarkMode(!darkMode)}
         engineMode={engineMode}
+        settingsVersion={settingsVersion}
       />
       <ChatInterface
         key={currentConversationId ?? 'new'}

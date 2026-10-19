@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .config import TITLE_MODEL
 from .openrouter import (
+    key_for_model,
     model_family,
     query_model,
     query_model_result,
@@ -1250,6 +1251,9 @@ The title should be concise and descriptive. Do not use quotes or punctuation in
 Question: {user_query}
 
 Title:'''
+
+    if not key_for_model(TITLE_MODEL):
+        return 'New Conversation'
 
     messages = [{'role': 'user', 'content': title_prompt}]
 

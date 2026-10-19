@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from .config import (
+    FREE_TIER_API_KEY,
     OPENROUTER_API_URL,
     OPENROUTER_CREDITS_URL,
     OPENROUTER_KEY_URL,
@@ -36,8 +37,15 @@ from .settings import settings
 
 
 def get_api_key() -> Optional[str]:
-    """Get the current API key from settings."""
+    """Personal key from settings. Credits and key info use this, not the free key."""
     return settings.api_key
+
+
+def key_for_model(model: str) -> Optional[str]:
+    """Bearer for one completion. Free and paid keys never substitute for each other."""
+    if is_free_model(model):
+        return FREE_TIER_API_KEY
+    return get_api_key()
 
 
 def resolve_max_tokens(model: str, override: Optional[int] = None) -> int:
@@ -214,7 +222,6 @@ async def _auth_get_data(
     """GET an authenticated OpenRouter JSON object from response['data']."""
     api_key = get_api_key()
     if not api_key:
-        print(f'Error fetching {label}: No API key configured')
         return None
 
     try:
@@ -290,7 +297,7 @@ async def _query_model_attempts(
     max_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     """One model's HTTP attempts. Caller serializes :free models."""
-    api_key = get_api_key()
+    api_key = key_for_model(model)
     if not api_key:
         print(f'Error querying model {model}: No API key configured')
         return _fail_result('No API key configured')

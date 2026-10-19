@@ -1,7 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { API_KEY_REQUIRED, browserEngine, pipeline } from './engine.js';
 import * as openrouter from './openrouter.js';
+import { FREE_TIER_API_KEY, resetFreeQueueForTests } from './openrouter.js';
 import { composeFollowUpQuery } from './query.js';
 import { selectedCatalogueIds } from './roster.js';
 import { resetSettingsState, settings } from './settings.js';
@@ -502,5 +503,197 @@ describe('all-free sample cap', () => {
     ]);
     expect(stage1Queries).toEqual([]);
     expect(settings.nSamples).toBe(1);
+  });
+});
+
+function answerAll() {
+  return vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (_model, messages) => {
+    const content = messages?.[0]?.content || '';
+    if (String(content).startsWith('You are evaluating')) {
+      return {
+        ok: true,
+        content: 'Response 1:\nCorrectness: 9/10\nIssues: none\n\nFINAL RANKING:\n1. Response 1',
+        usage: {},
+      };
+    }
+    if (String(content).startsWith('You are an adversarial')) {
+      return { ok: true, content: 'ok\nVERDICT: UPHELD\nCONFIDENCE: 9', usage: {} };
+    }
+    if (String(content).startsWith('You are the Chairman')) {
+      return { ok: true, content: 'final answer', usage: {} };
+    }
+    return { ok: true, content: 'paris', usage: {} };
+  });
+}
+
+describe('free roster without a personal key', () => {
+  const saved = {};
+
+  beforeEach(() => {
+    saved.council = [...settings.councilModels];
+    saved.chairman = settings.chairmanModel;
+    saved.redTeam = settings.redTeamModel;
+    saved.samples = settings.nSamples;
+    saved.key = settings.apiKey;
+  });
+
+  afterEach(() => {
+    settings.councilModels = saved.council;
+    settings.chairmanModel = saved.chairman;
+    settings.redTeamModel = saved.redTeam;
+    settings.nSamples = saved.samples;
+    if (saved.key) settings.apiKey = saved.key;
+    else settings.clearApiKey();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    resetFreeQueueForTests();
+  });
+
+  function useFreeRoster(redTeam = null) {
+    settings.clearApiKey();
+    settings.councilModels = ['a/one:free', 'b/two:free'];
+    settings.chairmanModel = 'a/one:free';
+    settings.redTeamModel = redTeam;
+    settings.nSamples = 1;
+  }
+
+  it('sends and stores a turn, and does not call the paid title model', async () => {
+    useFreeRoster();
+    const query = answerAll();
+    const created = await browserEngine.createConversation();
+    const { events, onEvent } = collectEvents();
+    await browserEngine.sendMessageStream(created.id, 'What is rain?', [], [], onEvent);
+    expect(events.map((item) => item.type)).toContain('complete');
+    const title = events.find((item) => item.type === 'title_complete');
+    expect(title.event.data.title).toBe('New Conversation');
+    const stored = await getConversation(created.id);
+    expect(stored.title).toBe('New Conversation');
+    expect(stored.messages).toHaveLength(2);
+    expect(stored.messages[1].stage3.response).toBe('final answer');
+    const prompts = query.mock.calls.map((call) => String(call[1]?.[0]?.content || ''));
+    expect(prompts.some((prompt) => prompt.startsWith('Generate a very short title'))).toBe(false);
+    expect(prompts.length).toBeGreaterThan(0);
+  });
+
+  it.each([1, 2, 3])('retries stage %s on a free roster', async (stage) => {
+    useFreeRoster();
+    answerAll();
+    const id = crypto.randomUUID();
+    await createConversation(id);
+    await addUserMessage(id, 'hello');
+    await addAssistantMessage(
+      id,
+      [
+        { model: 'a/one:free', response: 'one' },
+        { model: 'b/two:free', response: 'two' },
+      ],
+      [{
+        model: 'b/two:free',
+        ranking: 'FINAL RANKING:\n1. Response 1\n2. Response 2',
+        label_to_index: { 'Response 1': 0, 'Response 2': 1 },
+      }],
+      finalAnswer('old'),
+      { label_to_model: { 'Response 1': 'a/one:free', 'Response 2': 'b/two:free' } },
+    );
+    const { events, onEvent } = collectEvents();
+    await browserEngine.retryStage(id, stage, 1, onEvent);
+    expect(events.map((item) => item.type)).toContain('complete');
+    const stored = await getConversation(id);
+    expect(stored.messages[1].stage3.response).toBe('final answer');
+  });
+
+  it('refuses a roster that becomes paid while the catalogue loads', async () => {
+    useFreeRoster();
+    openrouter.getModelsPricing.mockImplementation(async () => {
+      settings.chairmanModel = 'openai/gpt-4.1';
+      return {
+        'a/one:free': { name: 'one' },
+        'b/two:free': { name: 'two' },
+        'openai/gpt-4.1': { name: 'gpt' },
+      };
+    });
+    const created = await browserEngine.createConversation();
+    await expect(
+      browserEngine.sendMessageStream(created.id, 'again', [], [], () => {}),
+    ).rejects.toThrow(API_KEY_REQUIRED);
+    expect((await getConversation(created.id)).messages).toEqual([]);
+
+    const id = crypto.randomUUID();
+    await createConversation(id);
+    await addUserMessage(id, 'hello');
+    await addAssistantMessage(
+      id,
+      [
+        { model: 'a/one:free', response: 'one' },
+        { model: 'b/two:free', response: 'two' },
+      ],
+      [{ model: 'b/two:free', ranking: '1. Response 1' }],
+      finalAnswer('old'),
+    );
+    const before = await getConversation(id);
+    for (const stage of [1, 2, 3]) {
+      settings.chairmanModel = 'a/one:free';
+      await expect(
+        browserEngine.retryStage(id, stage, 1, () => {}),
+      ).rejects.toThrow(API_KEY_REQUIRED);
+      expect(await getConversation(id)).toEqual(before);
+    }
+  });
+
+  it('leaves the conversation unchanged when a paid red team still requires a key', async () => {
+    useFreeRoster('openai/gpt-4.1');
+    const query = vi.spyOn(openrouter, 'queryModelResult');
+    const id = crypto.randomUUID();
+    await createConversation(id);
+    await addUserMessage(id, 'hello');
+    await addAssistantMessage(id, [{ model: 'a/one:free', response: 'one' }], [], finalAnswer('old'));
+    const before = await getConversation(id);
+    await expect(browserEngine.sendMessageStream(id, 'again', [], [], () => {})).rejects.toThrow(API_KEY_REQUIRED);
+    await expect(browserEngine.retryStage(id, 3, 1, () => {})).rejects.toThrow(API_KEY_REQUIRED);
+    expect(await getConversation(id)).toEqual(before);
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it('does not post the free key for a paid model remembered in an old ranking', async () => {
+    useFreeRoster();
+    resetFreeQueueForTests();
+    const posts = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url, init) => {
+      const body = JSON.parse(init.body);
+      posts.push({
+        model: body.model,
+        freeKey: init.headers.Authorization === `Bearer ${FREE_TIER_API_KEY}`,
+      });
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: 'ok\nVERDICT: UPHELD\nCONFIDENCE: 4' } }],
+        usage: {},
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }));
+    const id = crypto.randomUUID();
+    await createConversation(id);
+    await addUserMessage(id, 'hello');
+    await addAssistantMessage(
+      id,
+      [
+        { model: 'a/one:free', response: 'free answer' },
+        { model: 'openai/gpt-4.1', response: 'paid answer' },
+      ],
+      [{
+        model: 'b/two:free',
+        ranking: 'FINAL RANKING:\n1. Response 1\n2. Response 2',
+        label_to_index: { 'Response 1': 0, 'Response 2': 1 },
+      }],
+      finalAnswer('old'),
+      { label_to_model: { 'Response 1': 'a/one:free' } },
+    );
+    const { events, onEvent } = collectEvents();
+    await browserEngine.retryStage(id, 3, 1, onEvent);
+    expect(events.map((item) => item.type)).toContain('complete');
+    expect(posts.some((post) => post.model === 'openai/gpt-4.1')).toBe(false);
+    expect(posts.length).toBeGreaterThan(0);
+    expect(posts.every((post) => post.freeKey)).toBe(true);
+    const stored = await getConversation(id);
+    expect(stored.messages[1].metadata.red_team.model).toBe('openai/gpt-4.1');
+    expect(stored.messages[1].metadata.red_team.error.message).toBe('No API key configured');
   });
 });

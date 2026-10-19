@@ -10,6 +10,7 @@ import {
   readBlockedIds,
   RosterEmpty,
   selectedCatalogueIds,
+  rosterRequiresUserKey,
   stage1SampleLimit,
   storePrunedRoster,
 } from './roster.js';
@@ -28,7 +29,12 @@ function errorText(exc) {
 export const API_KEY_REQUIRED = 'Add an OpenRouter API key in Settings before running the council.';
 
 function requireApiKey() {
-  if (!settings.hasApiKey) {
+  if (settings.hasApiKey) return;
+  if (rosterRequiresUserKey(
+    settings.councilModels,
+    settings.chairmanModel,
+    settings.redTeamModel,
+  )) {
     throw new Error(API_KEY_REQUIRED);
   }
 }
@@ -516,6 +522,7 @@ export const browserEngine = {
     if (!conversation) throw new Error('Conversation not found');
 
     await ensureServableRoster();
+    requireApiKey();
     const isFirst = conversation.messages.length === 0;
     const prepared = prepareCouncilQuery(conversation, content, images, files);
     const msgIndex = await storage.addUserTurn(
@@ -657,6 +664,7 @@ async function* finishTitle(conversationId, titleState) {
 }
 
 async function* retryStage1Events(input) {
+  requireApiKey();
   const ctx = {
     conversationId: input.conversationId,
     msgIndex: input.msgIndex,
@@ -697,6 +705,7 @@ async function* retryStage1Events(input) {
 }
 
 async function* retryStage2Events(input) {
+  requireApiKey();
   const ctx = {
     conversationId: input.conversationId,
     msgIndex: input.msgIndex,
@@ -720,6 +729,7 @@ async function* retryStage2Events(input) {
 }
 
 async function* retryStage3Events(input) {
+  requireApiKey();
   try {
     await storage.updateStreamingMessage(input.conversationId, input.msgIndex, {
       stage3: null,

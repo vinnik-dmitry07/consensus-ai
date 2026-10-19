@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   MODELS_UNAVAILABLE,
@@ -6,6 +6,7 @@ import {
   buildJudgeView,
   calculateAggregateRankings,
   computeConsensus,
+  generateConversationTitle,
   parseCorrectnessScores,
   parseDisputedClaims,
   parseRankingFromText,
@@ -18,7 +19,8 @@ import {
   usableStage1Results,
 } from './council.js';
 import * as openrouter from './openrouter.js';
-import { rememberModelCooldown } from './roster.js';
+import { FREE_TIER_API_KEY, resetFreeQueueForTests } from './openrouter.js';
+import { clearModelCooldowns, rememberModelCooldown } from './roster.js';
 import { settings } from './settings.js';
 
 describe('stage 2 parsers', () => {
@@ -526,5 +528,119 @@ describe('skipped models in later stages', () => {
     await expect(stage3SynthesizeFinal('q', [
       { model: 'openai/gpt-4.1', response: 'a' },
     ])).rejects.toThrow(MODELS_UNAVAILABLE);
+  });
+});
+
+function completionResponse(content) {
+  return new Response(JSON.stringify({
+    choices: [{ message: { content } }],
+    usage: {},
+  }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+function bearerIs(init, key) {
+  return init?.headers?.Authorization === `Bearer ${key}`;
+}
+
+describe('title and red-team credentials', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    clearModelCooldowns();
+    resetFreeQueueForTests();
+  });
+
+  it('returns New Conversation without a title request when there is no personal key', async () => {
+    settings.clearApiKey();
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(generateConversationTitle('What is rain?')).resolves.toBe('New Conversation');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('still asks the paid title model with the personal key', async () => {
+    settings.apiKey = 'sk-user-test';
+    const fetchMock = vi.fn(async () => completionResponse('Rain Question'));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(generateConversationTitle('What is rain?')).resolves.toBe('Rain Question');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const init = fetchMock.mock.calls[0][1];
+    expect(bearerIs(init, 'sk-user-test')).toBe(true);
+    expect(bearerIs(init, FREE_TIER_API_KEY)).toBe(false);
+    expect(JSON.parse(init.body).model).toBe('google/gemini-2.5-flash');
+  });
+
+  it('returns null when the title request is already aborted', async () => {
+    settings.clearApiKey();
+    const controller = new AbortController();
+    controller.abort();
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(generateConversationTitle('q', controller.signal)).resolves.toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('uses the free key when a family swap stays on a free model', async () => {
+    settings.clearApiKey();
+    settings.chairmanModel = 'a/one:free';
+    settings.redTeamModel = null;
+    resetFreeQueueForTests();
+    const fetchMock = vi.fn(async () => completionResponse('ok\nVERDICT: UPHELD\nCONFIDENCE: 8'));
+    vi.stubGlobal('fetch', fetchMock);
+    const result = await redTeamReview(
+      'q',
+      'answer',
+      0,
+      [{ model: 'b/two:free', index: 1 }, { model: 'a/one:free', index: 0 }],
+      [
+        { model: 'a/one:free', response: 'answer' },
+        { model: 'b/two:free', response: 'other' },
+      ],
+    );
+    expect(result.model).toBe('b/two:free');
+    expect(result.error).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(bearerIs(fetchMock.mock.calls[0][1], FREE_TIER_API_KEY)).toBe(true);
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).model).toBe('b/two:free');
+  });
+
+  it('does not post a paid historical red-team model without a personal key', async () => {
+    settings.clearApiKey();
+    settings.chairmanModel = 'a/one:free';
+    settings.redTeamModel = null;
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const result = await redTeamReview(
+      'q',
+      'answer',
+      0,
+      [{ model: 'openai/gpt-4.1', index: 1 }],
+      [{ model: 'a/one:free', response: 'answer' }],
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result.model).toBe('openai/gpt-4.1');
+    expect(result.verdict).toBeNull();
+    expect(result.error.message).toBe('No API key configured');
+  });
+
+  it('falls through a cooled chairman onto the next model with that model\'s key', async () => {
+    settings.apiKey = 'sk-user-test';
+    settings.chairmanModel = 'openai/gpt-4.1';
+    settings.councilModels = ['b/two:free'];
+    rememberModelCooldown('openai/gpt-4.1', 600);
+    resetFreeQueueForTests();
+    const fetchMock = vi.fn(async () => completionResponse('final'));
+    vi.stubGlobal('fetch', fetchMock);
+    const stage3 = await stage3SynthesizeFinal('q', [
+      { model: 'b/two:free', response: 'yes' },
+    ]);
+    expect(stage3.response).toBe('final');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const init = fetchMock.mock.calls[0][1];
+    expect(bearerIs(init, FREE_TIER_API_KEY)).toBe(true);
+    expect(bearerIs(init, 'sk-user-test')).toBe(false);
+    expect(JSON.parse(init.body).model).toBe('b/two:free');
   });
 });

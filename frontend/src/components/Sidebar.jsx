@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { engineLabel } from '../engine/index.js';
 import './Sidebar.css';
@@ -13,31 +13,72 @@ export default function Sidebar({
   darkMode,
   onToggleDarkMode,
   engineMode = 'browser',
+  settingsVersion = 0,
 }) {
   const [credits, setCredits] = useState(null);
+  const creditsContext = `${engineMode}:${settingsVersion}`;
+  const [seenCreditsContext, setSeenCreditsContext] = useState(creditsContext);
+  const creditsRequest = useRef(creditsContext);
+  creditsRequest.current = creditsContext;
+  if (seenCreditsContext !== creditsContext) {
+    setSeenCreditsContext(creditsContext);
+    setCredits(null);
+  }
 
   useEffect(() => {
-    const fetchCredits = async () => {
+    const generation = creditsContext;
+    let intervalId = null;
+    let cancelled = false;
+    const current = () => !cancelled && creditsRequest.current === generation;
+
+    const poll = async () => {
+      if (!current()) return;
       try {
         const data = await api.getCredits();
-        setCredits(data);
+        if (current()) setCredits(data);
       } catch (error) {
-        console.error('Failed to fetch credits:', error);
+        if (current()) console.error('Failed to fetch credits:', error);
       }
     };
 
-    fetchCredits();
-    // Refresh credits every 30 seconds, and when the engine changes.
-    const interval = setInterval(fetchCredits, 30000);
-    return () => clearInterval(interval);
-  }, [engineMode]);
+    const load = async () => {
+      let settingsData;
+      try {
+        settingsData = await Promise.resolve(api.getSettings());
+      } catch (error) {
+        if (current()) console.error('Failed to fetch credits:', error);
+        return;
+      }
+      if (!current() || !settingsData?.has_api_key) return;
+      await poll();
+      if (!current()) return;
+      intervalId = setInterval(poll, 30000);
+    };
+
+    load();
+    return () => {
+      cancelled = true;
+      if (intervalId != null) clearInterval(intervalId);
+    };
+  }, [creditsContext]);
 
   return (
     <div className="sidebar">
       <div className="sidebar-header">
         <div className="header-row">
           <div className="brand">
-            <h1>consensus.ai</h1>
+            <h1 className="brand-logo">
+              <img
+                className="theme-light"
+                src={`${import.meta.env.BASE_URL}logo-light.svg`}
+                alt="Consensus AI"
+              />
+              <img
+                className="theme-dark"
+                src={`${import.meta.env.BASE_URL}logo-dark.svg`}
+                alt=""
+              />
+            </h1>
             <span className="slogan">Search Wide</span>
             <span className="engine-indicator">
               {engineLabel(engineMode)}

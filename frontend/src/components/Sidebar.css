@@ -14,20 +14,41 @@
 
 .header-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
+  gap: 8px;
   margin-bottom: 12px;
 }
 
 .brand {
   display: flex;
   flex-direction: column;
+  min-width: 0;
+  flex: 1;
 }
 
-.sidebar-header h1 {
-  font-size: 18px;
+.brand-logo {
   margin: 0;
-  color: var(--text-primary);
+  line-height: 0;
+}
+
+.brand-logo img {
+  display: block;
+  height: 34px;
+  width: auto;
+  max-width: 100%;
+}
+
+.brand-logo .theme-dark {
+  display: none;
+}
+
+[data-theme='dark'] .brand-logo .theme-light {
+  display: none;
+}
+
+[data-theme='dark'] .brand-logo .theme-dark {
+  display: block;
 }
 
 .slogan {

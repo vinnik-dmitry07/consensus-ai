@@ -4,7 +4,13 @@
  * bearer token to openrouter.ai.
  */
 
-const STORAGE_KEY = 'llm-council-browser-settings';
+export const STORAGE_KEY = 'llm-council-browser-settings';
+export const SETTINGS_CHANGED_EVENT = 'llm-council-settings-changed';
+
+export function notifySettingsChanged() {
+  if (typeof window === 'undefined') return;
+  window.dispatchEvent(new Event(SETTINGS_CHANGED_EVENT));
+}
 
 export const TITLE_MODEL = 'google/gemini-2.5-flash';
 

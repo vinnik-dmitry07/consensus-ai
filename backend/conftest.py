@@ -4,6 +4,14 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def free_tier_test_key(monkeypatch):
+    monkeypatch.setattr(
+        'backend.openrouter.FREE_TIER_API_KEY',
+        'sk-free-test',
+    )
+
+
+@pytest.fixture(autouse=True)
 def servable_catalogue(monkeypatch):
     from backend.roster import clear_blocked_ids, reset_free_queue_for_tests
 

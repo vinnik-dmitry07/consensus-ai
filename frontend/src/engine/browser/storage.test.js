@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
-import { settings } from './settings.js';
+import { FREE_TIER_API_KEY } from './openrouter.js';
+import { settings, STORAGE_KEY } from './settings.js';
 import {
   addAssistantMessage,
   addUserMessage,
@@ -102,6 +103,16 @@ describe('settings', () => {
     expect(settings.nSamples).toBe(3);
     expect(settings.apiKey).toBe('sk-or-v1-secret');
     expect(settings.toDict().has_api_key).toBe(true);
+  });
+
+  it('does not store the free-tier key as the personal key', () => {
+    settings.clearApiKey();
+    const snapshot = settings.toDict();
+    const stored = localStorage.getItem(STORAGE_KEY) || '';
+    expect(snapshot.has_api_key).toBe(false);
+    expect(snapshot.masked_api_key).toBeNull();
+    expect(JSON.stringify(snapshot).includes(FREE_TIER_API_KEY)).toBe(false);
+    expect(stored.includes(FREE_TIER_API_KEY)).toBe(false);
   });
 
   it('does not clear the api key when the update is blank', () => {

@@ -4,7 +4,7 @@
  * catalogueId lives here so this module does not import openrouter.js.
  */
 
-import { settings } from './settings.js';
+import { notifySettingsChanged, settings } from './settings.js';
 
 const BLOCKED_KEY = 'llm-council-blocked-models';
 const COOLDOWN_KEY = 'llm-council-model-cooldowns';
@@ -31,6 +31,29 @@ export function isAllFreeCouncil(councilModels) {
 export function stage1SampleLimit(councilModels, requested) {
   if (isAllFreeCouncil(councilModels)) return 1;
   return requested;
+}
+
+export function rosterRequiresUserKey(councilModels, chairmanModel, redTeamModel) {
+  if (!isAllFreeCouncil(councilModels)) return true;
+  if (!isFreeModel(chairmanModel)) return true;
+  if (String(redTeamModel || '').trim() && !isFreeModel(redTeamModel)) return true;
+  return false;
+}
+
+export function runAllowedBySettings(data) {
+  if (!data || typeof data !== 'object' || typeof data.has_api_key !== 'boolean') {
+    return false;
+  }
+  if (data.has_api_key) return true;
+  if (!Array.isArray(data.council_models) || typeof data.chairman_model !== 'string') {
+    return false;
+  }
+  if (!Object.prototype.hasOwnProperty.call(data, 'red_team_model')) return false;
+  return !rosterRequiresUserKey(
+    data.council_models,
+    data.chairman_model,
+    data.red_team_model,
+  );
 }
 
 const SPECIALIZED_FREE = /code|coder|codestral|devstral|starcoder|safety|guard|omni|-fin(?=:|$)|-sante(?=:|$)/i;
@@ -280,6 +303,7 @@ export function storePrunedRoster(pruned) {
   settings.councilModels = pruned.councilModels;
   settings.chairmanModel = pruned.chairmanModel;
   settings.redTeamModel = pruned.redTeamModel;
+  notifySettingsChanged();
 }
 
 export function dropBlockedModel(model) {

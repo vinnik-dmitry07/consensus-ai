@@ -72,11 +72,14 @@ def _fake_client(handler):
         async def __aexit__(self, *args):
             return False
 
-        async def post(self, *args, **kwargs):
+        async def _send(self, *args, **kwargs):
             result = handler(*args, **kwargs)
             if hasattr(result, '__await__'):
                 return await result
             return result
+
+        post = _send
+        get = _send
 
     return FakeClient()
 

@@ -512,6 +512,7 @@ export default function Settings({
                     ? 'Stored in this browser\'s localStorage, which is shared by every site on this origin, and sent only to openrouter.ai. A github.io project site shares that origin with the account\'s other Pages sites. '
                     : 'Sent to the local Python backend and kept in its memory until that process restarts. '}
                   Get your key at <a href="https://openrouter.ai/keys" target="_blank" rel="noopener noreferrer">openrouter.ai/keys</a>
+                  {' '}A free council with a free chairman and red team runs without a personal key. Paid models require one.
                 </p>
                 <div className="api-key-control">
                   <div className="api-key-status">

@@ -39,6 +39,7 @@ from .roster import (
     RosterEmpty,
     _selected_catalogue_ids,
     ensure_servable_roster,
+    roster_requires_user_key,
     stage1_sample_limit,
 )
 from .settings import settings
@@ -57,8 +58,14 @@ async def _require_servable_roster():
 
 
 def _require_api_key():
-    """Refuse a council run before it writes anything when no key is set."""
-    if not settings.has_api_key:
+    """Refuse a paid roster before it writes anything when no personal key is set."""
+    if settings.has_api_key:
+        return
+    if roster_requires_user_key(
+        settings.council_models,
+        settings.chairman_model,
+        settings.red_team_model,
+    ):
         raise HTTPException(status_code=400, detail=API_KEY_REQUIRED)
 
 
@@ -700,6 +707,7 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
         files,
         request.follow_up_to_message_index,
     )
+    _require_api_key()
 
     # Add user message
     storage.add_user_message(
@@ -906,6 +914,7 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             if title_task is not None:
                 _settle_title_task(conversation_id, title_task)
 
+    _require_api_key()
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
@@ -1054,6 +1063,7 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
         except Exception as e:
             yield _persist_generic_error(conversation_id, msg_index, current_stage, e)
 
+    _require_api_key()
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
@@ -1158,6 +1168,7 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
         except Exception as e:
             yield _persist_generic_error(conversation_id, msg_index, current_stage, e)
 
+    _require_api_key()
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
@@ -1244,6 +1255,7 @@ async def retry_stage3_stream(conversation_id: str, request: RetryStageRequest):
         except Exception as e:
             yield _persist_generic_error(conversation_id, msg_index, 3, e)
 
+    _require_api_key()
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",

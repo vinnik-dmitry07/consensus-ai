@@ -18,6 +18,8 @@ import {
 } from './roster.js';
 import { settings } from './settings.js';
 
+export const FREE_TIER_API_KEY = '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';
+
 export const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
 export const OPENROUTER_CREDITS_URL = 'https://openrouter.ai/api/v1/credits';
 export const OPENROUTER_MODELS_URL = 'https://openrouter.ai/api/v1/models';
@@ -94,6 +96,11 @@ export class CatalogueUnavailable extends Error {
 
 export function getApiKey() {
   return settings.apiKey;
+}
+
+export function keyForModel(model) {
+  if (isFreeModel(model)) return FREE_TIER_API_KEY;
+  return getApiKey();
 }
 
 export function clearModelsCache() {
@@ -280,10 +287,7 @@ export async function unknownCatalogueIds(models) {
 
 async function authGetData(url, label, timeout = 10) {
   const apiKey = getApiKey();
-  if (!apiKey) {
-    console.error(`Error fetching ${label}: No API key configured`);
-    return null;
-  }
+  if (!apiKey) return null;
 
   try {
     const response = await fetch(url, {
@@ -337,7 +341,7 @@ async function queryModelAttempts(model, messages, options) {
   const maxTokens = options.maxTokens ?? null;
   const signal = options.signal ?? null;
 
-  const apiKey = getApiKey();
+  const apiKey = keyForModel(model);
   if (!apiKey) {
     console.error(`Error querying model ${model}: No API key configured`);
     return failResult('No API key configured');

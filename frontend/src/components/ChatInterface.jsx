@@ -2,6 +2,7 @@ import { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } fr
 import ReactMarkdown from 'react-markdown';
 import { markdownComponents, remarkGfmPlugin } from '../markdownComponents';
 import { api } from '../api';
+import { runAllowedBySettings } from '../engine/browser/roster.js';
 import { catalogueModelId, modelFamily } from '../engine/browser/openrouter.js';
 import {
   composeFollowUpQuery,
@@ -306,6 +307,20 @@ function calculateActualUsage(msg) {
   return usage;
 }
 
+function EmptyState({ title, detail }) {
+  const base = import.meta.env.BASE_URL;
+  return (
+    <div className="empty-state">
+      <span className="brand-mark" aria-hidden="true">
+        <img className="theme-light" src={`${base}mark-light.svg`} alt="" />
+        <img className="theme-dark" src={`${base}mark-dark.svg`} alt="" />
+      </span>
+      <h2>{title}</h2>
+      <p>{detail}</p>
+    </div>
+  );
+}
+
 export default function ChatInterface({
   conversation,
   onSendMessage,
@@ -315,7 +330,14 @@ export default function ChatInterface({
   onOpenSettings,
 }) {
   const [input, setInput] = useState('');
-  const [hasApiKey, setHasApiKey] = useState(null);
+  const [gate, setGate] = useState('loading');
+  const [gateVersion, setGateVersion] = useState(settingsVersion);
+  const settingsRequest = useRef(settingsVersion);
+  settingsRequest.current = settingsVersion;
+  if (gateVersion !== settingsVersion) {
+    setGateVersion(settingsVersion);
+    setGate('loading');
+  }
   const [attachments, setAttachments] = useState([]);
   const [pricingData, setPricingData] = useState(null);
   const [costExpanded, setCostExpanded] = useState(false);
@@ -349,20 +371,25 @@ export default function ChatInterface({
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
+    const version = settingsVersion;
+    let active = true;
     Promise.resolve(api.getSettings())
       .then((data) => {
-        if (!cancelled) setHasApiKey(Boolean(data?.has_api_key));
+        if (!active || settingsRequest.current !== version) return;
+        setGate(runAllowedBySettings(data) ? 'allowed' : 'blocked');
       })
       .catch(() => {
-        if (!cancelled) setHasApiKey(false);
+        if (!active || settingsRequest.current !== version) return;
+        setGate('error');
       });
     return () => {
-      cancelled = true;
+      active = false;
     };
   }, [settingsVersion]);
 
-  const runBlocked = isLoading || hasApiKey !== true;
+  const needsPersonalKey = gate === 'blocked';
+  const settingsUnavailable = gate === 'error';
+  const runBlocked = isLoading || gate !== 'allowed';
 
   // Fetch pricing data on mount and when settings change
   useEffect(() => {
@@ -449,21 +476,21 @@ export default function ChatInterface({
     }
   };
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
     if (runBlocked) return;
-    if (input.trim() || attachments.length > 0) {
-      const images = attachments
-        .filter((item) => item.kind === 'image')
-        .map((item) => item.data);
-      const files = attachments
-        .filter((item) => item.kind === 'file')
-        .map((item) => ({ name: item.name, content: item.content }));
-      onSendMessage(input, images, files);
-      userFloorRef.current = 0;
-      setInput('');
-      setAttachments([]);
-    }
+    if (!(input.trim() || attachments.length > 0)) return;
+    const images = attachments
+      .filter((item) => item.kind === 'image')
+      .map((item) => item.data);
+    const files = attachments
+      .filter((item) => item.kind === 'file')
+      .map((item) => ({ name: item.name, content: item.content }));
+    const started = await onSendMessage(input, images, files);
+    if (!started) return;
+    userFloorRef.current = 0;
+    setInput('');
+    setAttachments([]);
   };
 
   const handleKeyDown = (e) => {
@@ -574,10 +601,10 @@ export default function ChatInterface({
   if (!conversation) {
     return (
       <div className="chat-interface">
-        <div className="empty-state">
-          <h2>Welcome to LLM Council</h2>
-          <p>Create a new conversation to get started</p>
-        </div>
+        <EmptyState
+          title="Welcome to LLM Council"
+          detail="Create a new conversation to get started"
+        />
       </div>
     );
   }
@@ -587,10 +614,10 @@ export default function ChatInterface({
       <div className="messages-area">
       <div className="messages-container" ref={containerRef} onScroll={handleScroll}>
         {conversation.messages.length === 0 ? (
-          <div className="empty-state">
-            <h2>Start a conversation</h2>
-            <p>Ask a question to consult the LLM Council</p>
-          </div>
+          <EmptyState
+            title="Start a conversation"
+            detail="Ask a question to consult the LLM Council"
+          />
         ) : (
           conversation.messages.map((msg, index) => (
             <div key={index} className="message-group">
@@ -926,7 +953,7 @@ export default function ChatInterface({
       </div>
 
       <form className="input-form" onSubmit={handleSubmit}>
-          {hasApiKey === false && (
+          {needsPersonalKey && (
             <div className="api-key-required" role="status">
               <span>Add an OpenRouter API key in Settings before running the council.</span>
               {onOpenSettings && (
@@ -938,6 +965,11 @@ export default function ChatInterface({
                   Open Settings
                 </button>
               )}
+            </div>
+          )}
+          {settingsUnavailable && (
+            <div className="api-key-required" role="status">
+              <span>Settings could not be loaded.</span>
             </div>
           )}
           {/* Cost Estimate Display */}
@@ -1055,7 +1087,7 @@ export default function ChatInterface({
                 type="submit"
                 className="send-button"
                 disabled={runBlocked || (!input.trim() && attachments.length === 0)}
-                title={hasApiKey === false ? 'Add an OpenRouter API key in Settings' : undefined}
+                title={needsPersonalKey ? 'Add an OpenRouter API key in Settings' : undefined}
               >
                 Send
               </button>
