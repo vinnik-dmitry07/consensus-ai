@@ -4,8 +4,8 @@ import { getApiBase, getEngineMode, setApiBase, setEngineMode } from '../engine/
 import { catalogueModelId } from '../engine/browser/openrouter.js';
 import {
   isAllFreeCouncil,
-  isFreeModel,
   pruneRoster,
+  rankTopFreeModels,
   readBlockedIds,
   removedModelsMessage,
   stage1SampleLimit,
@@ -179,69 +179,14 @@ export default function Settings({
     );
   }, [availableModels, searchQuery]);
 
-  // Extract model size from id, then name, then description (e.g. "550B", "2.4T")
-  const parseSizeFromText = (text) => {
-    if (!text) return 0;
-    let max = 0;
-    for (const match of String(text).matchAll(/(\d+(?:\.\d+)?)\s*([bt])\b/gi)) {
-      const value = parseFloat(match[1]);
-      const size = match[2].toLowerCase() === 't' ? value * 1000 : value;
-      if (size > max) max = size;
-    }
-    return max;
-  };
-
-  const extractSize = (model) => {
-    for (const source of [model.id, model.name, model.description]) {
-      const size = parseSizeFromText(source);
-      if (size > 0) return size;
-    }
-    return 0;
-  };
-
-  // Family = leading alpha run of the model slug (e.g. "nvidia/nemotron-3-ultra-550b:free" -> "nemotron")
-  const getFamily = (id) => {
-    const slug = id.replace(/:free$/i, '').split('/').pop().toLowerCase();
-    const match = slug.match(/^[a-z]+/);
-    return match ? match[0] : slug;
-  };
-
-  // Select 10 largest free models, one per family; chairman is the largest as R+
   const selectTopFreeModels = () => {
-    const specialized = /code|coder|codestral|devstral|starcoder|safety|guard|omni|-fin(?=:|$)|-sante(?=:|$)/i;
-
-    const blocked = readBlockedIds();
-    const skipped = [];
-    const freeModels = availableModels.filter((m) => {
-      if (!isFreeModel(m.id)) return false;
-      if (blocked.has(catalogueModelId(m.id))) {
-        skipped.push(catalogueModelId(m.id));
-        return false;
-      }
-      return !specialized.test(m.id.toLowerCase());
-    });
-
-    const familyBest = {};
-    for (const model of freeModels) {
-      const family = getFamily(model.id);
-      const size = extractSize(model);
-      const name = model.name || model.id;
-      const current = familyBest[family];
-      if (!current || size > current.size || (size === current.size && name.localeCompare(current.name) > 0)) {
-        familyBest[family] = { id: model.id, size, name };
-      }
-    }
-    const top = Object.values(familyBest)
-      .sort((a, b) => b.size - a.size || a.name.localeCompare(b.name))
-      .slice(0, 10)
-      .map((m) => m.id);
+    const top = rankTopFreeModels(availableModels, readBlockedIds());
     setCouncilModels(top);
     setNSamples(1);
     if (top.length > 0) {
       setChairmanModel(`${top[0]}-reasoning-high`);
     }
-    const removed = [...new Set(skipped)];
-    setError(removed.length ? removedModelsMessage(removed) : null);
+    setError(null);
   };
 
   // Select top 8 paid models
@@ -654,7 +599,7 @@ export default function Settings({
                   <button 
                     className="quick-action-btn"
                     onClick={selectTopFreeModels}
-                    title="Select 10 largest free models, one per family"
+                    title="Select up to 10 largest free models, preferring one per family"
                   >
                     🆓 Top 10 Free
                   </button>

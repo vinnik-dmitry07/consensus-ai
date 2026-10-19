@@ -33,6 +33,96 @@ export function stage1SampleLimit(councilModels, requested) {
   return requested;
 }
 
+const SPECIALIZED_FREE = /code|coder|codestral|devstral|starcoder|safety|guard|omni|-fin(?=:|$)|-sante(?=:|$)/i;
+
+function parseSizeFromText(text) {
+  let max = 0;
+  for (const match of String(text).matchAll(/(\d+(?:\.\d+)?)\s*([bt])\b/gi)) {
+    const value = parseFloat(match[1]);
+    const size = match[2].toLowerCase() === 't' ? value * 1000 : value;
+    if (size > max) max = size;
+  }
+  return max;
+}
+
+function extractSize(model) {
+  for (const source of [model.id, model.name, model.description]) {
+    const size = parseSizeFromText(source);
+    if (size > 0) return size;
+  }
+  return 0;
+}
+
+function freeSlugFamily(id) {
+  const slug = String(id || '').replace(/:free$/i, '').split('/').pop().toLowerCase();
+  const match = slug.match(/^[a-z]+/);
+  return match ? match[0] : slug;
+}
+
+function blockedIdSet(blockedIds) {
+  return blockedIds instanceof Set ? blockedIds : new Set(blockedIds || []);
+}
+
+/**
+ * Up to `limit` free catalogue ids. One model per slug family first, then
+ * the next largest ids if that is short. A size tie inside a family keeps
+ * the greater display name; published order uses the lesser name.
+ */
+export function rankTopFreeModels(models, blockedIds, limit = 10) {
+  const cap = Math.trunc(Number(limit));
+  if (!Number.isFinite(cap) || cap <= 0) return [];
+  const blocked = blockedIdSet(blockedIds);
+  const eligible = [];
+  const seen = new Set();
+  for (const model of Array.isArray(models) ? models : []) {
+    const id = model?.id;
+    if (!id || !isFreeModel(id)) continue;
+    const cid = catalogueId(id);
+    if (blocked.has(cid) || seen.has(cid)) continue;
+    if (SPECIALIZED_FREE.test(id)) continue;
+    seen.add(cid);
+    eligible.push({
+      id,
+      size: extractSize(model),
+      name: model.name || id,
+      index: eligible.length,
+    });
+  }
+
+  const familyBest = new Map();
+  for (const model of eligible) {
+    const family = freeSlugFamily(model.id);
+    const current = familyBest.get(family);
+    if (!current) {
+      familyBest.set(family, { ...model, familyIndex: familyBest.size });
+      continue;
+    }
+    const largerName = model.name.localeCompare(current.name) > 0;
+    if (model.size > current.size || (model.size === current.size && largerName)) {
+      familyBest.set(family, { ...model, familyIndex: current.familyIndex });
+    }
+  }
+
+  const representatives = [...familyBest.values()].sort((a, b) => (
+    b.size - a.size
+    || a.name.localeCompare(b.name)
+    || a.familyIndex - b.familyIndex
+  ));
+  const picked = representatives.slice(0, cap);
+  if (picked.length >= cap) return picked.map((model) => model.id);
+
+  const pickedIds = new Set(picked.map((model) => model.id));
+  const rest = eligible
+    .filter((model) => !pickedIds.has(model.id))
+    .sort((a, b) => (
+      b.size - a.size
+      || a.name.localeCompare(b.name)
+      || a.index - b.index
+    ));
+  picked.push(...rest.slice(0, cap - picked.length));
+  return picked.map((model) => model.id);
+}
+
 export function isHarnessOnlyMessage(text) {
   return String(text || '').toLowerCase().includes(HARNESS_ONLY);
 }
