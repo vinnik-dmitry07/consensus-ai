@@ -644,3 +644,43 @@ describe('title and red-team credentials', () => {
     expect(JSON.parse(init.body).model).toBe('b/two:free');
   });
 });
+
+describe('stage 1 transport boundary', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    resetFreeQueueForTests();
+  });
+
+  it('does not rank a stream that ends before [DONE]', async () => {
+    const previous = {
+      council: [...settings.councilModels],
+      chairman: settings.chairmanModel,
+      samples: settings.nSamples,
+    };
+    settings.councilModels = ['test/alpha:free'];
+    settings.chairmanModel = 'test/alpha:free';
+    settings.nSamples = 1;
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      'data: {"choices":[{"delta":{"content":"partial answer"}}]}\n\n',
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    )));
+    try {
+      const events = [];
+      for await (const event of stage1CollectResponsesStreaming('q')) {
+        events.push(event);
+      }
+      const completed = events.filter((event) => event[0] === 'model_complete' && !event[1].existing);
+      const failed = events.filter((event) => event[0] === 'model_failed' && !event[1].existing);
+      const finished = events.find((event) => event[0] === 'all_complete');
+      expect(completed).toEqual([]);
+      expect(failed).toHaveLength(1);
+      expect(failed[0][1].error.kind).toBe('protocol');
+      expect(finished[1].results).toEqual([]);
+      expect(JSON.stringify(finished[1].results)).not.toContain('partial answer');
+    } finally {
+      settings.councilModels = previous.council;
+      settings.chairmanModel = previous.chairman;
+      settings.nSamples = previous.samples;
+    }
+  });
+});

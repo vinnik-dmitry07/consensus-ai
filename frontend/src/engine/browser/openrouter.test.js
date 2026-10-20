@@ -3,9 +3,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { browserEngine } from './engine.js';
 import {
   CatalogueUnavailable,
+  CATALOGUE_FAILURE_COOLDOWN_MS,
+  clearModelsCache,
+  HEADER_WAIT_SECONDS,
+  IDLE_WAIT_SECONDS,
+  STREAM_TOTAL_SECONDS,
   FREE_TIER_API_KEY,
   getCredits,
   getKeyInfo,
+  getModelsPricing,
   hasVisibleContent,
   modelFamily,
   OPENROUTER_MAX_TOKENS,
@@ -212,6 +218,55 @@ describe('queryModelResult', () => {
     ]);
     expect(result.ok).toBe(false);
     expect(result.error.message).toBe('Empty model response');
+  });
+
+  it('assembles a streamed completion', async () => {
+    settings.apiKey = 'sk-test';
+    const sse = [
+      ': OPENROUTER PROCESSING',
+      '',
+      'data: {"choices":[{"delta":{"content":"KRAS "}}]}',
+      '',
+      'data: {"choices":[{"delta":{"reasoning":"ignored once content exists"}}]}',
+      '',
+      'data: {"choices":[{"delta":{"content":"autophagy"}}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n') + '\n';
+    const fetchMock = vi.fn(async () => new Response(sse, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const result = await queryModelResult('nvidia/nemotron-3-ultra-550b-a55b:free', [
+      { role: 'user', content: 'q' },
+    ]);
+    expect(result.ok).toBe(true);
+    expect(result.content).toBe('KRAS autophagy');
+    expect(result.usage.total_tokens).toBe(6);
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body.stream).toBe(true);
+    expect(body.stream_options).toEqual({ include_usage: true });
+  });
+
+  it('uses streamed reasoning when the answer content is blank', async () => {
+    settings.apiKey = 'sk-test';
+    const sse = [
+      'data: {"choices":[{"delta":{"reasoning":"the visible answer"}}]}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n') + '\n';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(sse, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })));
+    const result = await queryModelResult('openai/gpt-4.1', [
+      { role: 'user', content: 'q' },
+    ]);
+    expect(result.ok).toBe(true);
+    expect(result.content).toBe('the visible answer');
   });
 
   it('sends xhigh effort for an Anthropic reasoning-high model', async () => {
@@ -677,6 +732,7 @@ describe('queryModelResult', () => {
 
 describe('catalogue validation', () => {
   afterEach(() => {
+    clearModelsCache();
     vi.unstubAllGlobals();
   });
 
@@ -719,6 +775,75 @@ describe('catalogue validation', () => {
     );
     expect(settings.councilModels).toEqual(before);
     expect(settings.nSamples).toBe(3);
+  });
+});
+
+describe('getModelsPricing', () => {
+  afterEach(() => {
+    clearModelsCache();
+    vi.unstubAllGlobals();
+  });
+
+  it('cools down after an empty catalogue until an explicit refresh', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(200, { data: [] }))
+      .mockResolvedValueOnce(jsonResponse(200, {
+        data: [{ id: 'test/alpha-100b:free', name: 'Alpha', pricing: {}, description: '' }],
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+    expect(await getModelsPricing()).toEqual({});
+    expect(await getModelsPricing()).toEqual({});
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const refreshed = await getModelsPricing({ refresh: true });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(refreshed['test/alpha-100b:free'].name).toBe('Alpha');
+  });
+
+  it('cools down after a catalogue error and lets the next read wait it out', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn()
+        .mockRejectedValueOnce(new Error('network down'))
+        .mockResolvedValueOnce(jsonResponse(200, {
+          data: [{ id: 'test/alpha-100b:free', name: 'Alpha', pricing: {}, description: '' }],
+        }));
+      vi.stubGlobal('fetch', fetchMock);
+      expect(await getModelsPricing()).toEqual({});
+      expect(await getModelsPricing()).toEqual({});
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(CATALOGUE_FAILURE_COOLDOWN_MS);
+      const later = await getModelsPricing();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(later['test/alpha-100b:free'].name).toBe('Alpha');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('drops a late catalogue response after the cache generation changes', async () => {
+    let release;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(() => gate)
+      .mockResolvedValueOnce(jsonResponse(200, {
+        data: [{ id: 'test/fresh:free', name: 'Fresh', pricing: {}, description: '' }],
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+    const stale = getModelsPricing();
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    clearModelsCache();
+    const fresh = await getModelsPricing();
+    expect(fresh['test/fresh:free'].name).toBe('Fresh');
+    release(jsonResponse(200, {
+      data: [{ id: 'test/stale:free', name: 'Stale', pricing: {}, description: '' }],
+    }));
+    await stale;
+    const cached = await getModelsPricing();
+    expect(cached['test/fresh:free'].name).toBe('Fresh');
+    expect(cached['test/stale:free']).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -889,3 +1014,433 @@ describe('completion key routing', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+const encoder = new TextEncoder();
+const userMessage = [{ role: 'user', content: 'q' }];
+
+function sseResponse(text) {
+  return new Response(text, {
+    status: 200,
+    headers: { 'Content-Type': 'text/event-stream' },
+  });
+}
+
+function hangingFetch() {
+  let aborted = false;
+  const fetchMock = vi.fn((_url, init) => new Promise((resolve, reject) => {
+    const fail = () => {
+      aborted = true;
+      reject(init.signal.reason || new DOMException('Aborted', 'AbortError'));
+    };
+    if (init.signal?.aborted) {
+      fail();
+      return;
+    }
+    init.signal.addEventListener('abort', fail, { once: true });
+  }));
+  return {
+    fetchMock,
+    aborted: () => aborted,
+  };
+}
+
+function streamResponse(chunks, { contentType = 'text/event-stream', signal, gapMs = 0 } = {}) {
+  let index = 0;
+  const body = new ReadableStream({
+    pull(controller) {
+      if (signal?.aborted) {
+        controller.error(signal.reason || new DOMException('Aborted', 'AbortError'));
+        return undefined;
+      }
+      if (index >= chunks.length) {
+        controller.close();
+        return undefined;
+      }
+      const send = () => {
+        const piece = chunks[index];
+        index += 1;
+        if (piece) controller.enqueue(encoder.encode(piece));
+      };
+      if (gapMs > 0 && index > 0) {
+        return new Promise((resolve) => {
+          setTimeout(() => {
+            send();
+            resolve();
+          }, gapMs);
+        });
+      }
+      send();
+      return undefined;
+    },
+  });
+  return new Response(body, {
+    status: 200,
+    headers: { 'Content-Type': contentType },
+  });
+}
+
+describe('completion stream contract', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    resetFreeQueueForTests();
+  });
+
+  it('returns when [DONE] arrives and does not wait for the socket to close', async () => {
+    settings.apiKey = 'sk-test';
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(
+          'data: {"choices":[{"delta":{"content":"yes"}}]}\n\ndata: [DONE]\n\n',
+        ));
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })));
+    const result = await queryModelResult('openai/gpt-4.1', userMessage);
+    expect(result.ok).toBe(true);
+    expect(result.content).toBe('yes');
+  });
+
+  it('fails when an error frame follows visible text', async () => {
+    settings.apiKey = 'sk-test';
+    const sse = [
+      'data: {"choices":[{"delta":{"content":"partial"}}]}',
+      '',
+      'data: {"error":{"message":"overloaded","code":503}}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n') + '\n';
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(sse)));
+    const result = await queryModelResult('openai/gpt-4.1', userMessage);
+    expect(result.ok).toBe(false);
+    expect(result.error.kind).toBe('provider');
+    expect(result.error.status).toBe(503);
+    expect(result.error.detail).toContain('overloaded');
+    expect(result.content).toBeUndefined();
+  });
+
+  it('fails on EOF before [DONE] even when text arrived', async () => {
+    settings.apiKey = 'sk-test';
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(
+      'data: {"choices":[{"delta":{"content":"partial answer"}}]}\n\n',
+    )));
+    const result = await queryModelResult('openai/gpt-4.1', userMessage);
+    expect(result.ok).toBe(false);
+    expect(result.error.kind).toBe('protocol');
+    expect(result.content).toBeUndefined();
+  });
+
+  it('does not dispatch an unfinished [DONE] event at EOF', async () => {
+    settings.apiKey = 'sk-test';
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(
+      'data: {"choices":[{"delta":{"content":"partial"}}]}\n\ndata: [DONE]',
+    )));
+    const result = await queryModelResult('openai/gpt-4.1', userMessage);
+    expect(result.ok).toBe(false);
+    expect(result.error.kind).toBe('protocol');
+  });
+
+  it('reassembles events split across CRLF, CR, and comments', async () => {
+    settings.apiKey = 'sk-test';
+    vi.stubGlobal('fetch', vi.fn(async () => streamResponse([
+      'data: {"choi',
+      'ces":[{"delta":{"content":"A"}}]}\r\n\r\n',
+      ': keep-alive\r\n\r\n',
+      'data: {"choices":[{"delta":{"content":"B"}}]}\r\r',
+      'data: [DONE]\n\n',
+    ])));
+    const result = await queryModelResult('openai/gpt-4.1', userMessage);
+    expect(result.ok).toBe(true);
+    expect(result.content).toBe('AB');
+  });
+
+  it('rejects a data line that is neither [DONE] nor JSON', async () => {
+    settings.apiKey = 'sk-test';
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse('data: not-json\n\n')));
+    const result = await queryModelResult('openai/gpt-4.1', userMessage);
+    expect(result.ok).toBe(false);
+    expect(result.error.kind).toBe('protocol');
+  });
+
+  it('keeps reading after finish_reason stop so the final usage survives', async () => {
+    settings.apiKey = 'sk-test';
+    const sse = [
+      'data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":"stop"}]}',
+      '',
+      'data: {"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n') + '\n';
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(sse)));
+    const result = await queryModelResult('openai/gpt-4.1', userMessage);
+    expect(result.ok).toBe(true);
+    expect(result.content).toBe('Hi');
+    expect(result.usage.total_tokens).toBe(2);
+  });
+
+  it('accepts finish_reason length when [DONE] follows', async () => {
+    settings.apiKey = 'sk-test';
+    const sse = [
+      'data: {"choices":[{"delta":{"content":"cut"},"finish_reason":"length"}]}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n') + '\n';
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(sse)));
+    const result = await queryModelResult('openai/gpt-4.1', userMessage);
+    expect(result.ok).toBe(true);
+    expect(result.content).toBe('cut');
+  });
+
+  it('fails on finish_reason error, content_filter, and tool calls', async () => {
+    settings.apiKey = 'sk-test';
+    const cases = [
+      ['data: {"choices":[{"delta":{"content":"x"},"finish_reason":"error"}]}\n\n', 'provider'],
+      ['data: {"choices":[{"delta":{"content":"x"},"finish_reason":"content_filter"}]}\n\n', 'provider'],
+      ['data: {"choices":[{"delta":{"tool_calls":[{"id":"1"}]}}]}\n\n', 'protocol'],
+    ];
+    for (const [sse, kind] of cases) {
+      vi.stubGlobal('fetch', vi.fn(async () => sseResponse(sse)));
+      const result = await queryModelResult('openai/gpt-4.1', userMessage);
+      expect(result.ok).toBe(false);
+      expect(result.error.kind).toBe(kind);
+      expect(result.content).toBeUndefined();
+    }
+  });
+
+  it('keeps reasoning channels separate and merges detail fragments', async () => {
+    settings.apiKey = 'sk-test';
+    const separated = [
+      'data: {"choices":[{"delta":{"reasoning":"think","reasoning_content":"other"}}]}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n') + '\n';
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(separated)));
+    const reasoning = await queryModelResult('openai/gpt-4.1', userMessage);
+    expect(reasoning.ok).toBe(true);
+    expect(reasoning.content).toBe('think');
+
+    const details = [
+      'data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","index":0,"text":"hel"}]}}]}',
+      '',
+      'data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","index":0,"text":"lo"}]}}]}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n') + '\n';
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(details)));
+    const merged = await queryModelResult('openai/gpt-4.1', userMessage);
+    expect(merged.ok).toBe(true);
+    expect(merged.content).toBe('hello');
+
+    const encrypted = [
+      'data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","id":"1","data":"abc"}]}}]}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n') + '\n';
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(encrypted)));
+    const hidden = await queryModelResult('openai/gpt-4.1', userMessage);
+    expect(hidden.ok).toBe(false);
+    expect(hidden.error.message).toBe('Empty model response');
+  });
+
+  it('does not append a message snapshot after deltas', async () => {
+    settings.apiKey = 'sk-test';
+    const sse = [
+      'data: {"choices":[{"delta":{"content":"Hi"}}]}',
+      '',
+      'data: {"choices":[{"message":{"content":"Hi"}}]}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n') + '\n';
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(sse)));
+    const result = await queryModelResult('openai/gpt-4.1', userMessage);
+    expect(result.ok).toBe(true);
+    expect(result.content).toBe('Hi');
+  });
+
+  it('uses a message snapshot when the stream never sent a delta', async () => {
+    settings.apiKey = 'sk-test';
+    const sse = [
+      'data: {"choices":[{"message":{"content":"Hi"}}]}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n') + '\n';
+    vi.stubGlobal('fetch', vi.fn(async () => sseResponse(sse)));
+    const result = await queryModelResult('openai/gpt-4.1', userMessage);
+    expect(result.ok).toBe(true);
+    expect(result.content).toBe('Hi');
+  });
+
+  it('aborts the header wait and does not start a pre-aborted request', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    const hung = hangingFetch();
+    vi.stubGlobal('fetch', hung.fetchMock);
+    const pending = queryModelResult('openai/gpt-4.1', userMessage);
+    await vi.advanceTimersByTimeAsync((HEADER_WAIT_SECONDS * 1000) - 1000);
+    expect(hung.aborted()).toBe(false);
+    await vi.advanceTimersByTimeAsync(1000);
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    expect(result.error.kind).toBe('first-response');
+    expect(hung.aborted()).toBe(true);
+
+    const controller = new AbortController();
+    controller.abort();
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const skipped = await queryModelResult('openai/gpt-4.1', userMessage, {
+      signal: controller.signal,
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(skipped.error.kind).toBe('aborted');
+  });
+
+  it('aborts an idle JSON body and accepts one that keeps sending bytes', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    const idle = hangingFetchBody('{');
+    vi.stubGlobal('fetch', idle.fetchMock);
+    const stalled = queryModelResult('openai/gpt-4.1', userMessage);
+    await vi.advanceTimersByTimeAsync((IDLE_WAIT_SECONDS * 1000) - 1000);
+    expect(idle.aborted()).toBe(false);
+    await vi.advanceTimersByTimeAsync(1000);
+    const failed = await stalled;
+    expect(failed.ok).toBe(false);
+    expect(failed.error.kind).toBe('idle');
+
+    vi.stubGlobal('fetch', vi.fn(async (_url, init) => streamResponse(
+      ['{"cho', 'ices":[{"message":{"content":"ye', 's"}}]}'],
+      { contentType: 'application/json', signal: init.signal, gapMs: 90_000 },
+    )));
+    const slow = queryModelResult('openai/gpt-4.1', userMessage);
+    await vi.advanceTimersByTimeAsync(180_000);
+    const parsed = await slow;
+    expect(parsed.ok).toBe(true);
+    expect(parsed.content).toBe('yes');
+  });
+
+  it('stops a live stream at the attempt ceiling', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    let aborted = false;
+    vi.stubGlobal('fetch', vi.fn(async (_url, init) => {
+      let timer;
+      const body = new ReadableStream({
+        start(controller) {
+          const send = () => {
+            controller.enqueue(encoder.encode(': ping\n\n'));
+            timer = setTimeout(send, 30_000);
+          };
+          init.signal.addEventListener('abort', () => {
+            aborted = true;
+            clearTimeout(timer);
+            try {
+              controller.error(init.signal.reason);
+            } catch {
+              // The body is already closed.
+            }
+          }, { once: true });
+          send();
+        },
+      });
+      return new Response(body, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      });
+    }));
+    const pending = queryModelResult('openai/gpt-4.1', userMessage);
+    await vi.advanceTimersByTimeAsync((STREAM_TOTAL_SECONDS * 1000) - 1000);
+    expect(aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1000);
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    expect(result.error.kind).toBe('total');
+    expect(aborted).toBe(true);
+  });
+
+  it('keeps an explicit 30s timeout as the attempt ceiling', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    const hung = hangingFetch();
+    vi.stubGlobal('fetch', hung.fetchMock);
+    const pending = queryModelResult('openai/gpt-title', userMessage, { timeout: 30 });
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(hung.aborted()).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    expect(result.error.kind).toBe('first-response');
+    expect(hung.aborted()).toBe(true);
+  });
+
+  it('cancels an in-flight read and releases the free queue', async () => {
+    useFreeClock();
+    const messages = userMessage;
+    const starts = [];
+    vi.stubGlobal('fetch', vi.fn((_url, init) => {
+      starts.push(performance.now());
+      if (starts.length === 1) {
+        return new Promise((resolve, reject) => {
+          const fail = () => reject(init.signal.reason || new DOMException('Aborted', 'AbortError'));
+          if (init.signal.aborted) {
+            fail();
+            return;
+          }
+          init.signal.addEventListener('abort', fail, { once: true });
+        });
+      }
+      return Promise.resolve(jsonResponse(200, {
+        choices: [{ message: { content: 'ok' } }],
+      }));
+    }));
+    const controller = new AbortController();
+    const first = queryModelResult('a/one:free', messages, { signal: controller.signal });
+    await vi.advanceTimersByTimeAsync(0);
+    controller.abort();
+    const cancelled = await first;
+    expect(cancelled.error.kind).toBe('aborted');
+    const second = queryModelResult('b/two:free', messages);
+    await vi.advanceTimersByTimeAsync(FREE_START_GAP_MS);
+    const followed = await second;
+    expect(followed.ok).toBe(true);
+    expect(starts).toHaveLength(2);
+  });
+});
+
+function hangingFetchBody(firstChunk) {
+  let aborted = false;
+  const fetchMock = vi.fn(async (_url, init) => {
+    const body = new ReadableStream({
+      start(controller) {
+        if (firstChunk) controller.enqueue(encoder.encode(firstChunk));
+        init.signal.addEventListener('abort', () => {
+          aborted = true;
+          try {
+            controller.error(init.signal.reason);
+          } catch {
+            // The body is already closed.
+          }
+        }, { once: true });
+      },
+    });
+    return new Response(body, {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  });
+  return {
+    fetchMock,
+    aborted: () => aborted,
+  };
+}

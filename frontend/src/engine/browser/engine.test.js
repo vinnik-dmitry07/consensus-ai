@@ -1,11 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { API_KEY_REQUIRED, browserEngine, pipeline } from './engine.js';
+import { API_KEY_REQUIRED, browserEngine, modelsFromPricing, pipeline } from './engine.js';
 import * as openrouter from './openrouter.js';
 import { FREE_TIER_API_KEY, resetFreeQueueForTests } from './openrouter.js';
 import { composeFollowUpQuery } from './query.js';
-import { selectedCatalogueIds } from './roster.js';
-import { resetSettingsState, settings } from './settings.js';
+import {
+  freeTierDefaultRoster,
+  readBlockedIds,
+  RosterEmpty,
+  runAllowedBySettings,
+  selectedCatalogueIds,
+} from './roster.js';
+import {
+  DEFAULT_CHAIRMAN_MODEL,
+  DEFAULT_COUNCIL_MODELS,
+  DEFAULT_N_SAMPLES,
+  resetSettingsState,
+  settings,
+  STORAGE_KEY,
+} from './settings.js';
 import {
   addAssistantMessage,
   addUserMessage,
@@ -695,5 +708,318 @@ describe('free roster without a personal key', () => {
     const stored = await getConversation(id);
     expect(stored.messages[1].metadata.red_team.model).toBe('openai/gpt-4.1');
     expect(stored.messages[1].metadata.red_team.error.message).toBe('No API key configured');
+  });
+});
+
+function freeCataloguePricing() {
+  return {
+    'test/alpha-100b:free': { name: 'Alpha', description: '' },
+    'test/bravo-90b:free': { name: 'Bravo', description: '' },
+    'test/charlie-80b:free': { name: 'Charlie', description: '' },
+    'test/delta-70b:free': { name: 'Delta', description: '' },
+  };
+}
+
+function expectedFreeRoster(pricing = freeCataloguePricing()) {
+  return freeTierDefaultRoster(modelsFromPricing(pricing), readBlockedIds());
+}
+
+function writeStoredSettings(data) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  resetSettingsState();
+}
+
+function paidStorageDocument(extra = {}) {
+  return {
+    council_models: [...DEFAULT_COUNCIL_MODELS],
+    n_samples: DEFAULT_N_SAMPLES,
+    chairman_model: DEFAULT_CHAIRMAN_MODEL,
+    top_k: 3,
+    red_team_model: null,
+    self_exclusion: true,
+    api_key: null,
+    ...extra,
+  };
+}
+
+describe('free tier default roster', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    resetSettingsState();
+    vi.spyOn(openrouter, 'getModelsPricing').mockResolvedValue(freeCataloguePricing());
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('applies Top 10 Free on unset storage so a run needs no personal key', async () => {
+    const expected = expectedFreeRoster();
+    const saved = await browserEngine.getSettings();
+    expect(openrouter.getModelsPricing).not.toHaveBeenCalled();
+    expect(saved.council_models).toEqual(DEFAULT_COUNCIL_MODELS);
+    expect(settings.useFreeTierDefault).toBe(true);
+    const data = await browserEngine.getPricing();
+    expect(data.council_models).toEqual(expected.councilModels);
+    expect(data.chairman_model).toBe(expected.chairmanModel);
+    expect(data.chairman_model.endsWith('-reasoning-high')).toBe(true);
+    expect(data.n_samples).toBe(1);
+    const savedAfter = await browserEngine.getSettings();
+    expect(savedAfter.has_api_key).toBe(false);
+    expect(runAllowedBySettings(savedAfter)).toBe(true);
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    expect(stored.use_free_tier_default).not.toBe(true);
+    expect(stored.council_models).toEqual(expected.councilModels);
+  });
+
+  it('keeps a saved paid council that has no pending flag', async () => {
+    writeStoredSettings(paidStorageDocument());
+    const data = await browserEngine.getSettings();
+    expect(data.council_models).toEqual(DEFAULT_COUNCIL_MODELS);
+    expect(data.chairman_model).toBe(DEFAULT_CHAIRMAN_MODEL);
+    expect(data.n_samples).toBe(DEFAULT_N_SAMPLES);
+    expect(settings.useFreeTierDefault).toBe(false);
+    expect(runAllowedBySettings(data)).toBe(false);
+  });
+
+  it('replaces a factory roster that is still marked pending-free', async () => {
+    writeStoredSettings(paidStorageDocument({ use_free_tier_default: true }));
+    const expected = expectedFreeRoster();
+    const data = await browserEngine.getPricing();
+    expect(data.council_models).toEqual(expected.councilModels);
+    expect(data.chairman_model).toBe(expected.chairmanModel);
+    expect(data.n_samples).toBe(1);
+    expect(settings.useFreeTierDefault).toBe(false);
+  });
+
+  it('does not overwrite after a council setter clears the flag', async () => {
+    settings.councilModels = ['openai/gpt-4.1'];
+    settings.chairmanModel = 'openai/gpt-4.1';
+    expect(settings.useFreeTierDefault).toBe(false);
+    const data = await browserEngine.getSettings();
+    expect(data.council_models).toEqual(['openai/gpt-4.1']);
+    expect(data.chairman_model).toBe('openai/gpt-4.1');
+  });
+
+  it('leaves the paid placeholder when the catalogue is empty', async () => {
+    openrouter.getModelsPricing.mockResolvedValue({});
+    const data = await browserEngine.getSettings();
+    expect(settings.useFreeTierDefault).toBe(true);
+    expect(data.council_models).toEqual(DEFAULT_COUNCIL_MODELS);
+    expect(data.n_samples).toBe(DEFAULT_N_SAMPLES);
+    expect(runAllowedBySettings(data)).toBe(false);
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
+    const created = await browserEngine.createConversation();
+    await expect(
+      browserEngine.sendMessageStream(created.id, 'hello', [], [], () => {}),
+    ).rejects.toThrow(/catalogue unavailable/i);
+    expect(settings.useFreeTierDefault).toBe(true);
+    expect(settings.councilModels).toEqual(DEFAULT_COUNCIL_MODELS);
+  });
+
+  it('applies free models again after resetSettings on a saved paid council', async () => {
+    writeStoredSettings(paidStorageDocument());
+    const kept = await browserEngine.getSettings();
+    expect(kept.council_models).toEqual(DEFAULT_COUNCIL_MODELS);
+    const expected = expectedFreeRoster();
+    const reset = await browserEngine.resetSettings();
+    expect(reset.council_models).toEqual(expected.councilModels);
+    expect(reset.chairman_model).toBe(expected.chairmanModel);
+    expect(reset.n_samples).toBe(1);
+    expect(settings.useFreeTierDefault).toBe(false);
+  });
+
+  it('does not start send from the paid eight when the flag is unset', async () => {
+    const expected = expectedFreeRoster();
+    const queried = [];
+    vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model) => {
+      queried.push(model);
+      return {
+        ok: true,
+        content: 'Correctness: 8/10\nFINAL RANKING:\n1. Response 1\n',
+        usage: {},
+      };
+    });
+    const created = await browserEngine.createConversation();
+    await browserEngine.sendMessageStream(created.id, 'q', [], [], () => {});
+    expect(queried.length).toBeGreaterThan(0);
+    expect(queried.some((model) => DEFAULT_COUNCIL_MODELS.includes(model))).toBe(false);
+    expect(settings.councilModels).toEqual(expected.councilModels);
+    expect(settings.nSamples).toBe(1);
+    expect((await getConversation(created.id)).messages).toHaveLength(2);
+  });
+
+  it('does not apply free models after a same-tab roster write during the catalogue wait', async () => {
+    let release;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    openrouter.getModelsPricing.mockImplementation(async () => {
+      await gate;
+      return freeCataloguePricing();
+    });
+    const created = await browserEngine.createConversation();
+    const pending = browserEngine.sendMessageStream(created.id, 'q', [], [], () => {});
+    await vi.waitFor(() => expect(openrouter.getModelsPricing).toHaveBeenCalled());
+    settings.councilModels = ['openai/gpt-4.1'];
+    settings.chairmanModel = 'openai/gpt-4.1';
+    release();
+    await expect(pending).rejects.toThrow(API_KEY_REQUIRED);
+    expect(settings.councilModels).toEqual(['openai/gpt-4.1']);
+    expect(settings.chairmanModel).toBe('openai/gpt-4.1');
+    expect(settings.useFreeTierDefault).toBe(false);
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    expect(stored.council_models).toEqual(['openai/gpt-4.1']);
+    expect(stored.use_free_tier_default).toBe(false);
+  });
+
+  it('does not overwrite another tab roster saved during the catalogue wait', async () => {
+    let release;
+    const gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    openrouter.getModelsPricing.mockImplementation(async () => {
+      await gate;
+      return {
+        ...freeCataloguePricing(),
+        'openai/gpt-4.1': { name: 'GPT', description: '' },
+      };
+    });
+    vi.spyOn(openrouter, 'queryModelResult').mockResolvedValue({
+      ok: true,
+      content: 'Correctness: 8/10\nFINAL RANKING:\n1. Response 1\n',
+      usage: {},
+    });
+    const created = await browserEngine.createConversation();
+    const pending = browserEngine.sendMessageStream(created.id, 'q', [], [], () => {});
+    await vi.waitFor(() => expect(openrouter.getModelsPricing).toHaveBeenCalled());
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(paidStorageDocument({
+      council_models: ['openai/gpt-4.1'],
+      chairman_model: 'openai/gpt-4.1',
+      api_key: 'sk-other-tab-key',
+      top_k: 4,
+      red_team_model: 'openai/gpt-4.1',
+      use_free_tier_default: false,
+    })));
+    release();
+    await pending;
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    expect(stored.council_models).toEqual(['openai/gpt-4.1']);
+    expect(stored.chairman_model).toBe('openai/gpt-4.1');
+    expect(stored.api_key).toBe('sk-other-tab-key');
+    expect(stored.top_k).toBe(4);
+    expect(stored.red_team_model).toBe('openai/gpt-4.1');
+    expect(stored.use_free_tier_default).toBe(false);
+    expect(settings.councilModels).toEqual(['openai/gpt-4.1']);
+    expect(settings.apiKey).toBe('sk-other-tab-key');
+  });
+
+  it('returns the free roster from getPricing on a fresh profile', async () => {
+    const expected = expectedFreeRoster();
+    const data = await browserEngine.getPricing();
+    expect(data.council_models).toEqual(expected.councilModels);
+    expect(data.chairman_model).toBe(expected.chairmanModel);
+    expect(data.n_samples).toBe(1);
+    expect(Object.keys(data.pricing).sort()).toEqual([...expected.councilModels].sort());
+  });
+
+  it('prunes a pending factory roster without finishing it when nothing ranks free', async () => {
+    settings.apiKey = 'sk-test';
+    const kept = DEFAULT_COUNCIL_MODELS[0];
+    openrouter.getModelsPricing.mockResolvedValue({
+      [kept]: { name: 'Sol' },
+      'openai/gpt-4.1': { name: 'GPT' },
+    });
+    const queried = [];
+    vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model) => {
+      queried.push(model);
+      return {
+        ok: true,
+        content: 'Correctness: 8/10\nFINAL RANKING:\n1. Response 1\n',
+        usage: {},
+      };
+    });
+    const created = await browserEngine.createConversation();
+    await browserEngine.sendMessageStream(created.id, 'q', [], [], () => {});
+    expect(settings.useFreeTierDefault).toBe(true);
+    expect(settings.councilModels).toEqual([
+      '~openai/gpt-sol-latest',
+      '~openai/gpt-sol-latest-reasoning',
+    ]);
+    expect(settings.chairmanModel).toBe('~openai/gpt-sol-latest-reasoning-high');
+    expect(queried.length).toBeGreaterThan(0);
+    expect(queried.every((model) => String(model).startsWith(kept))).toBe(true);
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    expect(stored.use_free_tier_default).toBe(true);
+    expect(stored.council_models).toEqual(settings.councilModels);
+
+    openrouter.getModelsPricing.mockResolvedValue(freeCataloguePricing());
+    const later = await browserEngine.getPricing();
+    const expected = expectedFreeRoster();
+    expect(later.council_models).toEqual(expected.councilModels);
+    expect(later.chairman_model).toBe(expected.chairmanModel);
+    expect(settings.useFreeTierDefault).toBe(false);
+  });
+
+  it('does not finish the pending factory when prune finds no live council id', async () => {
+    settings.apiKey = 'sk-test';
+    openrouter.getModelsPricing.mockResolvedValue({
+      'openai/gpt-4.1': { name: 'GPT' },
+      'vendor/coder:free': { name: 'Coder' },
+    });
+    const created = await browserEngine.createConversation();
+    await expect(
+      browserEngine.sendMessageStream(created.id, 'hello', [], [], () => {}),
+    ).rejects.toThrow(RosterEmpty);
+    expect(settings.useFreeTierDefault).toBe(true);
+    expect(settings.councilModels).toEqual(DEFAULT_COUNCIL_MODELS);
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    expect(stored.use_free_tier_default).toBe(true);
+    expect(stored.council_models).toEqual(DEFAULT_COUNCIL_MODELS);
+  });
+
+  it('keeps the pending flag when a save does not change the council or chairman', async () => {
+    writeStoredSettings(paidStorageDocument({
+      use_free_tier_default: true,
+      api_key: 'sk-old-key',
+    }));
+    const pricing = { 'openai/gpt-4.1': { name: 'GPT', description: '' } };
+    for (const model of DEFAULT_COUNCIL_MODELS) {
+      pricing[String(model).replace(/-reasoning(?:-high)?$/, '')] = {
+        name: model,
+        description: '',
+      };
+    }
+    openrouter.getModelsPricing.mockResolvedValue(pricing);
+    await browserEngine.updateSettings({
+      council_models: [...DEFAULT_COUNCIL_MODELS],
+      chairman_model: DEFAULT_CHAIRMAN_MODEL,
+      n_samples: 2,
+      top_k: 2,
+      self_exclusion: true,
+      red_team_model: null,
+      api_key: 'sk-new-key',
+    });
+    expect(settings.useFreeTierDefault).toBe(true);
+    expect(settings.apiKey).toBe('sk-new-key');
+    expect(settings.nSamples).toBe(2);
+    expect(settings.topK).toBe(2);
+    expect(settings.councilModels).toEqual(DEFAULT_COUNCIL_MODELS);
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    expect(stored.use_free_tier_default).toBe(true);
+    expect(stored.api_key).toBe('sk-new-key');
+    expect(stored.top_k).toBe(2);
+
+    await browserEngine.updateSettings({
+      council_models: ['openai/gpt-4.1'],
+      chairman_model: 'openai/gpt-4.1',
+      n_samples: 2,
+      top_k: 2,
+      self_exclusion: true,
+      red_team_model: null,
+    });
+    expect(settings.useFreeTierDefault).toBe(false);
+    expect(settings.apiKey).toBe('sk-new-key');
+    expect(settings.councilModels).toEqual(['openai/gpt-4.1']);
   });
 });

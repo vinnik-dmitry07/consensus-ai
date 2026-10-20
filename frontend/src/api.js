@@ -20,8 +20,8 @@ export const api = {
     return engine().getPricing();
   },
 
-  getAvailableModels() {
-    return engine().getAvailableModels();
+  getAvailableModels(options) {
+    return engine().getAvailableModels(options);
   },
 
   getSettings() {

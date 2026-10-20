@@ -1,6 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
+import { browserEngine } from './engine.js';
 import { FREE_TIER_API_KEY } from './openrouter.js';
+import * as openrouter from './openrouter.js';
 import { settings, STORAGE_KEY } from './settings.js';
 import {
   addAssistantMessage,
@@ -103,6 +105,20 @@ describe('settings', () => {
     expect(settings.nSamples).toBe(3);
     expect(settings.apiKey).toBe('sk-or-v1-secret');
     expect(settings.toDict().has_api_key).toBe(true);
+  });
+
+  it('applies one sample after resetSettings when the catalogue has free models', async () => {
+    settings.councilModels = ['openai/gpt-4.1'];
+    settings.chairmanModel = 'openai/gpt-4.1';
+    settings.nSamples = 3;
+    vi.spyOn(openrouter, 'getModelsPricing').mockResolvedValue({
+      'test/alpha-100b:free': { name: 'Alpha', description: '' },
+      'test/bravo-90b:free': { name: 'Bravo', description: '' },
+    });
+    const reset = await browserEngine.resetSettings();
+    expect(reset.n_samples).toBe(1);
+    expect(settings.nSamples).toBe(1);
+    expect(settings.councilModels).toEqual(['test/alpha-100b:free', 'test/bravo-90b:free']);
   });
 
   it('does not store the free-tier key as the personal key', () => {

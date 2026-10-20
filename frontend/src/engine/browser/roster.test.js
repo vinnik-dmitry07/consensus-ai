@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  applyFreeTierDefaultRoster,
   clearBlockedIds,
   dropBlockedModel,
+  freeTierDefaultRoster,
   pruneRoster,
   rankTopFreeModels,
   rememberModelCooldown,
@@ -15,7 +17,9 @@ import {
   DEFAULT_CHAIRMAN_MODEL,
   DEFAULT_COUNCIL_MODELS,
   DEFAULT_RED_TEAM_MODEL,
+  resetSettingsState,
   SETTINGS_CHANGED_EVENT,
+  STORAGE_KEY,
 } from './settings.js';
 import { settings } from './settings.js';
 
@@ -246,6 +250,51 @@ describe('rankTopFreeModels', () => {
   });
 });
 
+describe('freeTierDefaultRoster', () => {
+  it('uses the ranked free list, reasoning-high chairman, and one sample', () => {
+    const models = [
+      freeRow('test/alpha-100b:free', 'Alpha'),
+      freeRow('test/bravo-50b:free', 'Bravo'),
+    ];
+    const blocked = [];
+    const roster = freeTierDefaultRoster(models, blocked);
+    expect(roster.councilModels).toEqual(rankTopFreeModels(models, blocked));
+    expect(roster.chairmanModel).toBe(`${roster.councilModels[0]}-reasoning-high`);
+    expect(roster.nSamples).toBe(1);
+  });
+
+  it('returns an empty council and chairman when nothing ranks', () => {
+    expect(freeTierDefaultRoster([], [])).toEqual({
+      councilModels: [],
+      chairmanModel: '',
+      nSamples: 1,
+    });
+    expect(freeTierDefaultRoster([freeRow('openai/gpt-4.1', 'GPT')], [])).toEqual({
+      councilModels: [],
+      chairmanModel: '',
+      nSamples: 1,
+    });
+  });
+
+  it('does not write when the pending-free flag is already cleared', () => {
+    const council = [...settings.councilModels];
+    const chairman = settings.chairmanModel;
+    settings.councilModels = ['openai/gpt-4.1'];
+    settings.chairmanModel = 'openai/gpt-4.1';
+    try {
+      expect(settings.useFreeTierDefault).toBe(false);
+      expect(applyFreeTierDefaultRoster([
+        freeRow('test/alpha-100b:free', 'Alpha'),
+      ])).toBe(false);
+      expect(settings.councilModels).toEqual(['openai/gpt-4.1']);
+      expect(settings.chairmanModel).toBe('openai/gpt-4.1');
+    } finally {
+      settings.councilModels = council;
+      settings.chairmanModel = chairman;
+    }
+  });
+});
+
 describe('dropBlockedModel', () => {
   it('caps samples when the remaining council is all-free', () => {
     const council = [...settings.councilModels];
@@ -351,5 +400,22 @@ describe('storePrunedRoster', () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it('keeps a pending free-tier document when storing a pruned roster', () => {
+    localStorage.clear();
+    resetSettingsState();
+    expect(settings.useFreeTierDefault).toBe(true);
+    storePrunedRoster({
+      councilModels: ['~openai/gpt-sol-latest'],
+      chairmanModel: '~openai/gpt-sol-latest-reasoning-high',
+      redTeamModel: null,
+    });
+    expect(settings.useFreeTierDefault).toBe(true);
+    expect(settings.councilModels).toEqual(['~openai/gpt-sol-latest']);
+    expect(settings.chairmanModel).toBe('~openai/gpt-sol-latest-reasoning-high');
+    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY));
+    expect(stored.use_free_tier_default).toBe(true);
+    expect(stored.council_models).toEqual(['~openai/gpt-sol-latest']);
   });
 });

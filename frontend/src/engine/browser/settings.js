@@ -40,6 +40,7 @@ function freshState() {
     red_team_model: DEFAULT_RED_TEAM_MODEL,
     self_exclusion: DEFAULT_SELF_EXCLUSION,
     api_key: null,
+    use_free_tier_default: true,
   };
 }
 
@@ -57,12 +58,20 @@ function clampInt(value, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
+export function sameStringList(left, right) {
+  const a = left || [];
+  const b = right || [];
+  if (a.length !== b.length) return false;
+  return a.every((item, index) => item === b[index]);
+}
+
 function load() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return freshState();
     const parsed = JSON.parse(raw);
     const next = freshState();
+    next.use_free_tier_default = false;
     if (Array.isArray(parsed.council_models)) {
       next.council_models = parsed.council_models.map((model) => String(model));
     }
@@ -80,6 +89,7 @@ function load() {
     if (typeof parsed.api_key === 'string' && parsed.api_key.trim()) {
       next.api_key = parsed.api_key.trim();
     }
+    if (parsed.use_free_tier_default === true) next.use_free_tier_default = true;
     return next;
   } catch {
     return freshState();
@@ -111,7 +121,9 @@ export const settings = {
   },
 
   set councilModels(value) {
-    current().council_models = [...value];
+    const data = current();
+    data.council_models = [...value];
+    data.use_free_tier_default = false;
     persist();
   },
 
@@ -129,7 +141,9 @@ export const settings = {
   },
 
   set chairmanModel(value) {
-    current().chairman_model = value;
+    const data = current();
+    data.chairman_model = value;
+    data.use_free_tier_default = false;
     persist();
   },
 
@@ -184,6 +198,10 @@ export const settings = {
     return Boolean(current().api_key);
   },
 
+  get useFreeTierDefault() {
+    return current().use_free_tier_default === true;
+  },
+
   get maskedApiKey() {
     return maskedKey(current().api_key);
   },
@@ -192,6 +210,37 @@ export const settings = {
     const apiKey = current().api_key;
     state = freshState();
     state.api_key = apiKey;
+    persist();
+  },
+
+  writeRoster(pruned) {
+    const data = current();
+    data.council_models = [...pruned.councilModels];
+    data.chairman_model = pruned.chairmanModel;
+    if (pruned.redTeamModel && String(pruned.redTeamModel).trim()) {
+      data.red_team_model = String(pruned.redTeamModel).trim();
+    } else {
+      data.red_team_model = null;
+    }
+    persist();
+  },
+
+  readPersisted() {
+    return load();
+  },
+
+  reloadFromStorage() {
+    state = load();
+  },
+
+  writeFreeTierDefaults(snapshot, roster) {
+    state = {
+      ...snapshot,
+      council_models: [...roster.councilModels],
+      chairman_model: roster.chairmanModel,
+      n_samples: clampInt(roster.nSamples, 1, 10),
+      use_free_tier_default: false,
+    };
     persist();
   },
 
@@ -211,12 +260,29 @@ export const settings = {
 
   updateFromDict(data) {
     if (!data) return;
-    if ('council_models' in data) this.councilModels = data.council_models;
-    if ('n_samples' in data) this.nSamples = data.n_samples;
-    if ('chairman_model' in data) this.chairmanModel = data.chairman_model;
-    if ('top_k' in data) this.topK = data.top_k;
-    if ('red_team_model' in data) this.redTeamModel = data.red_team_model;
-    if ('self_exclusion' in data) this.selfExclusion = data.self_exclusion;
-    if ('api_key' in data) this.apiKey = data.api_key;
+    const currentData = current();
+    const beforeCouncil = currentData.council_models.map((model) => String(model));
+    const beforeChairman = currentData.chairman_model;
+    if ('council_models' in data && Array.isArray(data.council_models)) {
+      currentData.council_models = data.council_models.map((model) => String(model));
+    }
+    if ('n_samples' in data) currentData.n_samples = clampInt(data.n_samples, 1, 10);
+    if ('chairman_model' in data) currentData.chairman_model = data.chairman_model;
+    if ('top_k' in data) currentData.top_k = clampInt(data.top_k, 1, 10);
+    if ('red_team_model' in data) {
+      if (data.red_team_model && String(data.red_team_model).trim()) {
+        currentData.red_team_model = String(data.red_team_model).trim();
+      } else {
+        currentData.red_team_model = null;
+      }
+    }
+    if ('self_exclusion' in data) currentData.self_exclusion = Boolean(data.self_exclusion);
+    if ('api_key' in data && data.api_key && String(data.api_key).trim()) {
+      currentData.api_key = String(data.api_key).trim();
+    }
+    const councilChanged = !sameStringList(currentData.council_models, beforeCouncil);
+    const chairmanChanged = currentData.chairman_model !== beforeChairman;
+    if (councilChanged || chairmanChanged) currentData.use_free_tier_default = false;
+    persist();
   },
 };

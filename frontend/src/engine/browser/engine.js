@@ -6,6 +6,7 @@
 import * as council from './council.js';
 import * as openrouter from './openrouter.js';
 import {
+  applyFreeTierDefaultRoster,
   pruneRoster,
   readBlockedIds,
   RosterEmpty,
@@ -39,7 +40,47 @@ function requireApiKey() {
   }
 }
 
+export function modelsFromPricing(pricing) {
+  const models = Object.entries(pricing).map(([modelId, info]) => ({
+    id: modelId,
+    name: info.name || modelId,
+    pricing: info.pricing || {},
+    description: info.description || '',
+  }));
+  models.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+  return models;
+}
+
+let freeTierTask = null;
+
+function settleFreeTierDefaults() {
+  if (!settings.useFreeTierDefault) return Promise.resolve({});
+  if (!freeTierTask) {
+    freeTierTask = (async () => {
+      const before = settings.readPersisted();
+      const pricing = await openrouter.getModelsPricing();
+      if (Object.keys(pricing).length) {
+        applyFreeTierDefaultRoster(modelsFromPricing(pricing), before);
+      }
+      settings.reloadFromStorage();
+      return pricing;
+    })().finally(() => {
+      freeTierTask = null;
+    });
+  }
+  return freeTierTask;
+}
+
+async function ensureFreeTierDefaults({ required = false } = {}) {
+  if (!settings.useFreeTierDefault) return;
+  const pricing = await settleFreeTierDefaults();
+  if (required && settings.useFreeTierDefault && !Object.keys(pricing).length) {
+    throw new openrouter.CatalogueUnavailable('Model catalogue unavailable');
+  }
+}
+
 async function ensureServableRoster() {
+  await ensureFreeTierDefaults();
   const pricing = await openrouter.getModelsPricing();
   if (pricing && Object.keys(pricing).length) {
     const pruned = pruneRoster({
@@ -398,6 +439,7 @@ export const browserEngine = {
   },
 
   async getPricing() {
+    await ensureFreeTierDefaults();
     const modelsPricing = await openrouter.getModelsPricing();
     const allModels = selectedCatalogueIds();
 
@@ -416,22 +458,15 @@ export const browserEngine = {
     };
   },
 
-  async getAvailableModels() {
-    const modelsData = await openrouter.getModelsPricing();
+  async getAvailableModels(options = {}) {
+    const modelsData = await openrouter.getModelsPricing(options);
     if (!modelsData || Object.keys(modelsData).length === 0) {
       throw new Error('Failed to fetch models');
     }
-    const models = Object.entries(modelsData).map(([modelId, info]) => ({
-      id: modelId,
-      name: info.name || modelId,
-      pricing: info.pricing || {},
-      description: info.description || '',
-    }));
-    models.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
-    return { models };
+    return { models: modelsFromPricing(modelsData) };
   },
 
-  getSettings() {
+  async getSettings() {
     return settings.toDict();
   },
 
@@ -471,8 +506,9 @@ export const browserEngine = {
     return settings.toDict();
   },
 
-  resetSettings() {
+  async resetSettings() {
     settings.resetToDefaults();
+    await ensureFreeTierDefaults();
     return settings.toDict();
   },
 
@@ -517,6 +553,7 @@ export const browserEngine = {
   },
 
   async sendMessageStream(conversationId, content, images = [], files = [], onEvent) {
+    await ensureFreeTierDefaults({ required: true });
     requireApiKey();
     const conversation = await storage.getConversation(conversationId);
     if (!conversation) throw new Error('Conversation not found');
@@ -541,6 +578,7 @@ export const browserEngine = {
   },
 
   async retryStage(conversationId, stage, messageIndex, onEvent) {
+    await ensureFreeTierDefaults({ required: true });
     requireApiKey();
     const conversation = await storage.getConversation(conversationId);
     if (!conversation) throw new Error('Conversation not found');

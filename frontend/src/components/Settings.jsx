@@ -3,9 +3,9 @@ import { api } from '../api';
 import { getApiBase, getEngineMode, setApiBase, setEngineMode } from '../engine/index.js';
 import { catalogueModelId } from '../engine/browser/openrouter.js';
 import {
+  freeTierDefaultRoster,
   isAllFreeCouncil,
   pruneRoster,
-  rankTopFreeModels,
   readBlockedIds,
   removedModelsMessage,
   stage1SampleLimit,
@@ -29,6 +29,8 @@ export default function Settings({
   const [availableModels, setAvailableModels] = useState([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [loading, setLoading] = useState(true);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsError, setModelsError] = useState(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
 
@@ -48,6 +50,12 @@ export default function Settings({
   const [loadedFrom, setLoadedFrom] = useState(null);
   const importInputRef = useRef(null);
   const failedMigration = useRef(null);
+  const formDirty = useRef(false);
+  const loadGeneration = useRef(0);
+
+  const markDirty = () => {
+    formDirty.current = true;
+  };
 
   // Load settings and available models
   useEffect(() => {
@@ -79,93 +87,136 @@ export default function Settings({
     if (capped !== nSamples) setNSamples(capped);
   }, [councilModels, nSamples]);
 
+  const showSavedSettings = (settingsData) => {
+    setTopK(settingsData.top_k ?? 3);
+    setSelfExclusion(settingsData.self_exclusion !== false);
+    setHasApiKey(settingsData.has_api_key || false);
+    setMaskedApiKey(settingsData.masked_api_key || '');
+    setApiKey('');
+    setNSamples(settingsData.n_samples);
+    setCouncilModels(settingsData.council_models || []);
+    setChairmanModel(settingsData.chairman_model || '');
+    setRedTeamModel(settingsData.red_team_model || '');
+  };
+
+  const applyLoadedModels = async (generation, settingsData, models) => {
+    if (generation !== loadGeneration.current) return;
+    setAvailableModels(models);
+    if (formDirty.current) return;
+    const known = new Set(models.map((model) => model.id));
+    let samples = settingsData.n_samples;
+    let council = settingsData.council_models || [];
+    let chairman = settingsData.chairman_model || '';
+    let redTeam = settingsData.red_team_model || '';
+    let removed = [];
+    if (known.size) {
+      const pruned = pruneRoster({
+        councilModels: council,
+        chairmanModel: chairman,
+        redTeamModel: redTeam || null,
+      }, known, readBlockedIds());
+      council = pruned.councilModels;
+      chairman = pruned.chairmanModel;
+      redTeam = pruned.redTeamModel || '';
+      removed = pruned.removed;
+      if (removed.length && !council.length) {
+        council = [];
+        chairman = '';
+        redTeam = '';
+        setError(removedModelsMessage(removed, true));
+      }
+    }
+    samples = stage1SampleLimit(council, samples);
+    const samplesChanged = samples !== settingsData.n_samples;
+    const rosterChanged = removed.length > 0 && council.length > 0;
+    if (council.length && (rosterChanged || samplesChanged)) {
+      try {
+        const saved = await api.updateSettings({
+          council_models: council,
+          chairman_model: chairman,
+          red_team_model: redTeam || null,
+          n_samples: samples,
+        });
+        if (generation !== loadGeneration.current || formDirty.current) return;
+        samples = saved.n_samples;
+        council = saved.council_models || council;
+        chairman = saved.chairman_model || chairman;
+        redTeam = saved.red_team_model || '';
+        if (removed.length) setError(removedModelsMessage(removed));
+        if (onSettingsChange) onSettingsChange();
+      } catch (saveErr) {
+        console.error(saveErr);
+        if (generation !== loadGeneration.current || formDirty.current) return;
+        const storedCouncil = [...(settingsData.council_models || [])];
+        failedMigration.current = {
+          council: storedCouncil,
+          samples: settingsData.n_samples,
+        };
+        samples = settingsData.n_samples;
+        council = storedCouncil;
+        chairman = settingsData.chairman_model || '';
+        redTeam = settingsData.red_team_model || '';
+        setError(saveErr instanceof Error ? saveErr.message : 'Failed to save settings');
+      }
+    }
+    if (generation !== loadGeneration.current || formDirty.current) return;
+    setNSamples(samples);
+    setCouncilModels(council);
+    setChairmanModel(chairman);
+    setRedTeamModel(redTeam);
+  };
+
+  const loadModels = async (generation, settingsData, refresh = false) => {
+    setModelsLoading(true);
+    setModelsError(null);
+    try {
+      const modelsData = await api.getAvailableModels(refresh ? { refresh: true } : undefined);
+      if (generation !== loadGeneration.current) return;
+      await applyLoadedModels(generation, settingsData, modelsData.models || []);
+    } catch (err) {
+      if (generation !== loadGeneration.current) return;
+      setModelsError('Model catalogue unavailable');
+      console.error(err);
+    } finally {
+      if (generation === loadGeneration.current) setModelsLoading(false);
+    }
+  };
+
   const loadData = async () => {
+    const generation = loadGeneration.current + 1;
+    loadGeneration.current = generation;
+    formDirty.current = false;
     setLoading(true);
     setError(null);
+    setModelsError(null);
     const mode = getEngineMode();
     const base = getApiBase();
     setEngineModeState(mode);
     setApiBaseState(base);
     try {
-      const [settingsData, modelsData] = await Promise.all([
-        api.getSettings(),
-        api.getAvailableModels(),
-      ]);
-      
-      setTopK(settingsData.top_k ?? 3);
-      setSelfExclusion(settingsData.self_exclusion !== false);
-      setHasApiKey(settingsData.has_api_key || false);
-      setMaskedApiKey(settingsData.masked_api_key || '');
-      setApiKey(''); // Clear any previous input
+      const settingsData = await api.getSettings();
+      if (generation !== loadGeneration.current) return;
+      showSavedSettings(settingsData);
       setLoadedFrom({ mode, base });
       setTransferMessage(null);
-      const models = modelsData.models || [];
-      setAvailableModels(models);
-      const known = new Set(models.map((model) => model.id));
-      let samples = settingsData.n_samples;
-      let council = settingsData.council_models || [];
-      let chairman = settingsData.chairman_model || '';
-      let redTeam = settingsData.red_team_model || '';
-      let removed = [];
-      if (known.size) {
-        const pruned = pruneRoster({
-          councilModels: council,
-          chairmanModel: chairman,
-          redTeamModel: redTeam || null,
-        }, known, readBlockedIds());
-        council = pruned.councilModels;
-        chairman = pruned.chairmanModel;
-        redTeam = pruned.redTeamModel || '';
-        removed = pruned.removed;
-        if (removed.length && !council.length) {
-          council = [];
-          chairman = '';
-          redTeam = '';
-          setError(removedModelsMessage(removed, true));
-        }
-      }
-      samples = stage1SampleLimit(council, samples);
-      const samplesChanged = samples !== settingsData.n_samples;
-      const rosterChanged = removed.length > 0 && council.length > 0;
-      if (council.length && (rosterChanged || samplesChanged)) {
-        try {
-          const saved = await api.updateSettings({
-            council_models: council,
-            chairman_model: chairman,
-            red_team_model: redTeam || null,
-            n_samples: samples,
-          });
-          samples = saved.n_samples;
-          council = saved.council_models || council;
-          chairman = saved.chairman_model || chairman;
-          redTeam = saved.red_team_model || '';
-          if (removed.length) setError(removedModelsMessage(removed));
-          if (onSettingsChange) onSettingsChange();
-        } catch (saveErr) {
-          console.error(saveErr);
-          const storedCouncil = [...(settingsData.council_models || [])];
-          failedMigration.current = {
-            council: storedCouncil,
-            samples: settingsData.n_samples,
-          };
-          samples = settingsData.n_samples;
-          council = storedCouncil;
-          chairman = settingsData.chairman_model || '';
-          redTeam = settingsData.red_team_model || '';
-          setError(saveErr instanceof Error ? saveErr.message : 'Failed to save settings');
-        }
-      }
-      setNSamples(samples);
-      setCouncilModels(council);
-      setChairmanModel(chairman);
-      setRedTeamModel(redTeam);
+      setLoading(false);
+      await loadModels(generation, settingsData);
     } catch (err) {
+      if (generation !== loadGeneration.current) return;
       setLoadedFrom(null);
       setError('Failed to load settings');
       console.error(err);
-    } finally {
       setLoading(false);
     }
+  };
+
+  const retryModels = () => {
+    loadModels(loadGeneration.current, {
+      n_samples: nSamples,
+      council_models: councilModels,
+      chairman_model: chairmanModel,
+      red_team_model: redTeamModel,
+    }, true);
   };
 
   // Filter models based on search query
@@ -180,17 +231,21 @@ export default function Settings({
   }, [availableModels, searchQuery]);
 
   const selectTopFreeModels = () => {
-    const top = rankTopFreeModels(availableModels, readBlockedIds());
-    setCouncilModels(top);
-    setNSamples(1);
-    if (top.length > 0) {
-      setChairmanModel(`${top[0]}-reasoning-high`);
+    markDirty();
+    const roster = freeTierDefaultRoster(availableModels, readBlockedIds());
+    if (!roster.councilModels.length) {
+      setError('No free models are available to rank.');
+      return;
     }
+    setCouncilModels(roster.councilModels);
+    setNSamples(roster.nSamples);
+    setChairmanModel(roster.chairmanModel);
     setError(null);
   };
 
   // Select top 8 paid models
   const selectTopPaidModels = () => {
+    markDirty();
     setCouncilModels([...DEFAULT_COUNCIL_MODELS]);
     setNSamples(DEFAULT_N_SAMPLES);
     setChairmanModel(DEFAULT_CHAIRMAN_MODEL);
@@ -243,6 +298,7 @@ export default function Settings({
 
   // Toggle a specific variant independently
   const toggleModel = (modelId, variant = 'base') => {
+    markDirty();
     const fullModelId = variant === 'base' ? modelId : `${modelId}-${variant}`;
     
     if (councilModels.includes(fullModelId)) {
@@ -256,6 +312,7 @@ export default function Settings({
 
   // Set chairman model variant
   const setChairmanVariant = (modelId, variant) => {
+    markDirty();
     const baseId = catalogueModelId(modelId);
     const fullModelId = variant === 'base' ? baseId : `${baseId}-${variant}`;
     setChairmanModel(fullModelId);
@@ -532,7 +589,7 @@ export default function Settings({
                     type="password"
                     placeholder={hasApiKey ? "Enter new key to update..." : "Enter your API key..."}
                     value={apiKey}
-                    onChange={(e) => setApiKey(e.target.value)}
+                    onChange={(e) => { markDirty(); setApiKey(e.target.value); }}
                     className="api-key-input"
                     autoComplete="off"
                   />
@@ -560,7 +617,7 @@ export default function Settings({
                 <div className="n-samples-control">
                   <button
                     className="n-samples-btn"
-                    onClick={() => setNSamples(Math.max(1, nSamples - 1))}
+                    onClick={() => { markDirty(); setNSamples(Math.max(1, nSamples - 1)); }}
                     disabled={isAllFreeCouncil(councilModels) || nSamples <= 1}
                   >
                     −
@@ -570,13 +627,13 @@ export default function Settings({
                     min="1"
                     max="10"
                     value={nSamples}
-                    onChange={(e) => setNSamples(Math.max(1, Math.min(10, parseInt(e.target.value) || 1)))}
+                    onChange={(e) => { markDirty(); setNSamples(Math.max(1, Math.min(10, parseInt(e.target.value) || 1))); }}
                     className="n-samples-input"
                     disabled={isAllFreeCouncil(councilModels)}
                   />
                   <button
                     className="n-samples-btn"
-                    onClick={() => setNSamples(Math.min(10, nSamples + 1))}
+                    onClick={() => { markDirty(); setNSamples(Math.min(10, nSamples + 1)); }}
                     disabled={isAllFreeCouncil(councilModels) || nSamples >= 10}
                   >
                     +
@@ -594,6 +651,17 @@ export default function Settings({
                   Select the models that will participate in the council.
                   You can select multiple variants (Base, R, R+) of the same model.
                 </p>
+                {modelsLoading && (
+                  <p className="settings-description">Loading the model catalogue…</p>
+                )}
+                {modelsError && (
+                  <p className="settings-description">
+                    {modelsError}{' '}
+                    <button type="button" className="quick-action-btn" onClick={retryModels}>
+                      Retry
+                    </button>
+                  </p>
+                )}
                 
                 {/* Quick Actions */}
                 <div className="quick-actions">
@@ -620,7 +688,7 @@ export default function Settings({
                       <span className="selected-models-title">Selected Models</span>
                       <button 
                         className="clear-all-btn"
-                        onClick={() => setCouncilModels([])}
+                        onClick={() => { markDirty(); setCouncilModels([]); }}
                         title="Clear all selections"
                       >
                         Clear All
@@ -647,6 +715,7 @@ export default function Settings({
                                 <button
                                   className={`chip-mode-btn ${variant === 'base' ? 'active' : ''}`}
                                   onClick={() => {
+                                    markDirty();
                                     setCouncilModels(prev => 
                                       prev.map(m => m === modelId ? baseId : m)
                                     );
@@ -658,6 +727,7 @@ export default function Settings({
                                 <button
                                   className={`chip-mode-btn ${variant === 'reasoning' ? 'active' : ''}`}
                                   onClick={() => {
+                                    markDirty();
                                     setCouncilModels(prev => 
                                       prev.map(m => m === modelId ? `${baseId}-reasoning` : m)
                                     );
@@ -669,6 +739,7 @@ export default function Settings({
                                 <button
                                   className={`chip-mode-btn ${variant === 'reasoning-high' ? 'active' : ''}`}
                                   onClick={() => {
+                                    markDirty();
                                     setCouncilModels(prev => 
                                       prev.map(m => m === modelId ? `${baseId}-reasoning-high` : m)
                                     );
@@ -680,7 +751,7 @@ export default function Settings({
                               </div>
                               <button
                                 className="chip-remove"
-                                onClick={() => setCouncilModels(prev => prev.filter(m => m !== modelId))}
+                                onClick={() => { markDirty(); setCouncilModels(prev => prev.filter(m => m !== modelId)); }}
                                 title="Remove from council"
                               >
                                 ×
@@ -759,7 +830,7 @@ export default function Settings({
                   <div className="n-samples-control">
                     <button
                       className="n-samples-btn"
-                      onClick={() => setTopK(Math.max(1, topK - 1))}
+                      onClick={() => { markDirty(); setTopK(Math.max(1, topK - 1)); }}
                       disabled={topK <= 1}
                     >
                       −
@@ -770,12 +841,12 @@ export default function Settings({
                       min="1"
                       max="10"
                       value={topK}
-                      onChange={(e) => setTopK(Math.max(1, Math.min(10, parseInt(e.target.value, 10) || 1)))}
+                      onChange={(e) => { markDirty(); setTopK(Math.max(1, Math.min(10, parseInt(e.target.value, 10) || 1))); }}
                       className="n-samples-input"
                     />
                     <button
                       className="n-samples-btn"
-                      onClick={() => setTopK(Math.min(10, topK + 1))}
+                      onClick={() => { markDirty(); setTopK(Math.min(10, topK + 1)); }}
                       disabled={topK >= 10}
                     >
                       +
@@ -787,7 +858,7 @@ export default function Settings({
                   <input
                     type="checkbox"
                     checked={selfExclusion}
-                    onChange={(e) => setSelfExclusion(e.target.checked)}
+                    onChange={(e) => { markDirty(); setSelfExclusion(e.target.checked); }}
                   />
                   <span>Self-exclusion — judges do not rank their own model family</span>
                 </label>
@@ -797,7 +868,7 @@ export default function Settings({
                   <select
                     id="red-team-select"
                     value={redTeamModel}
-                    onChange={(e) => setRedTeamModel(e.target.value)}
+                    onChange={(e) => { markDirty(); setRedTeamModel(e.target.value); }}
                     className="chairman-select"
                   >
                     <option value="">Same as chairman</option>

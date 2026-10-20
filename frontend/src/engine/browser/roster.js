@@ -4,7 +4,7 @@
  * catalogueId lives here so this module does not import openrouter.js.
  */
 
-import { notifySettingsChanged, settings } from './settings.js';
+import { notifySettingsChanged, sameStringList, settings } from './settings.js';
 
 const BLOCKED_KEY = 'llm-council-blocked-models';
 const COOLDOWN_KEY = 'llm-council-model-cooldowns';
@@ -144,6 +144,29 @@ export function rankTopFreeModels(models, blockedIds, limit = 10) {
     ));
   picked.push(...rest.slice(0, cap - picked.length));
   return picked.map((model) => model.id);
+}
+
+export function freeTierDefaultRoster(models, blockedIds) {
+  const councilModels = rankTopFreeModels(models, blockedIds);
+  return {
+    councilModels,
+    chairmanModel: withVariant(councilModels[0], 'reasoning-high'),
+    nSamples: 1,
+  };
+}
+
+export function applyFreeTierDefaultRoster(models, before = null) {
+  const baseline = before || settings.readPersisted();
+  if (baseline.use_free_tier_default !== true) return false;
+  const roster = freeTierDefaultRoster(models, readBlockedIds());
+  if (!roster.councilModels.length) return false;
+  const latest = settings.readPersisted();
+  if (latest.use_free_tier_default !== true) return false;
+  if (!sameStringList(latest.council_models, baseline.council_models)) return false;
+  if ((latest.chairman_model || '') !== (baseline.chairman_model || '')) return false;
+  settings.writeFreeTierDefaults(latest, roster);
+  notifySettingsChanged();
+  return true;
 }
 
 export function isHarnessOnlyMessage(text) {
@@ -300,9 +323,7 @@ export function selectedCatalogueIds() {
 }
 
 export function storePrunedRoster(pruned) {
-  settings.councilModels = pruned.councilModels;
-  settings.chairmanModel = pruned.chairmanModel;
-  settings.redTeamModel = pruned.redTeamModel;
+  settings.writeRoster(pruned);
   notifySettingsChanged();
 }
 
