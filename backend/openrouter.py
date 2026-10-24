@@ -23,6 +23,8 @@ from .roster import (
     MODEL_COOLDOWN_MAX_SECONDS,
     MODEL_COOLDOWN_SECONDS,
     admit_free_post,
+    UPSTREAM_LIMIT,
+    blocked_ids,
     catalogue_id,
     drop_blocked_model,
     is_free_model,
@@ -273,11 +275,35 @@ def visible_reasoning_text(message: Any) -> str:
     return '\n\n'.join(parts)
 
 
-def _skipped_result() -> Dict[str, Any]:
+def _skip_message(reason: str) -> str:
+    messages = {
+        'blocked': 'OpenRouter will not serve this model',
+        'cooldown': 'Temporarily unavailable (cooldown)',
+        'upstream-429': 'Temporarily rate-limited upstream',
+        'provider-429': 'Provider returned an error',
+        'harness-403': 'Only available on agentic harnesses',
+    }
+    return messages.get(reason, 'Skipped')
+
+
+def _unavailable_skip_message(model: str) -> str:
+    cid = catalogue_id(model)
+    if cid and cid in blocked_ids():
+        return _skip_message('blocked')
+    return _skip_message('cooldown')
+
+
+def _limited_skip_reason(detail: str) -> str:
+    if UPSTREAM_LIMIT in str(detail or '').lower():
+        return 'upstream-429'
+    return 'provider-429'
+
+
+def _skipped_result(message: str = 'Skipped') -> Dict[str, Any]:
     return {
         'ok': False,
         'skipped': True,
-        'error': {'status': 403, 'message': 'Skipped', 'detail': ''},
+        'error': {'status': 403, 'message': message, 'detail': ''},
     }
 
 
@@ -327,7 +353,7 @@ async def _query_model_attempts(
     for attempt in range(max_retries):
         try:
             if model_unavailable(model):
-                return _skipped_result()
+                return _skipped_result(_unavailable_skip_message(model))
             async with httpx.AsyncClient(timeout=timeout) as client:
                 if free:
                     await admit_free_post(extra_wait)
@@ -376,7 +402,9 @@ async def _query_model_attempts(
                         MODEL_COOLDOWN_MAX_SECONDS,
                     )
                     remember_model_cooldown(model, wait)
-                    return _skipped_result()
+                    return _skipped_result(
+                        _skip_message(_limited_skip_reason(detail))
+                    )
                 else:
                     wait = parse_retry_after(header, 2**attempt)
                 if attempt < max_retries - 1:
@@ -401,7 +429,7 @@ async def _query_model_attempts(
             ):
                 drop_blocked_model(model)
                 print(f'Error querying model {model}: {e}')
-                return _skipped_result()
+                return _skipped_result(_skip_message('harness-403'))
             else:
                 traceback.print_exc()
                 print(f'Error querying model {model}: {e}')
@@ -429,7 +457,7 @@ async def query_model_result(
     60-second window. Paid models stay parallel.
     """
     if model_unavailable(model):
-        return _skipped_result()
+        return _skipped_result(_unavailable_skip_message(model))
 
     async def attempt():
         return await _query_model_attempts(

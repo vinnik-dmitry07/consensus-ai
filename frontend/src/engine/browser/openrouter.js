@@ -11,9 +11,11 @@ import {
   isFreeModel,
   isHarnessOnlyMessage,
   isUpstreamLimited,
+  UPSTREAM_LIMIT,
   MODEL_COOLDOWN_MAX_MS,
   MODEL_COOLDOWN_MS,
   modelUnavailable,
+  readBlockedIds,
   rememberModelCooldown,
 } from './roster.js';
 import { settings } from './settings.js';
@@ -192,11 +194,31 @@ function failResult(message, status = null, detail = '', kind = null) {
   return { ok: false, error };
 }
 
-function skippedResult() {
+function skipReason(model) {
+  if (readBlockedIds().has(catalogueModelId(model))) return 'blocked';
+  return 'cooldown';
+}
+
+function skipMessage(reason) {
+  if (reason === 'blocked') return 'OpenRouter will not serve this model';
+  if (reason === 'cooldown') return 'Temporarily unavailable (cooldown)';
+  if (reason === 'upstream-429') return 'Temporarily rate-limited upstream';
+  if (reason === 'provider-429') return 'Provider returned an error';
+  if (reason === 'harness-403') return 'Only available on agentic harnesses';
+  return 'Skipped';
+}
+
+function limitedSkipReason(detail) {
+  const lowered = String(detail || '').toLowerCase();
+  if (lowered.includes(UPSTREAM_LIMIT)) return 'upstream-429';
+  return 'provider-429';
+}
+
+function skippedResult(message = 'Skipped') {
   return {
     ok: false,
     skipped: true,
-    error: { status: 403, message: 'Skipped', detail: '' },
+    error: { status: 403, message, detail: '' },
   };
 }
 
@@ -816,7 +838,9 @@ async function runModelAttempt({
 }) {
   let lifetime = null;
   try {
-    if (modelUnavailable(model)) return skippedResult();
+    if (modelUnavailable(model)) {
+      return skippedResult(skipMessage(skipReason(model)));
+    }
     if (signal?.aborted) return failResult('aborted', null, '', 'aborted');
     if (free) await admitFreePost(extraWaitMs, signal);
     const limits = attemptLimits(timeout);
@@ -851,7 +875,7 @@ async function runModelAttempt({
           MODEL_COOLDOWN_MAX_MS / 1000,
         );
         rememberModelCooldown(model, wait);
-        return skippedResult();
+        return skippedResult(skipMessage(limitedSkipReason(detail)));
       } else {
         wait = parseRetryAfter(header, 2 ** attempt);
       }
@@ -877,7 +901,7 @@ async function runModelAttempt({
       ) {
         dropBlockedModel(model);
         console.error(`Error querying model ${model}: HTTP 403`);
-        return skippedResult();
+        return skippedResult(skipMessage('harness-403'));
       } else {
         console.error(`Error querying model ${model}: HTTP ${response.status}`);
       }
@@ -900,7 +924,9 @@ async function runModelAttempt({
 }
 
 export async function queryModelResult(model, messages, options = {}) {
-  if (modelUnavailable(model)) return skippedResult();
+  if (modelUnavailable(model)) {
+    return skippedResult(skipMessage(skipReason(model)));
+  }
   const run = () => queryModelAttempts(model, messages, options);
   if (isFreeModel(model)) return enqueueFree(run);
   return run();

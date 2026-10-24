@@ -193,18 +193,20 @@ async function* emitStage1(
     sampleLimit,
     existingResults,
   );
-  if (existingFailures?.length) {
-    await storage.updateStreamingMessage(conversationId, msgIndex, {
-      stage1_failures: council.retainedStage1Failures(
-        existingFailures,
-        pending,
-        councilModels,
-      ),
-    });
-  }
+  const retainedFailures = council.retainedStage1Failures(
+    existingFailures,
+    pending,
+    councilModels,
+  );
+  await storage.updateStreamingMessage(conversationId, msgIndex, {
+    stage1_failures: retainedFailures,
+    stage1_skipped: [],
+  });
+  const skipped = [];
+  collected.skipped = skipped;
 
   let results = [];
-  let failures = [];
+  let failures = null;
   for await (const [eventType, eventData] of council.stage1CollectResponsesStreaming(
     userMessage,
     { existingResults, existingFailures },
@@ -217,37 +219,52 @@ async function* emitStage1(
       }
       yield { type: 'stage1_model_complete', data: eventData };
     } else if (eventType === 'model_failed') {
-      if (!eventData.existing && !eventData.skipped) {
-        await storage.appendStage1Failure(conversationId, msgIndex, {
-          model: eventData.model,
-          error: eventData.error,
-        });
+      if (!eventData.existing) {
+        const entry = { model: eventData.model, error: eventData.error };
+        if (eventData.skipped) {
+          skipped.push(entry);
+          await storage.appendStage1Skipped(conversationId, msgIndex, entry);
+        } else {
+          await storage.appendStage1Failure(conversationId, msgIndex, entry);
+        }
       }
       yield { type: 'stage1_model_failed', data: eventData };
     } else if (eventType === 'all_complete') {
       results = eventData.results;
-      failures = eventData.failures || [];
+      if (Array.isArray(eventData.failures)) {
+        failures = eventData.failures;
+        collected.failures = failures;
+      }
     }
   }
 
   collected.results = results;
-  collected.failures = failures;
-  await storage.updateStreamingMessage(conversationId, msgIndex, {
+  const finalFields = {
     stage1: results,
     stage1_complete: Boolean(results.length),
-    stage1_failures: failures,
-  });
-  if (!results.length) throw new council.Stage1AllFailed(failures);
-  yield { type: 'stage1_complete', data: results, failures };
+    stage1_skipped: skipped,
+  };
+  const failuresKnown = Array.isArray(failures);
+  if (failuresKnown) finalFields.stage1_failures = failures;
+  await storage.updateStreamingMessage(conversationId, msgIndex, finalFields);
+  if (!results.length) {
+    if (failuresKnown) throw new council.Stage1AllFailed(failures);
+    throw new Error('All models failed to respond in Stage 1');
+  }
+  const complete = { type: 'stage1_complete', data: results, skipped };
+  if (failuresKnown) complete.failures = failures;
+  yield complete;
 }
 
 async function* emitStage2(conversationId, msgIndex, queryText, stage1Results, collected) {
   let results = [];
   let labelToModel = {};
   let failures = [];
-  collected.results = results;
-  collected.labelToModel = labelToModel;
-  collected.failures = failures;
+  await storage.updateStreamingMessage(conversationId, msgIndex, {
+    stage2_skipped: [],
+  });
+  const skipped = [];
+  collected.skipped = skipped;
 
   for await (const [eventType, eventData] of council.stage2CollectRankingsStreaming(
     queryText,
@@ -261,29 +278,40 @@ async function* emitStage2(conversationId, msgIndex, queryText, stage1Results, c
       if (!eventData.skipped) {
         failures.push(eventData);
         collected.failures = failures;
+      } else {
+        const entry = { model: eventData.model, error: eventData.error };
+        skipped.push(entry);
+        await storage.appendStage2Skipped(conversationId, msgIndex, entry);
       }
       yield { type: 'stage2_model_failed', data: eventData };
     } else if (eventType === 'all_complete') {
       results = eventData.results;
       labelToModel = eventData.label_to_model;
-      failures = eventData.failures || failures;
+      if (Array.isArray(eventData.failures)) {
+        failures = eventData.failures;
+        collected.failures = failures;
+      }
       collected.results = results;
       collected.labelToModel = labelToModel;
-      collected.failures = failures;
     }
   }
 
-  if (!results.length) throw new Error(stage2FailMessage(failures));
+  if (!results.length) {
+    collected.failures = failures;
+    throw new Error(stage2FailMessage(failures));
+  }
 
   await storage.updateStreamingMessage(conversationId, msgIndex, {
     stage2: results,
     stage2_failures: failures,
+    stage2_skipped: skipped,
     metadata: { label_to_model: labelToModel },
   });
   yield {
     type: 'stage2_complete',
     data: results,
     failures,
+    skipped,
     metadata: { label_to_model: labelToModel },
   };
 }
@@ -297,28 +325,51 @@ async function persistGenericError(conversationId, msgIndex, stage, exc) {
   return { type: 'error', stage, message };
 }
 
+function stage1FailureList(exc, collected) {
+  if (exc instanceof council.Stage1AllFailed && Array.isArray(exc.failures)) {
+    return exc.failures;
+  }
+  if (Array.isArray(collected?.failures)) return collected.failures;
+  return null;
+}
+
 async function persistStage2Error(conversationId, msgIndex, exc, collected) {
-  const failures = collected.failures || [];
   const message = errorText(exc);
-  await storage.updateStreamingMessage(conversationId, msgIndex, {
+  const fields = {
     error: { stage: 2, message },
-    stage2_failures: failures,
     streaming: false,
-  });
-  return { type: 'stage2_error', stage: 2, message, failures };
+  };
+  const event = { type: 'stage2_error', stage: 2, message };
+  if (Array.isArray(collected?.failures)) {
+    fields.stage2_failures = collected.failures;
+    event.failures = collected.failures;
+  }
+  if (Array.isArray(collected?.skipped)) {
+    fields.stage2_skipped = collected.skipped;
+    event.skipped = collected.skipped;
+  }
+  await storage.updateStreamingMessage(conversationId, msgIndex, fields);
+  return event;
 }
 
 async function persistStage1Error(conversationId, msgIndex, exc, collected) {
-  let failures = [];
-  if (exc instanceof council.Stage1AllFailed) failures = exc.failures;
-  else if (collected.failures) failures = collected.failures;
   const message = errorText(exc);
-  await storage.updateStreamingMessage(conversationId, msgIndex, {
+  const fields = {
     error: { stage: 1, message },
-    stage1_failures: failures,
     streaming: false,
-  });
-  return { type: 'stage1_error', stage: 1, message, failures };
+  };
+  const event = { type: 'stage1_error', stage: 1, message };
+  const failures = stage1FailureList(exc, collected);
+  if (failures !== null) {
+    fields.stage1_failures = failures;
+    event.failures = failures;
+  }
+  if (Array.isArray(collected?.skipped)) {
+    fields.stage1_skipped = collected.skipped;
+    event.skipped = collected.skipped;
+  }
+  await storage.updateStreamingMessage(conversationId, msgIndex, fields);
+  return event;
 }
 
 function startTitle(queryText) {
@@ -602,7 +653,7 @@ export const browserEngine = {
         userMessage: rebuilt.userMessage,
         queryText: rebuilt.queryText,
         existingStage1: assistant.stage1 || [],
-        existingFailures: assistant.stage1_failures || [],
+        existingFailures: assistant.stage1_failures,
       }), onEvent);
       return;
     }
@@ -717,6 +768,7 @@ async function* retryStage1Events(input) {
       streaming: true,
       stage1_complete: false,
       stage2_failures: [],
+      stage2_skipped: [],
     });
     yield { type: 'stage1_start' };
     const collected = {};
@@ -758,6 +810,7 @@ async function* retryStage2Events(input) {
       metadata: null,
       streaming: true,
       stage2_failures: [],
+      stage2_skipped: [],
     });
     const stopped = yield* runFromStage2(ctx);
     if (!stopped) yield { type: 'complete' };

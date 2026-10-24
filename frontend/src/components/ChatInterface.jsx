@@ -10,6 +10,7 @@ import {
   getEffectiveText,
   usableFinalAnswer,
 } from '../engine/browser/query.js';
+import { answerTabsFrom, safeNoteReason, shortModelName } from '../stage1State.js';
 import Stage1 from './Stage1';
 import Stage2 from './Stage2';
 import Stage3 from './Stage3';
@@ -18,6 +19,21 @@ import './ChatInterface.css';
 
 const MAX_FILE_SIZE = 100 * 1024;
 const MAX_ATTACHMENTS = 10;
+function stage1AnswerCount(msg) {
+  return answerTabsFrom(msg.stage1Progress?.results || msg.stage1 || []).length;
+}
+
+function stage1HasNotes(msg) {
+  return Boolean(msg.stage1_failures?.length || msg.stage1_skipped?.length);
+}
+
+function stage2Diagnostic(failure, kind) {
+  const name = shortModelName(failure?.model);
+  const reason = safeNoteReason(kind, failure?.error?.message);
+  if (kind === 'skip') return `${name}: ${reason || 'Skipped'}`;
+  return `${name}: ${reason}`;
+}
+
 const INPUT_MIN_HEIGHT = 48;
 const INPUT_MAX_HEIGHT = 300;
 
@@ -665,21 +681,23 @@ export default function ChatInterface({
                       <span>Running Stage 1: Collecting individual responses...</span>
                     </div>
                   )}
-                  {(msg.stage1Progress || msg.stage1 || msg.stage1_failures?.length > 0) && (
+                  {(msg.stage1Progress || stage1AnswerCount(msg) > 0 || stage1HasNotes(msg)) && (
                     <Stage1
                       responses={msg.stage1Progress?.results || msg.stage1 || []}
                       progress={msg.stage1Progress}
-                      failures={msg.stage1_failures}
+                      failures={msg.stage1_failures || []}
+                      skipped={msg.stage1_skipped || []}
+                      isRunning={Boolean(msg.loading?.stage1)}
                     />
                   )}
-                  {/* Interrupted during Stage 1 - partial results collected */}
-                  {msg.streaming && !msg.loading?.stage1 && !msg.stage1Progress && !msg.stage2 && !msg.error && (!msg.stage1 || msg.stage1.length === 0) && (
+                  {/* Interrupted during Stage 1 - no usable answers yet */}
+                  {msg.streaming && !msg.loading?.stage1 && !msg.stage1Progress && !msg.stage2 && !msg.error && stage1AnswerCount(msg) === 0 && !msg.stage1_complete && (
                     <div className="stage-interrupted">
                       <div className="interrupted-content">
                         <span className="interrupted-icon">⏸️</span>
                         <div className="interrupted-details">
                           <strong>Processing Interrupted</strong>
-                          <p>No responses collected yet</p>
+                          {!stage1HasNotes(msg) && <p>No responses collected yet</p>}
                         </div>
                       </div>
                       <button 
@@ -692,13 +710,13 @@ export default function ChatInterface({
                     </div>
                   )}
                   {/* Interrupted during Stage 1 - some results collected but not complete */}
-                  {msg.streaming && !msg.loading?.stage1 && !msg.stage1Progress && !msg.stage2 && !msg.error && msg.stage1?.length > 0 && !msg.stage1_complete && (
+                  {msg.streaming && !msg.loading?.stage1 && !msg.stage1Progress && !msg.stage2 && !msg.error && stage1AnswerCount(msg) > 0 && !msg.stage1_complete && (
                     <div className="stage-interrupted">
                       <div className="interrupted-content">
                         <span className="interrupted-icon">⏸️</span>
                         <div className="interrupted-details">
                           <strong>Processing Interrupted</strong>
-                          <p>{msg.stage1.length} response(s) collected. Resume to continue or restart.</p>
+                          <p>{stage1AnswerCount(msg)} response(s) collected. Resume to continue or restart.</p>
                         </div>
                       </div>
                       <div className="interrupted-buttons">
@@ -798,6 +816,16 @@ export default function ChatInterface({
                       redTeam={msg.metadata?.red_team}
                     />
                   )}
+                  {msg.stage2_skipped?.length > 0 && (
+                    <div className="stage-skipped">
+                      <div className="error-details">
+                        <strong>Some judges were skipped</strong>
+                        {msg.stage2_skipped.map((failure, i) => (
+                          <p key={i}>{stage2Diagnostic(failure, 'skip')}</p>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                   {msg.stage2_failures?.length > 0 && (
                     <div className="stage-error">
                       <div className="error-content">
@@ -805,11 +833,7 @@ export default function ChatInterface({
                         <div className="error-details">
                           <strong>Some Stage 2 judges failed</strong>
                           {msg.stage2_failures.map((failure, i) => (
-                            <p key={i}>
-                              {(failure.model || '').split('/')[1] || failure.model}
-                              {': '}
-                              {failure.error?.message || 'Request failed'}
-                            </p>
+                            <p key={i}>{stage2Diagnostic(failure, 'fail')}</p>
                           ))}
                         </div>
                       </div>

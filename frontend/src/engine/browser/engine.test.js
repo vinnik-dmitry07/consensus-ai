@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { API_KEY_REQUIRED, browserEngine, modelsFromPricing, pipeline } from './engine.js';
+import * as council from './council.js';
 import * as openrouter from './openrouter.js';
 import { FREE_TIER_API_KEY, resetFreeQueueForTests } from './openrouter.js';
 import { composeFollowUpQuery } from './query.js';
@@ -1021,5 +1022,208 @@ describe('free tier default roster', () => {
     expect(settings.useFreeTierDefault).toBe(false);
     expect(settings.apiKey).toBe('sk-new-key');
     expect(settings.councilModels).toEqual(['openai/gpt-4.1']);
+  });
+});
+
+describe('skip persistence', () => {
+  const saved = {};
+
+  beforeEach(() => {
+    saved.council = [...settings.councilModels];
+    saved.chairman = settings.chairmanModel;
+    saved.samples = settings.nSamples;
+  });
+
+  afterEach(() => {
+    settings.councilModels = saved.council;
+    settings.chairmanModel = saved.chairman;
+    settings.nSamples = saved.samples;
+    vi.restoreAllMocks();
+  });
+
+  async function seedResume() {
+    const id = crypto.randomUUID();
+    await createConversation(id);
+    await addUserMessage(id, 'hello');
+    await addAssistantMessage(
+      id,
+      [
+        { model: 'a/keep', response: 'first' },
+        { model: 'a/keep', response: 'second' },
+        { model: 'gone/removed', response: 'stale' },
+      ],
+      [{ model: 'b', ranking: '1. Response 1' }],
+      finalAnswer('old'),
+      { label_to_model: { 'Response 1': 'a/keep' } },
+    );
+    await updateStreamingMessage(id, 1, {
+      stage1_skipped: [{
+        model: 'old/skip',
+        error: { message: 'Temporarily rate-limited upstream' },
+      }],
+      stage1_failures: [
+        { model: 'a/keep', error: { message: 'Model not found (404)' } },
+        { model: 'gone/removed', error: { message: 'Model not found (404)' } },
+      ],
+      stage2_skipped: [{ model: 'old/judge', error: { message: '{"leak":1}' } }],
+      streaming: false,
+    });
+    return id;
+  }
+
+  it('clears stored skips before the first stage 1 event and drops samples the council no longer uses', async () => {
+    settings.councilModels = ['a/keep', 'c/new'];
+    settings.chairmanModel = 'a/keep';
+    settings.nSamples = 1;
+    const id = await seedResume();
+    const seen = {};
+    const real = council.stage1CollectResponsesStreaming;
+    vi.spyOn(council, 'stage1CollectResponsesStreaming').mockImplementation(async function* (query, options) {
+      const before = (await getConversation(id)).messages[1];
+      seen.beforeSkips = before.stage1_skipped;
+      seen.beforeStage1 = before.stage1;
+      seen.beforeFailures = before.stage1_failures;
+      const iterator = real(query, options);
+      let next = await iterator.next();
+      while (!next.done) {
+        yield next.value;
+        if (next.value[0] === 'model_failed' && next.value[1]?.skipped) {
+          seen.midSkips = (await getConversation(id)).messages[1].stage1_skipped;
+        }
+        next = await iterator.next();
+      }
+    });
+    vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model) => {
+      if (model === 'c/new') {
+        return {
+          ok: false,
+          skipped: true,
+          error: { message: 'Temporarily rate-limited upstream', detail: '' },
+        };
+      }
+      return { ok: false, error: { message: 'stop' } };
+    });
+    vi.spyOn(council, 'stage2CollectRankingsStreaming').mockImplementation(async function* () {
+      seen.stage2Skips = (await getConversation(id)).messages[1].stage2_skipped;
+      yield ['init', { total_models: 1, completed: 0 }];
+      throw new Error('stop after stage 1');
+    });
+
+    await browserEngine.retryStage(id, 1, 1, () => {});
+    const message = (await getConversation(id)).messages[1];
+    expect(seen.beforeSkips).toEqual([]);
+    expect(seen.beforeStage1.map((item) => item.response)).toEqual(['first', 'second', 'stale']);
+    expect(seen.beforeFailures.map((item) => item.model)).toEqual(['a/keep']);
+    expect(seen.midSkips.map((item) => item.model)).toEqual(['c/new']);
+    expect(message.stage1).toEqual([{ model: 'a/keep', response: 'first' }]);
+    expect(message.stage1_skipped.map((item) => item.model)).toEqual(['c/new']);
+    expect(seen.stage2Skips).toEqual([]);
+  });
+
+  it('keeps partial failures when a stage 1 attempt throws before they are known', async () => {
+    settings.councilModels = ['a/keep'];
+    settings.chairmanModel = 'a/keep';
+    settings.nSamples = 1;
+    const id = await seedResume();
+    const seen = {};
+    vi.spyOn(council, 'stage1CollectResponsesStreaming').mockImplementation(async function* () {
+      const before = (await getConversation(id)).messages[1];
+      seen.beforeSkips = before.stage1_skipped;
+      seen.beforeStage1 = before.stage1;
+      yield ['model_failed', {
+        model: 'c/new',
+        error: { message: 'Temporarily rate-limited upstream' },
+        skipped: true,
+      }];
+      yield ['model_failed', {
+        model: 'c/new',
+        error: { message: 'Temporarily rate-limited upstream' },
+        skipped: true,
+      }];
+      seen.midSkips = (await getConversation(id)).messages[1].stage1_skipped;
+      throw new Error('boom');
+    });
+    const { events, onEvent } = collectEvents();
+    await browserEngine.retryStage(id, 1, 1, onEvent);
+    const message = (await getConversation(id)).messages[1];
+    const errorEvent = events.find((item) => item.type === 'stage1_error').event;
+    expect(seen.beforeSkips).toEqual([]);
+    expect(seen.beforeStage1).toHaveLength(3);
+    expect(seen.midSkips).toHaveLength(2);
+    expect(message.stage1.map((item) => item.response)).toEqual(['first', 'second', 'stale']);
+    expect(message.stage1_failures.map((item) => item.model)).toEqual(['a/keep']);
+    expect(message.stage1_skipped).toHaveLength(2);
+    expect(errorEvent.failures).toBeUndefined();
+    expect(errorEvent.skipped).toHaveLength(2);
+  });
+
+  it('replaces stage 2 skips before a new skip is appended', async () => {
+    settings.councilModels = ['a/keep'];
+    settings.chairmanModel = 'a/keep';
+    settings.nSamples = 1;
+    const id = await seedResume();
+    await updateStreamingMessage(id, 1, {
+      stage1: [{ model: 'a/keep', response: 'first' }],
+      streaming: false,
+    });
+    const seen = {};
+    vi.spyOn(council, 'stage2CollectRankingsStreaming').mockImplementation(async function* () {
+      seen.before = (await getConversation(id)).messages[1].stage2_skipped;
+      yield ['model_failed', {
+        model: 'c/new',
+        error: { message: 'Temporarily rate-limited upstream' },
+        skipped: true,
+      }];
+      seen.mid = (await getConversation(id)).messages[1].stage2_skipped;
+      throw new Error('boom');
+    });
+    const { events, onEvent } = collectEvents();
+    await browserEngine.retryStage(id, 2, 1, onEvent);
+    const message = (await getConversation(id)).messages[1];
+    const errorEvent = events.find((item) => item.type === 'stage2_error').event;
+    expect(seen.before).toEqual([]);
+    expect(seen.mid.map((item) => item.model)).toEqual(['c/new']);
+    expect(message.stage2_skipped.map((item) => item.model)).toEqual(['c/new']);
+    expect(message.stage1[0].response).toBe('first');
+    expect(errorEvent.skipped.map((item) => item.model)).toEqual(['c/new']);
+  });
+
+  it('clears stage 2 skips when a normal run enters stage 2', async () => {
+    settings.councilModels = ['a/keep'];
+    settings.chairmanModel = 'a/keep';
+    settings.nSamples = 1;
+    const id = crypto.randomUUID();
+    await createConversation(id);
+    vi.spyOn(openrouter, 'queryModel').mockResolvedValue('Title');
+    vi.spyOn(council, 'stage1CollectResponsesStreaming').mockImplementation(async function* () {
+      yield ['init', { total_models: 1, pending_models: 1, existing_count: 0 }];
+      yield ['model_complete', {
+        result: { model: 'a/keep', response: 'yes' },
+        existing: false,
+      }];
+      yield ['model_failed', {
+        model: 'c/new',
+        error: { message: 'Temporarily rate-limited upstream' },
+        skipped: true,
+      }];
+      yield ['all_complete', {
+        results: [{ model: 'a/keep', response: 'yes' }],
+        failures: [],
+      }];
+      await updateStreamingMessage(id, 1, {
+        stage2_skipped: [{ model: 'old/judge', error: { message: 'old' } }],
+      });
+    });
+    vi.spyOn(council, 'stage2CollectRankingsStreaming').mockImplementation(async function* () {
+      const message = (await getConversation(id)).messages[1];
+      expect(message.stage2_skipped).toEqual([]);
+      expect(message.stage1_skipped.map((item) => item.model)).toEqual(['c/new']);
+      yield ['init', { total_models: 1, completed: 0 }];
+      throw new Error('stop');
+    });
+    await browserEngine.sendMessageStream(id, 'hello', [], [], () => {});
+    const message = (await getConversation(id)).messages[1];
+    expect(message.stage1_skipped.map((item) => item.model)).toEqual(['c/new']);
+    expect(message.stage2_skipped).toEqual([]);
   });
 });

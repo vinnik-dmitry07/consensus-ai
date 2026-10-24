@@ -1,5 +1,6 @@
 """Regression tests: a retry must re-ask the same question and drop the old run."""
 
+import json
 import unittest
 import uuid
 from tempfile import TemporaryDirectory
@@ -207,6 +208,31 @@ class StaleStageClearingTests(unittest.TestCase):
         self.assertEqual(message['stage3']['response'], 'STALE FINAL ANSWER')
         self.assertEqual(len(message['stage2']), 1)
 
+    def test_empty_skip_list_replaces_and_omission_keeps_it(self):
+        note = {'model': 'a', 'error': {'message': 'Skipped'}}
+        storage.update_streaming_message(
+            self.conv_id,
+            1,
+            stage1_skipped=[note],
+            stage2_skipped=[note],
+            streaming=False,
+        )
+        storage.update_streaming_message(self.conv_id, 1, streaming=True)
+        message = storage.get_conversation(self.conv_id)['messages'][1]
+        self.assertEqual(message['stage1_skipped'], [note])
+        self.assertEqual(message['stage2_skipped'], [note])
+        storage.update_streaming_message(
+            self.conv_id,
+            1,
+            stage1_skipped=[],
+            stage2_skipped=[],
+            streaming=False,
+        )
+        message = storage.get_conversation(self.conv_id)['messages'][1]
+        self.assertEqual(message['stage1_skipped'], [])
+        self.assertEqual(message['stage2_skipped'], [])
+        self.assertEqual(message['stage3']['response'], 'STALE FINAL ANSWER')
+
 
 class Stage1ResumeWritebackTests(unittest.TestCase):
     """A resume must persist the filtered Stage 1 set, not only rank it."""
@@ -309,6 +335,281 @@ class ApiKeyRequiredTests(unittest.TestCase):
         message = storage.get_conversation(self.conv_id)['messages'][1]
         self.assertEqual(message['stage3']['response'], 'kept')
         self.assertNotEqual(message.get('streaming'), True)
+
+
+def _sse_events(response):
+    events = []
+    for line in response.text.splitlines():
+        if line.startswith('data: '):
+            events.append(json.loads(line[len('data: '):]))
+    return events
+
+
+class SkipPersistenceTests(unittest.TestCase):
+    """Skip lists are replaced before appends and unknown failures stay put."""
+
+    def setUp(self):
+        _pin_api_key(self)
+        self.saved_models = list(settings.council_models)
+        self.saved_chairman = settings.chairman_model
+        self.saved_samples = settings.n_samples
+        self.tmp = TemporaryDirectory()
+        self.dir_patch = patch('backend.storage.DATA_DIR', self.tmp.name)
+        self.dir_patch.start()
+        self.conv_id = str(uuid.uuid4())
+        storage.create_conversation(self.conv_id)
+        storage.add_user_message(self.conv_id, 'hello')
+        storage.add_assistant_message(
+            self.conv_id,
+            [
+                {'model': 'a/keep', 'response': 'first'},
+                {'model': 'a/keep', 'response': 'second'},
+                {'model': 'gone/removed', 'response': 'stale'},
+            ],
+            [{'model': 'b', 'ranking': '1. Response 1'}],
+            _final('old'),
+            metadata={'label_to_model': {'Response 1': 'a/keep'}},
+        )
+        storage.update_streaming_message(
+            self.conv_id,
+            1,
+            stage1_failures=[
+                {'model': 'a/keep', 'error': {'message': 'Model not found (404)'}},
+                {
+                    'model': 'gone/removed',
+                    'error': {'message': 'Model not found (404)'},
+                },
+            ],
+            stage1_skipped=[{
+                'model': 'old/skip',
+                'error': {'message': 'Temporarily rate-limited upstream'},
+            }],
+            stage2_skipped=[{
+                'model': 'old/judge',
+                'error': {'message': 'old'},
+            }],
+            streaming=False,
+        )
+        settings.council_models = ['a/keep', 'c/new']
+        settings.chairman_model = 'a/keep'
+        settings.n_samples = 1
+
+    def tearDown(self):
+        settings.council_models = self.saved_models
+        settings.chairman_model = self.saved_chairman
+        settings.n_samples = self.saved_samples
+        self.dir_patch.stop()
+        self.tmp.cleanup()
+
+    def test_stage1_retry_keeps_unknown_failures_and_drops_old_skips(self):
+        seen = {}
+
+        async def fake_collect(*args, **kwargs):
+            message = storage.get_conversation(self.conv_id)['messages'][1]
+            seen['before_skips'] = list(message.get('stage1_skipped') or [])
+            seen['before_stage1'] = list(message.get('stage1') or [])
+            seen['before_failures'] = list(message.get('stage1_failures') or [])
+            yield 'model_failed', {
+                'model': 'c/new',
+                'error': {'message': 'Temporarily rate-limited upstream'},
+                'skipped': True,
+            }
+            yield 'model_failed', {
+                'model': 'c/new',
+                'error': {'message': 'Temporarily rate-limited upstream'},
+                'skipped': True,
+            }
+            seen['mid'] = list(
+                storage.get_conversation(self.conv_id)['messages'][1]['stage1_skipped']
+            )
+            raise RuntimeError('boom')
+
+        with (
+            patch('backend.main._require_servable_roster', new=AsyncMock()),
+            patch('backend.main.stage1_collect_responses_streaming', new=fake_collect),
+        ):
+            client = TestClient(app)
+            response = client.post(
+                f'/api/conversations/{self.conv_id}/retry/stage1/stream',
+                json={'message_index': 1},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        message = storage.get_conversation(self.conv_id)['messages'][1]
+        error = next(
+            event for event in _sse_events(response)
+            if event['type'] == 'stage1_error'
+        )
+        self.assertEqual(seen['before_skips'], [])
+        self.assertEqual(
+            [item['response'] for item in seen['before_stage1']],
+            ['first', 'second', 'stale'],
+        )
+        self.assertEqual(
+            [item['model'] for item in seen['before_failures']],
+            ['a/keep'],
+        )
+        self.assertEqual(len(seen['mid']), 2)
+        self.assertEqual(
+            [item['response'] for item in message['stage1']],
+            ['first', 'second', 'stale'],
+        )
+        self.assertEqual(
+            [item['model'] for item in message['stage1_failures']],
+            ['a/keep'],
+        )
+        self.assertEqual(len(message['stage1_skipped']), 2)
+        self.assertNotIn('failures', error)
+        self.assertEqual(len(error['skipped']), 2)
+        self.assertEqual(message.get('stage2_skipped'), [])
+
+    def test_send_stream_keeps_a_partial_failure(self):
+        async def fake_collect(*args, **kwargs):
+            yield 'init', {
+                'total_models': 1,
+                'pending_models': 1,
+                'existing_count': 0,
+            }
+            yield 'model_failed', {
+                'model': 'openai/missing',
+                'error': {'message': 'Model not found (404)'},
+            }
+            raise RuntimeError('provider exploded')
+
+        with (
+            patch('backend.main._require_servable_roster', new=AsyncMock()),
+            patch('backend.main.stage1_collect_responses_streaming', new=fake_collect),
+        ):
+            client = TestClient(app)
+            response = client.post(
+                f'/api/conversations/{self.conv_id}/message/stream',
+                json={'content': 'another question'},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        message = storage.get_conversation(self.conv_id)['messages'][-1]
+        error = next(
+            event for event in _sse_events(response)
+            if event['type'] == 'stage1_error'
+        )
+        self.assertEqual(
+            [item['model'] for item in message['stage1_failures']],
+            ['openai/missing'],
+        )
+        self.assertEqual(message['stage1_skipped'], [])
+        self.assertNotIn('failures', error)
+        self.assertEqual(error['skipped'], [])
+
+    def test_stage2_retry_replaces_skips_before_append(self):
+        async def fake_collect(*args, **kwargs):
+            message = storage.get_conversation(self.conv_id)['messages'][1]
+            self.assertEqual(message.get('stage2_skipped'), [])
+            yield 'model_failed', {
+                'model': 'c/new',
+                'error': {'message': 'Temporarily rate-limited upstream'},
+                'skipped': True,
+            }
+            mid = storage.get_conversation(self.conv_id)['messages'][1]
+            self.assertEqual(
+                [item['model'] for item in mid['stage2_skipped']],
+                ['c/new'],
+            )
+            raise RuntimeError('boom')
+
+        with (
+            patch('backend.main._require_servable_roster', new=AsyncMock()),
+            patch(
+                'backend.main.stage2_collect_rankings_streaming',
+                new=fake_collect,
+            ),
+        ):
+            client = TestClient(app)
+            response = client.post(
+                f'/api/conversations/{self.conv_id}/retry/stage2/stream',
+                json={'message_index': 1},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        message = storage.get_conversation(self.conv_id)['messages'][1]
+        error = next(
+            event for event in _sse_events(response)
+            if event['type'] == 'stage2_error'
+        )
+        self.assertEqual(
+            [item['model'] for item in message['stage2_skipped']],
+            ['c/new'],
+        )
+        self.assertEqual(
+            [item['response'] for item in message['stage1']],
+            ['first', 'second', 'stale'],
+        )
+        self.assertEqual(
+            [item['model'] for item in error['skipped']],
+            ['c/new'],
+        )
+
+    def test_normal_stage2_entry_clears_skips_planted_after_stage1(self):
+        async def fake_stage1(*args, **kwargs):
+            yield 'init', {
+                'total_models': 1,
+                'pending_models': 1,
+                'existing_count': 0,
+            }
+            yield 'model_complete', {
+                'result': {'model': 'a/keep', 'response': 'yes'},
+                'existing': False,
+            }
+            yield 'model_failed', {
+                'model': 'c/new',
+                'error': {'message': 'Temporarily rate-limited upstream'},
+                'skipped': True,
+            }
+            yield 'all_complete', {
+                'results': [{'model': 'a/keep', 'response': 'yes'}],
+                'failures': [],
+            }
+            assistant = storage.get_conversation(self.conv_id)['messages'][-1]
+            index = len(storage.get_conversation(self.conv_id)['messages']) - 1
+            self.assertEqual(
+                [item['model'] for item in assistant.get('stage1_skipped') or []],
+                ['c/new'],
+            )
+            storage.update_streaming_message(
+                self.conv_id,
+                index,
+                stage2_skipped=[{
+                    'model': 'old/judge',
+                    'error': {'message': 'old'},
+                }],
+            )
+
+        async def fake_stage2(*args, **kwargs):
+            message = storage.get_conversation(self.conv_id)['messages'][-1]
+            if message.get('stage2_skipped') != []:
+                raise RuntimeError('stage 2 skips were not cleared')
+            if [item['model'] for item in message['stage1_skipped']] != ['c/new']:
+                raise RuntimeError('stage 1 skip was not stored')
+            yield 'init', {'total_models': 1, 'completed': 0}
+            raise RuntimeError('stop')
+
+        with (
+            patch('backend.main._require_servable_roster', new=AsyncMock()),
+            patch('backend.main.stage1_collect_responses_streaming', new=fake_stage1),
+            patch('backend.main.stage2_collect_rankings_streaming', new=fake_stage2),
+        ):
+            client = TestClient(app)
+            response = client.post(
+                f'/api/conversations/{self.conv_id}/message/stream',
+                json={'content': 'another question'},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        message = storage.get_conversation(self.conv_id)['messages'][-1]
+        self.assertEqual(
+            [item['model'] for item in message['stage1_skipped']],
+            ['c/new'],
+        )
+        self.assertEqual(message.get('stage2_skipped'), [])
 
 
 if __name__ == '__main__':

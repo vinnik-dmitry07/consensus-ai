@@ -3,6 +3,7 @@ import Sidebar from './components/Sidebar';
 import ChatInterface from './components/ChatInterface';
 import Settings from './components/Settings';
 import { api } from './api';
+import { applyStage1Event, knownList, stageRetryPatch } from './stage1State.js';
 import { getEngineMode } from './engine/index.js';
 import { runAllowedBySettings } from './engine/browser/roster.js';
 import { SETTINGS_CHANGED_EVENT, STORAGE_KEY } from './engine/browser/settings.js';
@@ -158,113 +159,19 @@ function App() {
 
     switch (eventType) {
       case 'stage1_start':
-        updateIfCurrentConv((prev) => {
-          const messages = [...prev.messages];
-          const idx = getTargetMsgIndex(prev);
-          messages[idx] = { 
-            ...messages[idx], 
-            loading: { ...messages[idx].loading, stage1: true }, 
-            stage1Progress: null,
-            stage1_failures: [],
-            stage2: null,
-            stage3: null,
-            metadata: null,
-            error: null 
-          };
-          return { ...prev, messages };
-        });
-        break;
-
       case 'stage1_init':
-        updateIfCurrentConv((prev) => {
-          const messages = [...prev.messages];
-          const idx = getTargetMsgIndex(prev);
-          messages[idx] = {
-            ...messages[idx],
-            stage1Progress: { 
-              total: event.data.total_models, 
-              completed: event.data.existing_count || 0, 
-              results: [],
-            }
-          };
-          return { ...prev, messages };
-        });
-        break;
-
       case 'stage1_model_complete':
-        updateIfCurrentConv((prev) => {
-          const messages = [...prev.messages];
-          const idx = getTargetMsgIndex(prev);
-          const progress = messages[idx].stage1Progress;
-          if (progress) {
-            // Only increment completed for NEW results, not existing ones being replayed
-            const isExisting = event.data.existing;
-            messages[idx] = {
-              ...messages[idx],
-              stage1Progress: {
-                ...progress,
-                completed: isExisting ? progress.completed : progress.completed + 1,
-                results: [...progress.results, event.data.result]
-              }
-            };
-          }
-          return { ...prev, messages };
-        });
-        break;
-
       case 'stage1_model_failed':
-        updateIfCurrentConv((prev) => {
-          const messages = [...prev.messages];
-          const idx = getTargetMsgIndex(prev);
-          const progress = messages[idx].stage1Progress;
-          const isExisting = event.data.existing;
-          messages[idx] = {
-            ...messages[idx],
-            stage1_failures: event.data.skipped
-              ? (messages[idx].stage1_failures || [])
-              : [...(messages[idx].stage1_failures || []), event.data],
-            ...(progress && {
-              stage1Progress: {
-                ...progress,
-                completed: isExisting ? progress.completed : progress.completed + 1,
-              },
-            }),
-          };
-          return { ...prev, messages };
-        });
-        break;
-
       case 'stage1_complete':
-        updateIfCurrentConv((prev) => {
-          const messages = [...prev.messages];
-          const idx = getTargetMsgIndex(prev);
-          messages[idx] = { 
-            ...messages[idx], 
-            stage1: event.data,
-            stage1_failures: event.failures || messages[idx].stage1_failures || [],
-            stage1Progress: null,
-            loading: { ...messages[idx].loading, stage1: false } 
-          };
-          return { ...prev, messages };
-        });
-        break;
-
       case 'stage1_error':
         updateIfCurrentConv((prev) => {
           const messages = [...prev.messages];
           const idx = getTargetMsgIndex(prev);
-          const progressResults = messages[idx].stage1Progress?.results;
-          messages[idx] = { 
-            ...messages[idx],
-            stage1: progressResults ?? messages[idx].stage1 ?? [],
-            stage1_failures: event.failures || messages[idx].stage1_failures || [],
-            loading: { ...messages[idx].loading, stage1: false }, 
-            stage1Progress: null,
-            error: { stage: 1, message: event.message } 
-          };
+          if (!messages[idx]) return prev;
+          messages[idx] = applyStage1Event(messages[idx], eventType, event);
           return { ...prev, messages };
         });
-        finishRun(runConvId);
+        if (eventType === 'stage1_error') finishRun(runConvId);
         break;
 
       case 'stage2_start':
@@ -276,6 +183,7 @@ function App() {
             loading: { ...messages[idx].loading, stage2: true },
             stage2Progress: null,
             stage2_failures: [],
+            stage2_skipped: [],
             stage2: null,
             stage3: null,
             metadata: null,
@@ -309,17 +217,25 @@ function App() {
           const nextFailures = recordFailure
             ? [...(messages[idx].stage2_failures || []), event.data]
             : messages[idx].stage2_failures;
+          const nextSkipped = eventType === 'stage2_model_failed' && event.data.skipped
+            ? [...(messages[idx].stage2_skipped || []), event.data]
+            : messages[idx].stage2_skipped;
           if (progress) {
             messages[idx] = {
               ...messages[idx],
               stage2_failures: nextFailures,
+              stage2_skipped: nextSkipped,
               stage2Progress: {
                 ...progress,
                 completed: progress.completed + 1
               }
             };
           } else if (eventType === 'stage2_model_failed') {
-            messages[idx] = { ...messages[idx], stage2_failures: nextFailures };
+            messages[idx] = {
+              ...messages[idx],
+              stage2_failures: nextFailures,
+              stage2_skipped: nextSkipped,
+            };
           }
           return { ...prev, messages };
         });
@@ -332,7 +248,8 @@ function App() {
           messages[idx] = { 
             ...messages[idx], 
             stage2: event.data,
-            stage2_failures: event.failures || messages[idx].stage2_failures || [],
+            stage2_failures: knownList(event.failures, messages[idx].stage2_failures),
+            stage2_skipped: knownList(event.skipped, messages[idx].stage2_skipped),
             metadata: event.metadata, 
             loading: { ...messages[idx].loading, stage2: false },
             stage2Progress: null
@@ -388,7 +305,8 @@ function App() {
             ...messages[idx],
             loading: { ...messages[idx].loading, stage2: false },
             error: { stage: 2, message: event.message },
-            stage2_failures: event.failures ?? messages[idx].stage2_failures ?? [],
+            stage2_failures: knownList(event.failures, messages[idx].stage2_failures),
+            stage2_skipped: knownList(event.skipped, messages[idx].stage2_skipped),
           };
           return { ...prev, messages };
         });
@@ -538,6 +456,7 @@ function App() {
         metadata: null,
         error: null,
         stage1_failures: [],
+        stage1_skipped: [],
         loading: {
           stage1: true,
           stage2: false,
@@ -589,19 +508,7 @@ function App() {
         if (!prev || prev.id !== convId) return prev;
         const messages = [...prev.messages];
         const msg = messages[messageIndex];
-        messages[messageIndex] = {
-          ...msg,
-          error: null,
-          streaming: false,
-          stage1_failures: stage === 1 ? [] : msg.stage1_failures,
-          stage2_failures: stage === 3 ? msg.stage2_failures : [],
-          loading: {
-            stage1: stage === 1,
-            stage2: stage === 2,
-            redteam: stage === 3,
-            stage3: false,
-          },
-        };
+        messages[messageIndex] = stageRetryPatch(msg, stage);
         return { ...prev, messages };
       });
 

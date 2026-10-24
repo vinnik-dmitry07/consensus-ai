@@ -93,15 +93,19 @@
   font-weight: 600;
 }
 
-.tab-failed {
-  color: var(--error, #b91c1c);
-  border-color: #fecaca;
+.stage1-notes {
+  overflow-wrap: anywhere;
 }
 
-.tab-failed.active {
-  color: var(--error, #b91c1c);
-  border-color: #f87171;
-  border-bottom-color: var(--bg-primary);
+.stage1-notes p {
+  margin: 0 0 6px 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.stage1-notes p:last-child {
+  margin-bottom: 0;
 }
 
 .tab-content {

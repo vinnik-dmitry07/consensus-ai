@@ -329,12 +329,14 @@ def create_streaming_assistant_message(conversation_id: str) -> int:
         raise ValueError(f"Conversation {conversation_id} not found")
 
     message = {
-        "role": "assistant",
-        "stage1": [],
-        "stage1_failures": [],
-        "stage2": None,
-        "stage3": None,
-        "streaming": True  # Mark as in-progress
+        'role': 'assistant',
+        'stage1': [],
+        'stage1_failures': [],
+        'stage1_skipped': [],
+        'stage2': None,
+        'stage2_skipped': [],
+        'stage3': None,
+        'streaming': True,
     }
     conversation["messages"].append(message)
     save_conversation(conversation)
@@ -370,6 +372,20 @@ def append_stage1_failure(conversation_id: str, message_index: int, failure: Dic
     )
 
 
+def append_stage1_skipped(conversation_id: str, message_index: int, skipped: Dict[str, Any]):
+    """Append a Stage 1 skip as it happens."""
+    _append_message_list_item(
+        conversation_id, message_index, 'stage1_skipped', skipped
+    )
+
+
+def append_stage2_skipped(conversation_id: str, message_index: int, skipped: Dict[str, Any]):
+    """Append a Stage 2 skip as it happens."""
+    _append_message_list_item(
+        conversation_id, message_index, 'stage2_skipped', skipped
+    )
+
+
 def update_streaming_message(
     conversation_id: str,
     message_index: int,
@@ -382,6 +398,8 @@ def update_streaming_message(
     stage1_complete: bool = None,
     stage1_failures: Optional[List[Dict[str, Any]]] = None,
     stage2_failures: Optional[List[Dict[str, Any]]] = None,
+    stage1_skipped: Optional[List[Dict[str, Any]]] = None,
+    stage2_skipped: Optional[List[Dict[str, Any]]] = None,
 ):
     """
     Update a streaming assistant message with stage2/stage3 results.
@@ -389,6 +407,8 @@ def update_streaming_message(
     stage1/stage2/stage3/metadata use the UNSET sentinel: omitting one leaves
     the stored value alone, while passing None clears it. A retry that wipes a
     later stage must not leave the previous run's answer on the message.
+    Failure and skip lists stay unchanged when omitted. An empty list replaces
+    the stored list.
     """
     conversation = get_conversation(conversation_id)
     if conversation is None:
@@ -402,8 +422,12 @@ def update_streaming_message(
         message["stage1_complete"] = stage1_complete
     if stage1_failures is not None:
         message['stage1_failures'] = stage1_failures
+    if stage1_skipped is not None:
+        message['stage1_skipped'] = stage1_skipped
     if stage2_failures is not None:
         message['stage2_failures'] = stage2_failures
+    if stage2_skipped is not None:
+        message['stage2_skipped'] = stage2_skipped
     if stage2 is not UNSET:
         message["stage2"] = stage2
     if stage3 is not UNSET:

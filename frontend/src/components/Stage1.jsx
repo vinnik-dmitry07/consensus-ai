@@ -1,57 +1,66 @@
 import { useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { markdownComponents, remarkGfmPlugin } from '../markdownComponents';
+import { answerTabsFrom, pickAnswerTab, safeNoteReason, shortModelName } from '../stage1State.js';
 import CopyButton from './CopyButton';
 import './Stage1.css';
 
-export default function Stage1({ responses = [], progress, failures = [] }) {
-  const [activeTab, setActiveTab] = useState(null);
+function noteLine(kind, item) {
+  const name = shortModelName(item?.model);
+  const reason = safeNoteReason(kind, item?.error?.message);
+  const label = kind === 'skip' ? 'Skipped' : 'Failed';
+  if (!reason) return `${label}: ${name}`;
+  return `${label}: ${name} — ${reason}`;
+}
 
-  const tabs = [
-    ...responses.map((resp, index) => ({
-      key: `ok-${index}`,
-      kind: 'ok',
-      model: resp.model,
-      response: resp.response,
-    })),
-    ...failures.map((failure, index) => ({
-      key: `fail-${index}`,
-      kind: 'fail',
-      model: failure.model,
-      error: failure.error || {},
-    })),
-  ];
-
-  const countByModel = {};
-  for (const tab of tabs) {
-    countByModel[tab.model] = (countByModel[tab.model] || 0) + 1;
+export default function Stage1({
+  responses = [],
+  progress,
+  failures = [],
+  skipped = [],
+  isRunning = false,
+}) {
+  const [selectedSource, setSelectedSource] = useState(null);
+  const [seenRunning, setSeenRunning] = useState(isRunning);
+  if (isRunning !== seenRunning) {
+    setSeenRunning(isRunning);
+    if (isRunning) setSelectedSource(null);
   }
-  const seenByModel = {};
 
-  const isStreaming = !!progress;
-  const latestIndex = Math.max(tabs.length - 1, 0);
-  const safeIndex = activeTab === null
-    ? latestIndex
-    : Math.min(activeTab, latestIndex);
-  const active = tabs[safeIndex];
+  const answerTabs = answerTabsFrom(responses);
+  const active = pickAnswerTab(answerTabs, selectedSource);
+  const showProgress = isRunning && progress != null;
+  const total = Number(progress?.total);
+  const completed = Number(progress?.completed);
+  const hasTotal = Number.isFinite(total) && total > 0;
+  const progressText = hasTotal ? `${answerTabs.length}/${total} responses` : '0 responses';
+  const progressPct = hasTotal && Number.isFinite(completed)
+    ? Math.min(100, Math.max(0, (completed / total) * 100))
+    : 0;
+  const counts = new Map();
+  for (const tab of answerTabs) {
+    const key = typeof tab.model === 'string' ? tab.model : '';
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  const seen = new Map();
 
   return (
     <div className='stage stage1'>
       <h3 className='stage-title'>
         Stage 1: Individual Responses
-        {isStreaming && (
+        {showProgress && (
           <span className='progress-indicator'>
             <span className='progress-spinner'></span>
-            {progress.completed}/{progress.total}
+            {progressText}
           </span>
         )}
       </h3>
 
-      {isStreaming && (
+      {showProgress && (
         <div className='progress-bar-container'>
           <div
             className='progress-bar'
-            style={{ width: `${(progress.completed / progress.total) * 100}%` }}
+            style={{ width: `${progressPct}%` }}
           />
         </div>
       )}
@@ -59,21 +68,21 @@ export default function Stage1({ responses = [], progress, failures = [] }) {
       {active ? (
         <>
           <div className='tabs'>
-            {tabs.map((tab, index) => {
-              const modelName = tab.model.split('/')[1] || tab.model;
-              seenByModel[tab.model] = (seenByModel[tab.model] || 0) + 1;
-              const currentModelIndex = seenByModel[tab.model];
-              const sameModelCount = countByModel[tab.model];
-
+            {answerTabs.map((tab) => {
+              const key = typeof tab.model === 'string' ? tab.model : '';
+              const sampleNumber = (seen.get(key) || 0) + 1;
+              seen.set(key, sampleNumber);
+              const sameModelCount = counts.get(key) || 0;
+              const isActive = active.sourceIndex === tab.sourceIndex;
               return (
                 <button
-                  key={tab.key}
-                  className={`tab ${safeIndex === index ? 'active' : ''} ${tab.kind === 'fail' ? 'tab-failed' : ''}`}
-                  onClick={() => setActiveTab(index)}
+                  key={`answer-${tab.sourceIndex}`}
+                  type='button'
+                  className={`tab${isActive ? ' active' : ''}`}
+                  onClick={() => setSelectedSource(tab.sourceIndex)}
                 >
-                  {modelName}
-                  {sameModelCount > 1 && ` #${currentModelIndex}`}
-                  {tab.kind === 'fail' && ' (failed)'}
+                  {shortModelName(tab.model)}
+                  {sameModelCount > 1 ? ` #${sampleNumber}` : ''}
                 </button>
               );
             })}
@@ -81,33 +90,32 @@ export default function Stage1({ responses = [], progress, failures = [] }) {
 
           <div className='tab-content'>
             <div className='model-name'>{active.model}</div>
-            {active.kind === 'fail' ? (
-              <div className='stage-error'>
-                <div className='error-details'>
-                  <strong>{active.error.message || 'Request failed'}</strong>
-                  {active.error.detail
-                    && !String(active.error.message || '').includes(String(active.error.detail)) && (
-                    <p>{active.error.detail}</p>
-                  )}
-                </div>
-              </div>
-            ) : (
-              <>
-                <div className='response-text markdown-content'>
-                  <ReactMarkdown remarkPlugins={[remarkGfmPlugin]} components={markdownComponents}>
-                    {active.response}
-                  </ReactMarkdown>
-                </div>
-                <div className='copy-row'>
-                  <CopyButton text={active.response} label='Copy response' />
-                </div>
-              </>
-            )}
+            <div className='response-text markdown-content'>
+              <ReactMarkdown remarkPlugins={[remarkGfmPlugin]} components={markdownComponents}>
+                {active.response}
+              </ReactMarkdown>
+            </div>
+            <div className='copy-row'>
+              <CopyButton text={active.response} label='Copy response' />
+            </div>
           </div>
         </>
-      ) : isStreaming ? (
+      ) : isRunning ? (
         <div className='waiting-message'>Waiting for first response...</div>
-      ) : null}
+      ) : (
+        <div className='waiting-message'>No successful responses</div>
+      )}
+
+      {(failures.length > 0 || skipped.length > 0) && (
+        <div className='stage-skipped stage1-notes'>
+          {failures.map((item, index) => (
+            <p key={`fail-${item?.model || 'model'}-${index}`}>{noteLine('fail', item)}</p>
+          ))}
+          {skipped.map((item, index) => (
+            <p key={`skip-${item?.model || 'model'}-${index}`}>{noteLine('skip', item)}</p>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

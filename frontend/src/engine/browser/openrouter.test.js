@@ -27,7 +27,7 @@ import {
   resolveMaxTokens,
   unknownCatalogueIds,
 } from './openrouter.js';
-import { readBlockedIds } from './roster.js';
+import { clearModelCooldowns, modelIsCooling, readBlockedIds } from './roster.js';
 import { settings } from './settings.js';
 
 function jsonResponse(status, body, headers = {}) {
@@ -365,6 +365,7 @@ describe('queryModelResult', () => {
     ]);
     expect(first.ok).toBe(false);
     expect(first.skipped).toBe(true);
+    expect(first.error.message).toBe('Only available on agentic harnesses');
     expect(second.skipped).toBe(true);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(readBlockedIds().has('thinkingmachines/inkling:free')).toBe(true);
@@ -394,7 +395,9 @@ describe('queryModelResult', () => {
     const first = await queryModelResult('google/gemma-4-31b-it:free', messages);
     const second = await queryModelResult('google/gemma-4-31b-it:free-reasoning-high', messages);
     expect(first.skipped).toBe(true);
+    expect(first.error.message).toBe('Temporarily rate-limited upstream');
     expect(second.skipped).toBe(true);
+    expect(second.error.message).toBe('Temporarily unavailable (cooldown)');
     expect(calls).toBe(1);
     await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
     const third = await queryModelResult('google/gemma-4-31b-it:free', messages);
@@ -423,6 +426,36 @@ describe('queryModelResult', () => {
     const result = await pending;
     expect(result.ok).toBe(true);
     expect(calls).toBe(2);
+    expect(modelIsCooling('a/one:free')).toBe(false);
+  });
+
+  it('cools a generic provider 429 without calling it an upstream limit', async () => {
+    useFreeClock();
+    clearModelCooldowns();
+    settings.apiKey = 'sk-test';
+    let calls = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        return jsonResponse(429, {
+          error: { message: 'Provider returned error' },
+        });
+      }
+      return jsonResponse(200, { choices: [{ message: { content: 'ok' } }] });
+    }));
+    const messages = [{ role: 'user', content: 'q' }];
+    const first = await queryModelResult('vendor/generic:free', messages);
+    const second = await queryModelResult('vendor/generic:free', messages);
+    expect(first.skipped).toBe(true);
+    expect(first.error.message).toBe('Provider returned an error');
+    expect(second.skipped).toBe(true);
+    expect(second.error.message).toBe('Temporarily unavailable (cooldown)');
+    expect(calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000);
+    const third = await queryModelResult('vendor/generic:free', messages);
+    expect(third.ok).toBe(true);
+    expect(calls).toBe(2);
+    clearModelCooldowns();
   });
 
   it('starts free calls at least 3 seconds apart', async () => {

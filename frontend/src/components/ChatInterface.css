@@ -501,6 +501,14 @@
   border: 1px solid #fecaca;
 }
 
+.stage-skipped {
+  padding: 16px;
+  margin: 12px 0;
+  background: var(--bg-secondary, #f8fafc);
+  border-radius: 8px;
+  border: 1px solid var(--border-color);
+}
+
 .error-content {
   display: flex;
   align-items: flex-start;

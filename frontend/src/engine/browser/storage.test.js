@@ -131,6 +131,29 @@ describe('settings', () => {
     expect(stored.includes(FREE_TIER_API_KEY)).toBe(false);
   });
 
+  it('keeps a skip list when the update omits it and clears on an empty array', async () => {
+    const id = await seed();
+    const note = { model: 'a/skip', error: { message: 'Skipped' } };
+    await updateStreamingMessage(id, 1, {
+      stage1_skipped: [note],
+      stage2_skipped: [note],
+      streaming: false,
+    });
+    await updateStreamingMessage(id, 1, { streaming: true });
+    let message = (await getConversation(id)).messages[1];
+    expect(message.stage1_skipped).toEqual([note]);
+    expect(message.stage2_skipped).toEqual([note]);
+    await updateStreamingMessage(id, 1, {
+      stage1_skipped: [],
+      stage2_skipped: [],
+      streaming: false,
+    });
+    message = (await getConversation(id)).messages[1];
+    expect(message.stage1_skipped).toEqual([]);
+    expect(message.stage2_skipped).toEqual([]);
+    expect(message.stage1).toEqual([{ model: 'a', response: 'old answer' }]);
+  });
+
   it('does not clear the api key when the update is blank', () => {
     settings.apiKey = 'sk-keep';
     settings.updateFromDict({ api_key: '   ' });

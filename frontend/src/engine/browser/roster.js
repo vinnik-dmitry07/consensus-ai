@@ -9,7 +9,7 @@ import { notifySettingsChanged, sameStringList, settings } from './settings.js';
 const BLOCKED_KEY = 'llm-council-blocked-models';
 const COOLDOWN_KEY = 'llm-council-model-cooldowns';
 const HARNESS_ONLY = 'only available on agentic harnesses';
-const UPSTREAM_LIMIT = 'temporarily rate-limited upstream';
+export const UPSTREAM_LIMIT = 'temporarily rate-limited upstream';
 const PROVIDER_RETURNED = 'provider returned error';
 export const MODEL_COOLDOWN_MS = 10 * 60 * 1000;
 export const MODEL_COOLDOWN_MAX_MS = 60 * 60 * 1000;

@@ -26,7 +26,12 @@ from backend.openrouter import (
     query_model_result,
     resolve_max_tokens,
 )
-from backend.roster import FREE_START_GAP_SECONDS, blocked_ids
+from backend.roster import (
+    FREE_START_GAP_SECONDS,
+    blocked_ids,
+    model_is_cooling,
+    reset_free_queue_for_tests,
+)
 from backend.settings import settings
 
 
@@ -437,6 +442,10 @@ class QueryModelResultTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertFalse(first['ok'])
             self.assertTrue(first.get('skipped'))
+            self.assertEqual(
+                first['error']['message'],
+                'Only available on agentic harnesses',
+            )
             self.assertTrue(second.get('skipped'))
             self.assertEqual(calls['n'], 1)
             self.assertIn('thinkingmachines/inkling:free', blocked_ids())
@@ -490,12 +499,66 @@ class QueryModelResultTests(unittest.IsolatedAsyncioTestCase):
                 'google/gemma-4-31b-it:free-reasoning-high', messages
             )
             self.assertTrue(first.get('skipped'))
+            self.assertEqual(
+                first['error']['message'],
+                'Temporarily rate-limited upstream',
+            )
             self.assertTrue(second.get('skipped'))
+            self.assertEqual(
+                second['error']['message'],
+                'Temporarily unavailable (cooldown)',
+            )
             self.assertEqual(calls['n'], 1)
             clock.now += 600
             third = await query_model_result('google/gemma-4-31b-it:free', messages)
         self.assertTrue(third['ok'])
         self.assertEqual(calls['n'], 2)
+
+    async def test_generic_provider_429_does_not_claim_an_upstream_limit(self):
+        clock = _MonoClock()
+        calls = {'n': 0}
+        reset_free_queue_for_tests()
+
+        def handler(*args, **kwargs):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                return _response(429, {
+                    'error': {'message': 'Provider returned error'},
+                })
+            return _response(200, {
+                'choices': [{'message': {'content': 'ok'}}],
+                'usage': {},
+            })
+
+        messages = [{'role': 'user', 'content': 'q'}]
+        try:
+            with (
+                patch('backend.openrouter.get_api_key', return_value='sk-test'),
+                patch(
+                    'backend.openrouter.httpx.AsyncClient',
+                    return_value=_fake_client(handler),
+                ),
+                patch('backend.roster.time.monotonic', new=clock.monotonic),
+                patch('backend.roster.asyncio.sleep', new=clock.sleep),
+            ):
+                first = await query_model_result('vendor/generic:free', messages)
+                second = await query_model_result('vendor/generic:free', messages)
+                self.assertTrue(first.get('skipped'))
+                self.assertEqual(
+                    first['error']['message'], 'Provider returned an error',
+                )
+                self.assertTrue(second.get('skipped'))
+                self.assertEqual(
+                    second['error']['message'],
+                    'Temporarily unavailable (cooldown)',
+                )
+                self.assertEqual(calls['n'], 1)
+                clock.now += 600
+                third = await query_model_result('vendor/generic:free', messages)
+            self.assertTrue(third['ok'])
+            self.assertEqual(calls['n'], 2)
+        finally:
+            reset_free_queue_for_tests()
 
     async def test_provider_text_with_free_minute_still_retries(self):
         clock = _MonoClock()
@@ -528,6 +591,7 @@ class QueryModelResultTests(unittest.IsolatedAsyncioTestCase):
             patch('backend.roster.asyncio.sleep', new=clock.sleep),
         ):
             result = await query_model_result('a/one:free', messages)
+            self.assertFalse(model_is_cooling('a/one:free'))
         self.assertTrue(result['ok'])
         self.assertEqual(calls['n'], 2)
 

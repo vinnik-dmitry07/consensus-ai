@@ -183,6 +183,18 @@ export async function removeConversation(conversationId) {
   });
 }
 
+function streamingAssistantMessage() {
+  return {
+    role: 'assistant',
+    stage1: [],
+    stage1_failures: [],
+    stage1_skipped: [],
+    stage2: null,
+    stage3: null,
+    streaming: true,
+  };
+}
+
 export async function addUserTurn(
   conversationId,
   content,
@@ -196,28 +208,14 @@ export async function addUserTurn(
     if (files && files.length) message.files = files;
     if (followUpTo != null) message.follow_up_to = followUpTo;
     row.messages.push(message);
-    row.messages.push({
-      role: 'assistant',
-      stage1: [],
-      stage1_failures: [],
-      stage2: null,
-      stage3: null,
-      streaming: true,
-    });
+    row.messages.push(streamingAssistantMessage());
   });
   return conversation.messages.length - 1;
 }
 
 export async function createStreamingAssistantMessage(conversationId) {
   const conversation = await mutate(conversationId, (row) => {
-    row.messages.push({
-      role: 'assistant',
-      stage1: [],
-      stage1_failures: [],
-      stage2: null,
-      stage3: null,
-      streaming: true,
-    });
+    row.messages.push(streamingAssistantMessage());
   });
   return conversation.messages.length - 1;
 }
@@ -238,6 +236,14 @@ export function appendStage1Failure(conversationId, messageIndex, failure) {
   return appendMessageListItem(conversationId, messageIndex, 'stage1_failures', failure);
 }
 
+export function appendStage1Skipped(conversationId, messageIndex, failure) {
+  return appendMessageListItem(conversationId, messageIndex, 'stage1_skipped', failure);
+}
+
+export function appendStage2Skipped(conversationId, messageIndex, failure) {
+  return appendMessageListItem(conversationId, messageIndex, 'stage2_skipped', failure);
+}
+
 export async function updateStreamingMessage(conversationId, messageIndex, fields = {}) {
   const stage1 = 'stage1' in fields ? fields.stage1 : UNSET;
   const stage2 = 'stage2' in fields ? fields.stage2 : UNSET;
@@ -247,7 +253,9 @@ export async function updateStreamingMessage(conversationId, messageIndex, field
   const streaming = 'streaming' in fields ? fields.streaming : true;
   const stage1Complete = 'stage1_complete' in fields ? fields.stage1_complete : null;
   const stage1Failures = 'stage1_failures' in fields ? fields.stage1_failures : null;
+  const stage1Skipped = 'stage1_skipped' in fields ? fields.stage1_skipped : null;
   const stage2Failures = 'stage2_failures' in fields ? fields.stage2_failures : null;
+  const stage2Skipped = 'stage2_skipped' in fields ? fields.stage2_skipped : null;
 
   await mutate(conversationId, (conversation) => {
     const message = conversation.messages[messageIndex];
@@ -256,7 +264,9 @@ export async function updateStreamingMessage(conversationId, messageIndex, field
     if (stage1 !== UNSET) message.stage1 = stage1;
     if (stage1Complete != null) message.stage1_complete = stage1Complete;
     if (stage1Failures != null) message.stage1_failures = stage1Failures;
+    if (stage1Skipped != null) message.stage1_skipped = stage1Skipped;
     if (stage2Failures != null) message.stage2_failures = stage2Failures;
+    if (stage2Skipped != null) message.stage2_skipped = stage2Skipped;
     if (stage2 !== UNSET) message.stage2 = stage2;
     if (stage3 !== UNSET) message.stage3 = stage3;
     if (metadata !== UNSET) message.metadata = metadata;

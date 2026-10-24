@@ -307,21 +307,23 @@ async def _emit_stage1_sse(
 ):
     """Yield Stage 1 SSE lines and persist successes and failures as they land."""
     results: List[Dict[str, Any]] = []
-    failures: List[Dict[str, Any]] = []
+    failures: Optional[List[Dict[str, Any]]] = None
     council_models = list(settings.council_models)
     pending = pending_stage1_slots(
         council_models,
         stage1_sample_limit(council_models, settings.n_samples),
         existing_results,
     )
-    if existing_failures:
-        storage.update_streaming_message(
-            conversation_id,
-            msg_index,
-            stage1_failures=retained_stage1_failures(
-                existing_failures, pending, council_models
-            ),
-        )
+    retained = retained_stage1_failures(
+        existing_failures, pending, council_models
+    )
+    storage.update_streaming_message(
+        conversation_id,
+        msg_index,
+        stage1_failures=retained,
+        stage1_skipped=[],
+    )
+    collected['skipped'] = []
     async for event_type, event_data in stage1_collect_responses_streaming(
         user_message,
         existing_results=existing_results,
@@ -336,31 +338,48 @@ async def _emit_stage1_sse(
                 )
             yield f"data: {json.dumps({'type': 'stage1_model_complete', 'data': event_data})}\n\n"
         elif event_type == 'model_failed':
-            if not event_data.get('existing') and not event_data.get('skipped'):
-                storage.append_stage1_failure(conversation_id, msg_index, {
+            if not event_data.get('existing'):
+                entry = {
                     'model': event_data['model'],
                     'error': event_data.get('error'),
-                })
+                }
+                if event_data.get('skipped'):
+                    collected['skipped'].append(entry)
+                    storage.append_stage1_skipped(conversation_id, msg_index, entry)
+                else:
+                    storage.append_stage1_failure(conversation_id, msg_index, entry)
             yield f"data: {json.dumps({'type': 'stage1_model_failed', 'data': event_data})}\n\n"
         elif event_type == 'all_complete':
             results = event_data['results']
-            failures = event_data.get('failures') or []
+            if isinstance(event_data.get('failures'), list):
+                failures = event_data['failures']
+                collected['failures'] = failures
 
     collected['results'] = results
-    collected['failures'] = failures
     # Write back the full result set, not just the appended ones: a resume may
     # have dropped samples from models the council no longer contains, and the
     # stored Stage 1 must match what Stage 2 actually ranked.
-    storage.update_streaming_message(
-        conversation_id,
-        msg_index,
-        stage1=results,
-        stage1_complete=bool(results),
-        stage1_failures=failures,
-    )
+    final_fields = {
+        'stage1': results,
+        'stage1_complete': bool(results),
+        'stage1_skipped': collected['skipped'],
+    }
+    failures_known = isinstance(failures, list)
+    if failures_known:
+        final_fields['stage1_failures'] = failures
+    storage.update_streaming_message(conversation_id, msg_index, **final_fields)
     if not results:
-        raise Stage1AllFailed(failures)
-    yield f"data: {json.dumps({'type': 'stage1_complete', 'data': results, 'failures': failures})}\n\n"
+        if failures_known:
+            raise Stage1AllFailed(failures)
+        raise Exception('All models failed to respond in Stage 1')
+    payload = {
+        'type': 'stage1_complete',
+        'data': results,
+        'skipped': collected['skipped'],
+    }
+    if failures_known:
+        payload['failures'] = failures
+    yield f"data: {json.dumps(payload)}\n\n"
 
 
 def _stage2_fail_message(failures: List[Dict[str, Any]]) -> str:
@@ -383,9 +402,11 @@ async def _emit_stage2_sse(
     results: List[Dict[str, Any]] = []
     label_to_model: Dict[str, str] = {}
     failures: List[Dict[str, Any]] = []
-    collected['results'] = results
-    collected['label_to_model'] = label_to_model
-    collected['failures'] = failures
+    storage.update_streaming_message(
+        conversation_id, msg_index, stage2_skipped=[]
+    )
+    skipped: List[Dict[str, Any]] = []
+    collected['skipped'] = skipped
 
     async for event_type, event_data in stage2_collect_rankings_streaming(
         query_text, stage1_results
@@ -398,16 +419,25 @@ async def _emit_stage2_sse(
             if not event_data.get('skipped'):
                 failures.append(event_data)
                 collected['failures'] = failures
+            else:
+                entry = {
+                    'model': event_data.get('model'),
+                    'error': event_data.get('error'),
+                }
+                skipped.append(entry)
+                storage.append_stage2_skipped(conversation_id, msg_index, entry)
             yield f"data: {json.dumps({'type': 'stage2_model_failed', 'data': event_data})}\n\n"
         elif event_type == 'all_complete':
             results = event_data['results']
             label_to_model = event_data['label_to_model']
-            failures = event_data.get('failures') or failures
+            if isinstance(event_data.get('failures'), list):
+                failures = event_data['failures']
+                collected['failures'] = failures
             collected['results'] = results
             collected['label_to_model'] = label_to_model
-            collected['failures'] = failures
 
     if not results:
+        collected['failures'] = failures
         raise Exception(_stage2_fail_message(failures))
 
     storage.update_streaming_message(
@@ -415,9 +445,20 @@ async def _emit_stage2_sse(
         msg_index,
         stage2=results,
         stage2_failures=failures,
+        stage2_skipped=skipped,
         metadata={'label_to_model': label_to_model},
     )
-    yield f"data: {json.dumps({'type': 'stage2_complete', 'data': results, 'failures': failures, 'metadata': {'label_to_model': label_to_model}})}\n\n"
+    yield (
+        'data: '
+        + json.dumps({
+            'type': 'stage2_complete',
+            'data': results,
+            'failures': failures,
+            'skipped': skipped,
+            'metadata': {'label_to_model': label_to_model},
+        })
+        + '\n\n'
+    )
 
 
 def _settle_title_task(conversation_id: str, title_task: "asyncio.Task") -> None:
@@ -454,21 +495,63 @@ def _persist_generic_error(
     )
 
 
+def _known_list(collected: Dict[str, Any], key: str):
+    value = collected.get(key)
+    if isinstance(value, list):
+        return value
+    return None
+
+
+def _persist_stage1_error(
+    conversation_id: str,
+    msg_index: int,
+    exc: Exception,
+    collected: Dict[str, Any],
+) -> str:
+    message = str(exc)
+    failures = None
+    if isinstance(exc, Stage1AllFailed) and isinstance(exc.failures, list):
+        failures = exc.failures
+    else:
+        failures = _known_list(collected, 'failures')
+    skipped = _known_list(collected, 'skipped')
+    fields = {
+        'error': {'stage': 1, 'message': message},
+        'streaming': False,
+    }
+    payload = {'type': 'stage1_error', 'stage': 1, 'message': message}
+    if failures is not None:
+        fields['stage1_failures'] = failures
+        payload['failures'] = failures
+    if skipped is not None:
+        fields['stage1_skipped'] = skipped
+        payload['skipped'] = skipped
+    storage.update_streaming_message(conversation_id, msg_index, **fields)
+    return f"data: {json.dumps(payload)}\n\n"
+
+
 def _persist_stage2_error(
     conversation_id: str,
     msg_index: int,
     exc: Exception,
     collected: Dict[str, Any],
 ) -> str:
-    failures = collected.get('failures') or []
-    storage.update_streaming_message(
-        conversation_id,
-        msg_index,
-        error={'stage': 2, 'message': str(exc)},
-        stage2_failures=failures,
-        streaming=False,
-    )
-    return f"data: {json.dumps({'type': 'stage2_error', 'stage': 2, 'message': str(exc), 'failures': failures})}\n\n"
+    message = str(exc)
+    failures = _known_list(collected, 'failures')
+    skipped = _known_list(collected, 'skipped')
+    fields = {
+        'error': {'stage': 2, 'message': message},
+        'streaming': False,
+    }
+    payload = {'type': 'stage2_error', 'stage': 2, 'message': message}
+    if failures is not None:
+        fields['stage2_failures'] = failures
+        payload['failures'] = failures
+    if skipped is not None:
+        fields['stage2_skipped'] = skipped
+        payload['skipped'] = skipped
+    storage.update_streaming_message(conversation_id, msg_index, **fields)
+    return f"data: {json.dumps(payload)}\n\n"
 
 
 @app.get("/")
@@ -821,18 +904,9 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                     yield chunk
                 stage1_results = collected['results']
             except Exception as e:
-                failures = []
-                if isinstance(e, Stage1AllFailed):
-                    failures = e.failures
-                elif collected.get('failures'):
-                    failures = collected['failures']
-                storage.update_streaming_message(
-                    conversation_id, msg_index,
-                    error={'stage': 1, 'message': str(e)},
-                    stage1_failures=failures,
-                    streaming=False
+                yield _persist_stage1_error(
+                    conversation_id, msg_index, e, collected
                 )
-                yield f"data: {json.dumps({'type': 'stage1_error', 'stage': 1, 'message': str(e), 'failures': failures})}\n\n"
                 return
 
             # Stage 2: Collect rankings with streaming progress
@@ -961,7 +1035,7 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
     
     # Get existing stage1 results for resume
     existing_stage1 = messages[msg_index].get("stage1") or []
-    existing_failures = messages[msg_index].get('stage1_failures') or []
+    existing_failures = messages[msg_index].get('stage1_failures')
 
     async def event_generator():
         stage1_results = None
@@ -979,7 +1053,7 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
             storage.update_streaming_message(
                 conversation_id, msg_index,
                 stage2=None, stage3=None, metadata=None, streaming=True,
-                stage1_complete=False, stage2_failures=[],
+                stage1_complete=False, stage2_failures=[], stage2_skipped=[],
             )
 
             # Stage 1: Collect responses with streaming progress (resume from existing)
@@ -997,18 +1071,9 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
                     yield chunk
                 stage1_results = collected['results']
             except Exception as e:
-                failures = []
-                if isinstance(e, Stage1AllFailed):
-                    failures = e.failures
-                elif collected.get('failures'):
-                    failures = collected['failures']
-                storage.update_streaming_message(
-                    conversation_id, msg_index,
-                    error={'stage': 1, 'message': str(e)},
-                    stage1_failures=failures,
-                    streaming=False
+                yield _persist_stage1_error(
+                    conversation_id, msg_index, e, collected
                 )
-                yield f"data: {json.dumps({'type': 'stage1_error', 'stage': 1, 'message': str(e), 'failures': failures})}\n\n"
                 return
 
             current_stage = 2
@@ -1115,7 +1180,7 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
             storage.update_streaming_message(
                 conversation_id, msg_index,
                 stage2=None, stage3=None, metadata=None,
-                streaming=True, stage2_failures=[],
+                streaming=True, stage2_failures=[], stage2_skipped=[],
             )
 
             yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
