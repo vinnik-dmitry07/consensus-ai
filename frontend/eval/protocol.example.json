@@ -1,0 +1,32 @@
+{
+  "example": true,
+  "frozen": false,
+  "protocolHash": "<sha256 of protocol.js document>",
+  "devSelected": true,
+  "label": "dev-selected",
+  "councilModels": [
+    "vendor-a/model:free",
+    "vendor-b/model:free",
+    "vendor-c/model:free",
+    "vendor-d/model:free",
+    "vendor-e/model:free"
+  ],
+  "chairmanModel": "vendor-a/model:free-reasoning-high",
+  "bModel": "vendor-a/model:free",
+  "a0AliasesA1": false,
+  "councilSize": 5,
+  "tieBreak": ["accuracy", "completion", "latency", "configId"],
+  "totalCap": 3053,
+  "nominal": {
+    "A0": 1,
+    "A1": 1,
+    "A2": 5,
+    "A3": 6,
+    "A4": 5,
+    "A5": 10,
+    "A6": 12,
+    "A7": 11,
+    "note": "Counts assume five council models and no retries. A0 is omitted when it is the same call as A1."
+  },
+  "note": "This file is a shape example. It is not a frozen roster and it does not authorize a test run."
+}

@@ -11,7 +11,6 @@ import {
   readBlockedIds,
   RosterEmpty,
   selectedCatalogueIds,
-  rosterRequiresUserKey,
   stage1SampleLimit,
   storePrunedRoster,
 } from './roster.js';
@@ -31,13 +30,7 @@ export const API_KEY_REQUIRED = 'Add an OpenRouter API key in Settings before ru
 
 function requireApiKey() {
   if (settings.hasApiKey) return;
-  if (rosterRequiresUserKey(
-    settings.councilModels,
-    settings.chairmanModel,
-    settings.redTeamModel,
-  )) {
-    throw new Error(API_KEY_REQUIRED);
-  }
+  throw new Error(API_KEY_REQUIRED);
 }
 
 export function modelsFromPricing(pricing) {

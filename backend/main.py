@@ -39,7 +39,6 @@ from .roster import (
     RosterEmpty,
     _selected_catalogue_ids,
     ensure_servable_roster,
-    roster_requires_user_key,
     stage1_sample_limit,
 )
 from .settings import settings
@@ -58,15 +57,10 @@ async def _require_servable_roster():
 
 
 def _require_api_key():
-    """Refuse a paid roster before it writes anything when no personal key is set."""
+    """Refuse every roster before it writes anything when no personal key is set."""
     if settings.has_api_key:
         return
-    if roster_requires_user_key(
-        settings.council_models,
-        settings.chairman_model,
-        settings.red_team_model,
-    ):
-        raise HTTPException(status_code=400, detail=API_KEY_REQUIRED)
+    raise HTTPException(status_code=400, detail=API_KEY_REQUIRED)
 
 
 # Enable CORS for local development

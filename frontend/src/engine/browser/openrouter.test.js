@@ -8,7 +8,6 @@ import {
   HEADER_WAIT_SECONDS,
   IDLE_WAIT_SECONDS,
   STREAM_TOTAL_SECONDS,
-  FREE_TIER_API_KEY,
   getCredits,
   getKeyInfo,
   getModelsPricing,
@@ -935,7 +934,6 @@ describe('credits', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     for (const call of fetchMock.mock.calls) {
       expect(usesBearer(call[1], 'sk-user-test')).toBe(true);
-      expect(usesBearer(call[1], FREE_TIER_API_KEY)).toBe(false);
     }
   });
 });
@@ -959,22 +957,26 @@ describe('completion key routing', () => {
     'vendor/model:free',
     'vendor/model:free-reasoning',
     'vendor/model:free-reasoning-high',
-  ])('sends the free key for %s with or without a personal key', async (model) => {
+  ])('sends the personal key for %s and does not post without one', async (model) => {
     resetFreeQueueForTests();
-    for (const personal of [null, 'sk-user-test']) {
-      resetFreeQueueForTests();
-      if (personal) settings.apiKey = personal;
-      else settings.clearApiKey();
-      const fetchMock = vi.fn(async () => okCompletion());
-      vi.stubGlobal('fetch', fetchMock);
-      const result = await queryModelResult(model, [{ role: 'user', content: 'q' }]);
-      expect(result.ok).toBe(true);
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      const init = fetchMock.mock.calls[0][1];
-      expect(usesBearer(init, FREE_TIER_API_KEY)).toBe(true);
-      if (personal) expect(usesBearer(init, personal)).toBe(false);
-      expect(JSON.parse(init.body).model.endsWith(':free')).toBe(true);
-    }
+    settings.clearApiKey();
+    const missing = vi.fn();
+    vi.stubGlobal('fetch', missing);
+    const refused = await queryModelResult(model, [{ role: 'user', content: 'q' }]);
+    expect(refused.ok).toBe(false);
+    expect(refused.error.message).toBe('No API key configured');
+    expect(missing).not.toHaveBeenCalled();
+
+    resetFreeQueueForTests();
+    settings.apiKey = 'sk-user-test';
+    const fetchMock = vi.fn(async () => okCompletion());
+    vi.stubGlobal('fetch', fetchMock);
+    const result = await queryModelResult(model, [{ role: 'user', content: 'q' }]);
+    expect(result.ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const init = fetchMock.mock.calls[0][1];
+    expect(usesBearer(init, 'sk-user-test')).toBe(true);
+    expect(JSON.parse(init.body).model.endsWith(':free')).toBe(true);
   });
 
   it('sends only the personal key for a paid id, alias, or :free-extra', async () => {
@@ -986,7 +988,6 @@ describe('completion key routing', () => {
       expect(result.ok).toBe(true);
       const init = fetchMock.mock.calls[0][1];
       expect(usesBearer(init, 'sk-user-test')).toBe(true);
-      expect(usesBearer(init, FREE_TIER_API_KEY)).toBe(false);
     }
   });
 
@@ -1000,7 +1001,7 @@ describe('completion key routing', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('retries a free 429 only with the free key', async () => {
+  it('retries a free 429 only with the personal key', async () => {
     useFreeClock();
     resetFreeQueueForTests();
     settings.apiKey = 'sk-user-test';
@@ -1008,7 +1009,7 @@ describe('completion key routing', () => {
     let calls = 0;
     vi.stubGlobal('fetch', vi.fn(async (_url, init) => {
       calls += 1;
-      bearers.push(usesBearer(init, FREE_TIER_API_KEY));
+      bearers.push(usesBearer(init, 'sk-user-test'));
       if (calls === 1) {
         return jsonResponse(429, {
           error: { message: 'Rate limit exceeded: free-models-per-min' },
@@ -1025,7 +1026,7 @@ describe('completion key routing', () => {
     expect(bearers.every(Boolean)).toBe(true);
   });
 
-  it('does not switch a paid failure onto the free key', async () => {
+  it('does not switch a paid failure onto another key', async () => {
     settings.apiKey = 'sk-user-test';
     const fetchMock = vi.fn(async () => jsonResponse(402, {
       error: { message: 'This request requires more credits' },
@@ -1035,7 +1036,6 @@ describe('completion key routing', () => {
     expect(result.ok).toBe(false);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(usesBearer(fetchMock.mock.calls[0][1], 'sk-user-test')).toBe(true);
-    expect(usesBearer(fetchMock.mock.calls[0][1], FREE_TIER_API_KEY)).toBe(false);
   });
 
   it('does not post when a paid model has no personal key and then fails', async () => {
@@ -1419,6 +1419,7 @@ describe('completion stream contract', () => {
 
   it('cancels an in-flight read and releases the free queue', async () => {
     useFreeClock();
+    settings.apiKey = 'sk-test';
     const messages = userMessage;
     const starts = [];
     vi.stubGlobal('fetch', vi.fn((_url, init) => {

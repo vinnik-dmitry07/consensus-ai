@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .config import TITLE_MODEL
 from .openrouter import (
-    key_for_model,
+    get_api_key,
     model_family,
     query_model,
     query_model_result,
@@ -1252,7 +1252,7 @@ Question: {user_query}
 
 Title:'''
 
-    if not key_for_model(TITLE_MODEL):
+    if not get_api_key():
         return 'New Conversation'
 
     messages = [{'role': 'user', 'content': title_prompt}]

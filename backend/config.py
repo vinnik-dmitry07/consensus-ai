@@ -6,11 +6,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# OpenRouter API key
+# OpenRouter API key. Free and paid model ids both use this personal key.
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-
-# $0-limit key for :free completions only. Paid calls must not send it.
-FREE_TIER_API_KEY = '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'
 
 # Council members - list of OpenRouter model identifiers
 # ~*-latest aliases always resolve to the newest model in each family

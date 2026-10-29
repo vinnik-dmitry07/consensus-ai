@@ -8,20 +8,16 @@ import {
   pruneRoster,
   rankTopFreeModels,
   rememberModelCooldown,
-  rosterRequiresUserKey,
   runAllowedBySettings,
   stage1SampleLimit,
   storePrunedRoster,
 } from './roster.js';
 import {
-  DEFAULT_CHAIRMAN_MODEL,
-  DEFAULT_COUNCIL_MODELS,
-  DEFAULT_RED_TEAM_MODEL,
   resetSettingsState,
   SETTINGS_CHANGED_EVENT,
   STORAGE_KEY,
+  settings,
 } from './settings.js';
-import { settings } from './settings.js';
 
 describe('pruneRoster', () => {
   it('drops a delisted model and keeps the chairman reasoning suffix', () => {
@@ -335,51 +331,17 @@ describe('dropBlockedModel', () => {
   });
 });
 
-describe('rosterRequiresUserKey', () => {
+describe('personal key gate', () => {
   const free = ['a/one:free', 'b/two:free'];
-
-  it.each([
-    [free, 'a/one:free', null, false],
-    [free, 'a/one:free', 'b/two:free-reasoning-high', false],
-    [['a/one:free', 'openai/gpt-4.1'], 'a/one:free', null, true],
-    [free, 'openai/gpt-4.1', null, true],
-    [free, 'a/one:free', 'openai/gpt-4.1', true],
-    [[], 'a/one:free', null, true],
-    [null, 'a/one:free', null, true],
-    [free, '', null, true],
-    [free, null, null, true],
-    [DEFAULT_COUNCIL_MODELS, DEFAULT_CHAIRMAN_MODEL, DEFAULT_RED_TEAM_MODEL, true],
-    [['vendor/name:free-extra'], 'vendor/name:free-extra', null, true],
-    [['vendor/name:free-reasoning'], 'vendor/name:free-reasoning-high', null, false],
-  ])('council %j chairman %j red %j requires key %s', (council, chairman, redTeam, requires) => {
-    expect(rosterRequiresUserKey(council, chairman, redTeam)).toBe(requires);
-  });
 
   it('does not change the all-free sample cap when the chairman is paid', () => {
     expect(stage1SampleLimit(free, 3)).toBe(1);
-    expect(rosterRequiresUserKey(free, 'openai/gpt-4.1', null)).toBe(true);
   });
 
   it('treats an incomplete settings snapshot as not runnable', () => {
     expect(runAllowedBySettings(null)).toBe(false);
     expect(runAllowedBySettings({ has_api_key: false })).toBe(false);
-    expect(runAllowedBySettings({
-      has_api_key: false,
-      council_models: free,
-      chairman_model: 'a/one:free',
-    })).toBe(false);
-    expect(runAllowedBySettings({
-      has_api_key: true,
-      council_models: ['openai/gpt-4.1'],
-      chairman_model: 'openai/gpt-4.1',
-      red_team_model: null,
-    })).toBe(true);
-    expect(runAllowedBySettings({
-      has_api_key: false,
-      council_models: free,
-      chairman_model: 'a/one:free-reasoning-high',
-      red_team_model: null,
-    })).toBe(true);
+    expect(runAllowedBySettings({ has_api_key: true })).toBe(true);
   });
 });
 

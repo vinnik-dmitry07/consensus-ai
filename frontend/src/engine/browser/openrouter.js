@@ -20,8 +20,6 @@ import {
 } from './roster.js';
 import { settings } from './settings.js';
 
-export const FREE_TIER_API_KEY = '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';
-
 export const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
 export const OPENROUTER_CREDITS_URL = 'https://openrouter.ai/api/v1/credits';
 export const OPENROUTER_MODELS_URL = 'https://openrouter.ai/api/v1/models';
@@ -107,9 +105,28 @@ export function getApiKey() {
   return settings.apiKey;
 }
 
-export function keyForModel(model) {
-  if (isFreeModel(model)) return FREE_TIER_API_KEY;
-  return getApiKey();
+let queryHook = null;
+
+export function setQueryHook(hook) {
+  queryHook = typeof hook === 'function' ? hook : null;
+}
+
+export function canonicalCompletionRequest(model, messages, options = {}) {
+  const baseModel = catalogueModelId(model);
+  const isAnthropic = modelFamily(model) === 'anthropic';
+  const payload = {
+    model: baseModel,
+    messages,
+    max_tokens: resolveMaxTokens(model, options.maxTokens),
+    stream: true,
+    stream_options: { include_usage: true },
+  };
+  if (String(model).endsWith('-reasoning-high')) {
+    payload.reasoning = { effort: isAnthropic ? 'xhigh' : 'high' };
+  } else if (String(model).endsWith('-reasoning')) {
+    payload.reasoning = { effort: 'high' };
+  }
+  return payload;
 }
 
 function invalidateModelsCache() {
@@ -771,10 +788,9 @@ function jsonCompletion(text) {
 
 async function queryModelAttempts(model, messages, options) {
   const timeout = options.timeout ?? 120;
-  const maxTokens = options.maxTokens ?? null;
   const signal = options.signal ?? null;
 
-  const apiKey = keyForModel(model);
+  const apiKey = getApiKey();
   if (!apiKey) {
     console.error(`Error querying model ${model}: No API key configured`);
     return failResult('No API key configured');
@@ -787,22 +803,11 @@ async function queryModelAttempts(model, messages, options) {
     'X-Title': APP_TITLE,
   };
 
-  const baseModel = catalogueModelId(model);
-  const isAnthropic = modelFamily(model) === 'anthropic';
-  const payload = {
-    model: baseModel,
-    messages,
-    max_tokens: resolveMaxTokens(model, maxTokens),
-    stream: true,
-    stream_options: { include_usage: true },
-  };
-  if (String(model).endsWith('-reasoning-high')) {
-    payload.reasoning = { effort: isAnthropic ? 'xhigh' : 'high' };
-  } else if (String(model).endsWith('-reasoning')) {
-    payload.reasoning = { effort: 'high' };
-  }
-
-  const maxRetries = 5;
+  const payload = canonicalCompletionRequest(model, messages, options);
+  const requestedRetries = Number(options.maxRetries);
+  const maxRetries = Number.isInteger(requestedRetries) && requestedRetries > 0
+    ? requestedRetries
+    : 5;
   const free = isFreeModel(model);
   let extraWaitMs = 0;
   for (let attempt = 0; attempt < maxRetries; attempt += 1) {
@@ -923,13 +928,29 @@ async function runModelAttempt({
   }
 }
 
-export async function queryModelResult(model, messages, options = {}) {
+async function queryModelResultLive(model, messages, options = {}) {
   if (modelUnavailable(model)) {
     return skippedResult(skipMessage(skipReason(model)));
   }
   const run = () => queryModelAttempts(model, messages, options);
   if (isFreeModel(model)) return enqueueFree(run);
   return run();
+}
+
+export async function queryModelResult(model, messages, options = {}) {
+  if (queryHook) {
+    return queryHook({
+      model,
+      messages,
+      options,
+      execute: (overrides) => queryModelResultLive(
+        model,
+        messages,
+        { ...options, ...overrides },
+      ),
+    });
+  }
+  return queryModelResultLive(model, messages, options);
 }
 
 export async function queryModel(model, messages, options = {}) {

@@ -1,4 +1,4 @@
-"""Free-tier key routing and the personal-key run gate."""
+"""Personal-key routing and the run gate. Free and paid ids share that key."""
 
 import copy
 import unittest
@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
-from backend import openrouter, storage
+from backend import storage
 from backend.config import (
     CHAIRMAN_MODEL,
     COUNCIL_MODELS,
@@ -24,7 +24,6 @@ from backend.openrouter import get_credits, get_key_info, query_model_result
 from backend.roster import (
     remember_model_cooldown,
     reset_free_queue_for_tests,
-    roster_requires_user_key,
     stage1_sample_limit,
 )
 from backend.settings import settings
@@ -47,42 +46,8 @@ def _ok_response():
 
 
 class RosterPolicyTests(unittest.TestCase):
-    def test_matrix(self):
-        free = ['a/one:free', 'b/two:free']
-        cases = (
-            (free, 'a/one:free', None, False),
-            (free, 'a/one:free', 'b/two:free-reasoning-high', False),
-            (['a/one:free', 'openai/gpt-4.1'], 'a/one:free', None, True),
-            (free, 'openai/gpt-4.1', None, True),
-            (free, 'a/one:free', 'openai/gpt-4.1', True),
-            ([], 'a/one:free', None, True),
-            (None, 'a/one:free', None, True),
-            (free, '', None, True),
-            (free, None, None, True),
-            (list(COUNCIL_MODELS), CHAIRMAN_MODEL, RED_TEAM_MODEL, True),
-            (['vendor/name:free-extra'], 'vendor/name:free-extra', None, True),
-            (
-                ['vendor/name:free-reasoning'],
-                'vendor/name:free-reasoning-high',
-                None,
-                False,
-            ),
-        )
-        for council, chairman, red_team, requires in cases:
-            self.assertEqual(
-                roster_requires_user_key(council, chairman, red_team),
-                requires,
-            )
-
     def test_paid_chairman_does_not_change_the_free_sample_cap(self):
         self.assertEqual(stage1_sample_limit(['a/one:free', 'b/two:free'], 3), 1)
-        self.assertTrue(
-            roster_requires_user_key(
-                ['a/one:free', 'b/two:free'],
-                'openai/gpt-4.1',
-                None,
-            )
-        )
 
 
 class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
@@ -110,32 +75,37 @@ class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
         ):
             return await query_model_result(model, [{'role': 'user', 'content': 'q'}])
 
-    async def test_free_models_use_the_shared_key(self):
-        free_key = openrouter.FREE_TIER_API_KEY
-        for personal in (None, 'sk-user'):
-            for model in (
-                'vendor/model:free',
-                'vendor/model:free-reasoning',
-                'vendor/model:free-reasoning-high',
-            ):
-                settings._api_key = personal
-                seen = []
+    async def test_free_models_use_the_personal_key(self):
+        for model in (
+            'vendor/model:free',
+            'vendor/model:free-reasoning',
+            'vendor/model:free-reasoning-high',
+        ):
+            settings._api_key = None
+            with patch('backend.openrouter.httpx.AsyncClient') as client:
+                refused = await query_model_result(
+                    model,
+                    [{'role': 'user', 'content': 'q'}],
+                )
+            self.assertFalse(refused['ok'])
+            self.assertEqual(refused['error']['message'], 'No API key configured')
+            client.assert_not_called()
 
-                def handler(*args, **kwargs):
-                    seen.append(kwargs)
-                    return _ok_response()
+            settings._api_key = 'sk-user'
+            seen = []
 
-                result = await self._post(model, handler)
-                self.assertTrue(result['ok'])
-                self.assertEqual(len(seen), 1)
-                self.assertTrue(_uses(seen[0]['headers'], free_key))
-                if personal:
-                    self.assertFalse(_uses(seen[0]['headers'], personal))
-                self.assertTrue(seen[0]['json']['model'].endswith(':free'))
+            def handler(*args, **kwargs):
+                seen.append(kwargs)
+                return _ok_response()
+
+            result = await self._post(model, handler)
+            self.assertTrue(result['ok'])
+            self.assertEqual(len(seen), 1)
+            self.assertTrue(_uses(seen[0]['headers'], 'sk-user'))
+            self.assertTrue(seen[0]['json']['model'].endswith(':free'))
 
     async def test_paid_models_use_only_the_personal_key(self):
         settings._api_key = 'sk-user'
-        free_key = openrouter.FREE_TIER_API_KEY
         for model, expected in (
             ('openai/gpt-4.1', 'openai/gpt-4.1'),
             ('~openai/gpt-sol-latest', '~openai/gpt-sol-latest'),
@@ -150,7 +120,6 @@ class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
             result = await self._post(model, handler)
             self.assertTrue(result['ok'])
             self.assertTrue(_uses(seen[-1]['headers'], 'sk-user'))
-            self.assertFalse(_uses(seen[-1]['headers'], free_key))
             self.assertEqual(seen[-1]['json']['model'], expected)
 
     async def test_paid_model_without_a_personal_key_does_not_post(self):
@@ -164,7 +133,7 @@ class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['error']['message'], 'No API key configured')
         client.assert_not_called()
 
-    async def test_free_retry_keeps_the_shared_key(self):
+    async def test_free_retry_keeps_the_personal_key(self):
         settings._api_key = 'sk-user'
         clock = _MonoClock()
         calls = []
@@ -188,8 +157,7 @@ class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertTrue(result['ok'])
         self.assertGreater(len(calls), 1)
-        free_key = openrouter.FREE_TIER_API_KEY
-        self.assertTrue(all(_uses(headers, free_key) for headers in calls))
+        self.assertTrue(all(_uses(headers, 'sk-user') for headers in calls))
 
     async def test_paid_failure_does_not_switch_keys(self):
         settings._api_key = 'sk-user'
@@ -205,7 +173,6 @@ class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result['ok'])
         self.assertEqual(len(calls), 1)
         self.assertTrue(_uses(calls[0], 'sk-user'))
-        self.assertFalse(_uses(calls[0], openrouter.FREE_TIER_API_KEY))
 
     async def test_credits_and_key_info_need_the_personal_key(self):
         settings._api_key = None
@@ -232,9 +199,6 @@ class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(credits['total_credits'], 1)
         self.assertEqual(len(seen), 2)
         self.assertTrue(all(_uses(headers, 'sk-user') for headers in seen))
-        self.assertTrue(
-            all(not _uses(headers, openrouter.FREE_TIER_API_KEY) for headers in seen)
-        )
 
     async def test_title_skips_the_client_without_a_personal_key(self):
         settings._api_key = None
@@ -259,7 +223,6 @@ class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(title, 'ok')
         self.assertEqual(len(seen), 1)
         self.assertTrue(_uses(seen[0]['headers'], 'sk-user'))
-        self.assertFalse(_uses(seen[0]['headers'], openrouter.FREE_TIER_API_KEY))
         self.assertEqual(seen[0]['json']['model'], 'google/gemini-2.5-flash')
 
     async def test_paid_historical_red_team_does_not_post(self):
@@ -300,8 +263,7 @@ class KeyRoutingTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(stage3['response'], 'ok')
         self.assertEqual(len(seen), 1)
-        self.assertTrue(_uses(seen[0]['headers'], openrouter.FREE_TIER_API_KEY))
-        self.assertFalse(_uses(seen[0]['headers'], 'sk-user'))
+        self.assertTrue(_uses(seen[0]['headers'], 'sk-user'))
         self.assertEqual(seen[0]['json']['model'], 'b/two:free')
 
 
@@ -345,8 +307,8 @@ class RunGateTests(unittest.TestCase):
         settings.n_samples = samples
         settings._api_key = key
 
-    def _free_roster(self):
-        settings._api_key = None
+    def _free_roster(self, api_key=None):
+        settings._api_key = api_key
         settings.council_models = ['a/one:free', 'b/two:free']
         settings.chairman_model = 'a/one:free'
         settings.red_team_model = None
@@ -388,52 +350,12 @@ class RunGateTests(unittest.TestCase):
             ),
         )
 
-    def test_settings_do_not_expose_the_free_key(self):
+    def test_settings_do_not_expose_a_shared_key(self):
         settings._api_key = None
         payload = settings.to_dict()
         self.assertFalse(payload['has_api_key'])
         self.assertIsNone(payload['masked_api_key'])
-        self.assertNotIn(openrouter.FREE_TIER_API_KEY, str(payload))
-
-    def test_roster_change_during_catalogue_load_is_refused(self):
-        self._free_roster()
-        before = copy.deepcopy(storage.get_conversation(self.conv_id))
-
-        async def flip_roster():
-            settings.chairman_model = 'openai/gpt-4.1'
-
-        client = TestClient(app)
-        calls = (
-            ('post', f'/api/conversations/{self.conv_id}/message', {'content': 'again'}),
-            (
-                'post',
-                f'/api/conversations/{self.conv_id}/message/stream',
-                {'content': 'again'},
-            ),
-            (
-                'post',
-                f'/api/conversations/{self.conv_id}/retry/stage1/stream',
-                {'message_index': 1},
-            ),
-            (
-                'post',
-                f'/api/conversations/{self.conv_id}/retry/stage2/stream',
-                {'message_index': 1},
-            ),
-            (
-                'post',
-                f'/api/conversations/{self.conv_id}/retry/stage3/stream',
-                {'message_index': 1},
-            ),
-        )
-        with patch('backend.main._require_servable_roster', new=flip_roster):
-            for method, path, body in calls:
-                settings._api_key = None
-                settings.chairman_model = 'a/one:free'
-                response = getattr(client, method)(path, json=body)
-                self.assertEqual(response.status_code, 400, response.text)
-                self.assertEqual(response.json()['detail'], API_KEY_REQUIRED)
-                self.assertEqual(storage.get_conversation(self.conv_id), before)
+        self.assertNotIn('sk-or-v1-', str(payload))
 
     def test_denied_endpoints_leave_the_conversation_unchanged(self):
         self._paid_roster()
@@ -471,7 +393,7 @@ class RunGateTests(unittest.TestCase):
             council.assert_not_called()
 
     def test_allowed_message_reaches_the_mocked_pipeline(self):
-        self._free_roster()
+        self._free_roster('sk-user')
         council = AsyncMock(return_value=(
             [{'model': 'a/one:free', 'response': 'yes'}],
             [{'model': 'b/two:free', 'ranking': '1. Response 1'}],
@@ -494,7 +416,7 @@ class RunGateTests(unittest.TestCase):
         self.assertEqual(stored['messages'][-1]['stage3']['response'], 'final')
 
     def test_allowed_streams_and_retries_reach_the_mocked_pipeline(self):
-        self._free_roster()
+        self._free_roster('sk-user')
         client = TestClient(app)
         paths = (
             (f'/api/conversations/{self.conv_id}/message/stream', {'content': 'again'}),

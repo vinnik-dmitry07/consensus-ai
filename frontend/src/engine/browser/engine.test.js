@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { API_KEY_REQUIRED, browserEngine, modelsFromPricing, pipeline } from './engine.js';
 import * as council from './council.js';
 import * as openrouter from './openrouter.js';
-import { FREE_TIER_API_KEY, resetFreeQueueForTests } from './openrouter.js';
+import { resetFreeQueueForTests } from './openrouter.js';
 import { composeFollowUpQuery } from './query.js';
 import {
   freeTierDefaultRoster,
@@ -563,30 +563,63 @@ describe('free roster without a personal key', () => {
     resetFreeQueueForTests();
   });
 
-  function useFreeRoster(redTeam = null) {
-    settings.clearApiKey();
+  function useFreeRoster(apiKey = 'sk-user-test') {
+    if (apiKey) settings.apiKey = apiKey;
+    else settings.clearApiKey();
     settings.councilModels = ['a/one:free', 'b/two:free'];
     settings.chairmanModel = 'a/one:free';
-    settings.redTeamModel = redTeam;
+    settings.redTeamModel = null;
     settings.nSamples = 1;
   }
 
-  it('sends and stores a turn, and does not call the paid title model', async () => {
+  it('sends and stores a free-roster turn with the personal key', async () => {
     useFreeRoster();
-    const query = answerAll();
+    answerAll();
+    const titles = vi.spyOn(openrouter, 'queryModel').mockResolvedValue({
+      content: 'paris',
+      usage: {},
+    });
     const created = await browserEngine.createConversation();
     const { events, onEvent } = collectEvents();
     await browserEngine.sendMessageStream(created.id, 'What is rain?', [], [], onEvent);
     expect(events.map((item) => item.type)).toContain('complete');
     const title = events.find((item) => item.type === 'title_complete');
-    expect(title.event.data.title).toBe('New Conversation');
+    expect(title.event.data.title).toBe('paris');
     const stored = await getConversation(created.id);
-    expect(stored.title).toBe('New Conversation');
+    expect(stored.title).toBe('paris');
     expect(stored.messages).toHaveLength(2);
     expect(stored.messages[1].stage3.response).toBe('final answer');
-    const prompts = query.mock.calls.map((call) => String(call[1]?.[0]?.content || ''));
-    expect(prompts.some((prompt) => prompt.startsWith('Generate a very short title'))).toBe(false);
-    expect(prompts.length).toBeGreaterThan(0);
+    expect(String(titles.mock.calls[0][1][0].content)).toMatch(/^Generate a very short title/);
+    expect(titles.mock.calls[0][0]).toBe('google/gemini-2.5-flash');
+  });
+
+  it('refuses a free roster when the personal key is missing', async () => {
+    useFreeRoster(null);
+    const query = vi.spyOn(openrouter, 'queryModelResult');
+    const created = await browserEngine.createConversation();
+    await expect(
+      browserEngine.sendMessageStream(created.id, 'What is rain?', [], [], () => {}),
+    ).rejects.toThrow(API_KEY_REQUIRED);
+    expect((await getConversation(created.id)).messages).toEqual([]);
+
+    const id = crypto.randomUUID();
+    await createConversation(id);
+    await addUserMessage(id, 'hello');
+    await addAssistantMessage(
+      id,
+      [
+        { model: 'a/one:free', response: 'one' },
+        { model: 'b/two:free', response: 'two' },
+      ],
+      [{ model: 'b/two:free', ranking: '1. Response 1' }],
+      finalAnswer('old'),
+    );
+    const before = await getConversation(id);
+    for (const stage of [1, 2, 3]) {
+      await expect(browserEngine.retryStage(id, stage, 1, () => {})).rejects.toThrow(API_KEY_REQUIRED);
+      expect(await getConversation(id)).toEqual(before);
+    }
+    expect(query).not.toHaveBeenCalled();
   });
 
   it.each([1, 2, 3])('retries stage %s on a free roster', async (stage) => {
@@ -616,59 +649,7 @@ describe('free roster without a personal key', () => {
     expect(stored.messages[1].stage3.response).toBe('final answer');
   });
 
-  it('refuses a roster that becomes paid while the catalogue loads', async () => {
-    useFreeRoster();
-    openrouter.getModelsPricing.mockImplementation(async () => {
-      settings.chairmanModel = 'openai/gpt-4.1';
-      return {
-        'a/one:free': { name: 'one' },
-        'b/two:free': { name: 'two' },
-        'openai/gpt-4.1': { name: 'gpt' },
-      };
-    });
-    const created = await browserEngine.createConversation();
-    await expect(
-      browserEngine.sendMessageStream(created.id, 'again', [], [], () => {}),
-    ).rejects.toThrow(API_KEY_REQUIRED);
-    expect((await getConversation(created.id)).messages).toEqual([]);
-
-    const id = crypto.randomUUID();
-    await createConversation(id);
-    await addUserMessage(id, 'hello');
-    await addAssistantMessage(
-      id,
-      [
-        { model: 'a/one:free', response: 'one' },
-        { model: 'b/two:free', response: 'two' },
-      ],
-      [{ model: 'b/two:free', ranking: '1. Response 1' }],
-      finalAnswer('old'),
-    );
-    const before = await getConversation(id);
-    for (const stage of [1, 2, 3]) {
-      settings.chairmanModel = 'a/one:free';
-      await expect(
-        browserEngine.retryStage(id, stage, 1, () => {}),
-      ).rejects.toThrow(API_KEY_REQUIRED);
-      expect(await getConversation(id)).toEqual(before);
-    }
-  });
-
-  it('leaves the conversation unchanged when a paid red team still requires a key', async () => {
-    useFreeRoster('openai/gpt-4.1');
-    const query = vi.spyOn(openrouter, 'queryModelResult');
-    const id = crypto.randomUUID();
-    await createConversation(id);
-    await addUserMessage(id, 'hello');
-    await addAssistantMessage(id, [{ model: 'a/one:free', response: 'one' }], [], finalAnswer('old'));
-    const before = await getConversation(id);
-    await expect(browserEngine.sendMessageStream(id, 'again', [], [], () => {})).rejects.toThrow(API_KEY_REQUIRED);
-    await expect(browserEngine.retryStage(id, 3, 1, () => {})).rejects.toThrow(API_KEY_REQUIRED);
-    expect(await getConversation(id)).toEqual(before);
-    expect(query).not.toHaveBeenCalled();
-  });
-
-  it('does not post the free key for a paid model remembered in an old ranking', async () => {
+  it('posts a remembered paid model with the personal key, not a shared key', async () => {
     useFreeRoster();
     resetFreeQueueForTests();
     const posts = [];
@@ -676,7 +657,7 @@ describe('free roster without a personal key', () => {
       const body = JSON.parse(init.body);
       posts.push({
         model: body.model,
-        freeKey: init.headers.Authorization === `Bearer ${FREE_TIER_API_KEY}`,
+        personalKey: init.headers.Authorization === 'Bearer sk-user-test',
       });
       return new Response(JSON.stringify({
         choices: [{ message: { content: 'ok\nVERDICT: UPHELD\nCONFIDENCE: 4' } }],
@@ -703,12 +684,12 @@ describe('free roster without a personal key', () => {
     const { events, onEvent } = collectEvents();
     await browserEngine.retryStage(id, 3, 1, onEvent);
     expect(events.map((item) => item.type)).toContain('complete');
-    expect(posts.some((post) => post.model === 'openai/gpt-4.1')).toBe(false);
+    expect(posts.some((post) => post.model === 'openai/gpt-4.1')).toBe(true);
     expect(posts.length).toBeGreaterThan(0);
-    expect(posts.every((post) => post.freeKey)).toBe(true);
+    expect(posts.every((post) => post.personalKey)).toBe(true);
     const stored = await getConversation(id);
     expect(stored.messages[1].metadata.red_team.model).toBe('openai/gpt-4.1');
-    expect(stored.messages[1].metadata.red_team.error.message).toBe('No API key configured');
+    expect(stored.messages[1].metadata.red_team.verdict).toBe('UPHELD');
   });
 });
 
@@ -754,7 +735,7 @@ describe('free tier default roster', () => {
     vi.restoreAllMocks();
   });
 
-  it('applies Top 10 Free on unset storage so a run needs no personal key', async () => {
+  it('applies Top 10 Free on unset storage and still requires a personal key', async () => {
     const expected = expectedFreeRoster();
     const saved = await browserEngine.getSettings();
     expect(openrouter.getModelsPricing).not.toHaveBeenCalled();
@@ -767,7 +748,7 @@ describe('free tier default roster', () => {
     expect(data.n_samples).toBe(1);
     const savedAfter = await browserEngine.getSettings();
     expect(savedAfter.has_api_key).toBe(false);
-    expect(runAllowedBySettings(savedAfter)).toBe(true);
+    expect(runAllowedBySettings(savedAfter)).toBe(false);
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY));
     expect(stored.use_free_tier_default).not.toBe(true);
     expect(stored.council_models).toEqual(expected.councilModels);
@@ -831,6 +812,7 @@ describe('free tier default roster', () => {
   });
 
   it('does not start send from the paid eight when the flag is unset', async () => {
+    settings.apiKey = 'sk-user-test';
     const expected = expectedFreeRoster();
     const queried = [];
     vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model) => {

@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { browserEngine } from './engine.js';
-import { FREE_TIER_API_KEY } from './openrouter.js';
 import * as openrouter from './openrouter.js';
 import { settings, STORAGE_KEY } from './settings.js';
 import {
@@ -121,14 +120,14 @@ describe('settings', () => {
     expect(settings.councilModels).toEqual(['test/alpha-100b:free', 'test/bravo-90b:free']);
   });
 
-  it('does not store the free-tier key as the personal key', () => {
+  it('does not store a shared key when the personal key is absent', () => {
     settings.clearApiKey();
     const snapshot = settings.toDict();
     const stored = localStorage.getItem(STORAGE_KEY) || '';
     expect(snapshot.has_api_key).toBe(false);
     expect(snapshot.masked_api_key).toBeNull();
-    expect(JSON.stringify(snapshot).includes(FREE_TIER_API_KEY)).toBe(false);
-    expect(stored.includes(FREE_TIER_API_KEY)).toBe(false);
+    expect(JSON.stringify(snapshot).includes('sk-or-v1-')).toBe(false);
+    expect(stored.includes('sk-or-v1-')).toBe(false);
   });
 
   it('keeps a skip list when the update omits it and clears on an empty array', async () => {

@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 import { beforeEach, vi } from 'vitest';
 
-import { clearModelsCache, resetFreeQueueForTests } from '../engine/browser/openrouter.js';
+import { clearModelsCache, resetFreeQueueForTests, setQueryHook } from '../engine/browser/openrouter.js';
 import { clearBlockedIds, clearModelCooldowns } from '../engine/browser/roster.js';
 import { resetSettingsState } from '../engine/browser/settings.js';
 import { resetStorageForTests } from '../engine/browser/storage.js';
@@ -25,6 +25,7 @@ beforeEach(async () => {
   clearModelCooldowns();
   resetFreeQueueForTests();
   clearModelsCache();
+  setQueryHook(null);
   vi.restoreAllMocks();
   await resetStorageForTests();
 });

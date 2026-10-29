@@ -42,22 +42,6 @@ def stage1_sample_limit(council_models, requested: int) -> int:
     return requested
 
 
-def roster_requires_user_key(council_models, chairman_model, red_team_model) -> bool:
-    """Personal key is required unless every configured model is free.
-
-    A blank red-team value means the chairman, matching settings. A blank
-    council or chairman is not a free roster. This does not change the
-    Stage 1 sample cap.
-    """
-    if not is_all_free_council(council_models):
-        return True
-    if not is_free_model(chairman_model):
-        return True
-    if str(red_team_model or '').strip() and not is_free_model(red_team_model):
-        return True
-    return False
-
-
 def is_harness_only_message(text: str) -> bool:
     return HARNESS_ONLY in str(text or '').lower()
 

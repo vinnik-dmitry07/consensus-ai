@@ -19,7 +19,7 @@ import {
   usableStage1Results,
 } from './council.js';
 import * as openrouter from './openrouter.js';
-import { FREE_TIER_API_KEY, resetFreeQueueForTests } from './openrouter.js';
+import { resetFreeQueueForTests } from './openrouter.js';
 import { clearModelCooldowns, rememberModelCooldown } from './roster.js';
 import { settings } from './settings.js';
 
@@ -568,7 +568,6 @@ describe('title and red-team credentials', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const init = fetchMock.mock.calls[0][1];
     expect(bearerIs(init, 'sk-user-test')).toBe(true);
-    expect(bearerIs(init, FREE_TIER_API_KEY)).toBe(false);
     expect(JSON.parse(init.body).model).toBe('google/gemini-2.5-flash');
   });
 
@@ -582,10 +581,26 @@ describe('title and red-team credentials', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('uses the free key when a family swap stays on a free model', async () => {
+  it('uses the personal key when a family swap stays on a free model', async () => {
     settings.clearApiKey();
     settings.chairmanModel = 'a/one:free';
     settings.redTeamModel = null;
+    const missing = vi.fn();
+    vi.stubGlobal('fetch', missing);
+    const refused = await redTeamReview(
+      'q',
+      'answer',
+      0,
+      [{ model: 'b/two:free', index: 1 }, { model: 'a/one:free', index: 0 }],
+      [
+        { model: 'a/one:free', response: 'answer' },
+        { model: 'b/two:free', response: 'other' },
+      ],
+    );
+    expect(missing).not.toHaveBeenCalled();
+    expect(refused.error.message).toBe('No API key configured');
+
+    settings.apiKey = 'sk-user-test';
     resetFreeQueueForTests();
     const fetchMock = vi.fn(async () => completionResponse('ok\nVERDICT: UPHELD\nCONFIDENCE: 8'));
     vi.stubGlobal('fetch', fetchMock);
@@ -602,7 +617,7 @@ describe('title and red-team credentials', () => {
     expect(result.model).toBe('b/two:free');
     expect(result.error).toBeUndefined();
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(bearerIs(fetchMock.mock.calls[0][1], FREE_TIER_API_KEY)).toBe(true);
+    expect(bearerIs(fetchMock.mock.calls[0][1], 'sk-user-test')).toBe(true);
     expect(JSON.parse(fetchMock.mock.calls[0][1].body).model).toBe('b/two:free');
   });
 
@@ -639,8 +654,7 @@ describe('title and red-team credentials', () => {
     expect(stage3.response).toBe('final');
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const init = fetchMock.mock.calls[0][1];
-    expect(bearerIs(init, FREE_TIER_API_KEY)).toBe(true);
-    expect(bearerIs(init, 'sk-user-test')).toBe(false);
+    expect(bearerIs(init, 'sk-user-test')).toBe(true);
     expect(JSON.parse(init.body).model).toBe('b/two:free');
   });
 });
@@ -656,7 +670,9 @@ describe('stage 1 transport boundary', () => {
       council: [...settings.councilModels],
       chairman: settings.chairmanModel,
       samples: settings.nSamples,
+      key: settings.apiKey,
     };
+    settings.apiKey = 'sk-user-test';
     settings.councilModels = ['test/alpha:free'];
     settings.chairmanModel = 'test/alpha:free';
     settings.nSamples = 1;
@@ -681,6 +697,8 @@ describe('stage 1 transport boundary', () => {
       settings.councilModels = previous.council;
       settings.chairmanModel = previous.chairman;
       settings.nSamples = previous.samples;
+      if (previous.key) settings.apiKey = previous.key;
+      else settings.clearApiKey();
     }
   });
 });

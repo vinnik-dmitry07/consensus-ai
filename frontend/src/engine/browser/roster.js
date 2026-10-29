@@ -33,30 +33,15 @@ export function stage1SampleLimit(councilModels, requested) {
   return requested;
 }
 
-export function rosterRequiresUserKey(councilModels, chairmanModel, redTeamModel) {
-  if (!isAllFreeCouncil(councilModels)) return true;
-  if (!isFreeModel(chairmanModel)) return true;
-  if (String(redTeamModel || '').trim() && !isFreeModel(redTeamModel)) return true;
-  return false;
-}
-
 export function runAllowedBySettings(data) {
-  if (!data || typeof data !== 'object' || typeof data.has_api_key !== 'boolean') {
-    return false;
-  }
-  if (data.has_api_key) return true;
-  if (!Array.isArray(data.council_models) || typeof data.chairman_model !== 'string') {
-    return false;
-  }
-  if (!Object.prototype.hasOwnProperty.call(data, 'red_team_model')) return false;
-  return !rosterRequiresUserKey(
-    data.council_models,
-    data.chairman_model,
-    data.red_team_model,
-  );
+  return data?.has_api_key === true;
 }
 
 const SPECIALIZED_FREE = /code|coder|codestral|devstral|starcoder|safety|guard|omni|-fin(?=:|$)|-sante(?=:|$)/i;
+
+export function isSpecializedFreeId(model) {
+  return SPECIALIZED_FREE.test(String(model || ''));
+}
 
 function parseSizeFromText(text) {
   let max = 0;
@@ -68,8 +53,8 @@ function parseSizeFromText(text) {
   return max;
 }
 
-function extractSize(model) {
-  for (const source of [model.id, model.name, model.description]) {
+export function publishedModelSize(model) {
+  for (const source of [model?.id, model?.name, model?.description]) {
     const size = parseSizeFromText(source);
     if (size > 0) return size;
   }
@@ -102,11 +87,11 @@ export function rankTopFreeModels(models, blockedIds, limit = 10) {
     if (!id || !isFreeModel(id)) continue;
     const cid = catalogueId(id);
     if (blocked.has(cid) || seen.has(cid)) continue;
-    if (SPECIALIZED_FREE.test(id)) continue;
+    if (isSpecializedFreeId(id)) continue;
     seen.add(cid);
     eligible.push({
       id,
-      size: extractSize(model),
+      size: publishedModelSize(model),
       name: model.name || id,
       index: eligible.length,
     });

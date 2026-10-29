@@ -28,3 +28,7 @@ conversations_old/
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
+
+# Evaluation cache and run artifacts. Question text stays out of git.
+frontend/eval/.cache/
+frontend/eval/.runs/

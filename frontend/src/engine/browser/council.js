@@ -996,7 +996,7 @@ Provide a clear, well-reasoned final answer:`;
 
 export async function generateConversationTitle(userQuery, signal = null) {
   if (signal?.aborted) return null;
-  if (!openrouter.keyForModel(TITLE_MODEL)) return 'New Conversation';
+  if (!openrouter.getApiKey()) return 'New Conversation';
 
   const titlePrompt = `Generate a very short title (3-5 words maximum) that summarizes the following question.
 The title should be concise and descriptive. Do not use quotes or punctuation in the title.
