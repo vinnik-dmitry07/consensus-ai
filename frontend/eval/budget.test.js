@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { createBudget } from './budget.js';
+import { createBudget, createSpendBudget } from './budget.js';
 
 const NOON = Date.parse('2026-10-27T12:00:00Z');
 const NEXT_NOON = Date.parse('2026-10-28T12:00:00Z');
@@ -49,5 +49,50 @@ describe('daily post budget', () => {
     expect(budget.tryReserve(NEXT_NOON)).toBe(true);
     expect(budget.tryReserve(NEXT_NOON)).toBe(true);
     expect(budget.tryReserve(NEXT_NOON)).toBe(false);
+  });
+});
+
+describe('paid repair spend', () => {
+  it('charges token prices and pauses when the usd cap is reached', () => {
+    const budget = createSpendBudget({
+      maxUsd: 0.01,
+      maxPosts: 10,
+      utcDay: '2026-10-27',
+      pricing: new Map([['alpha/a', { prompt: 0.001, completion: 0.002 }]]),
+    });
+    expect(budget.tryReserve(NOON, 'alpha/a')).toBe(true);
+    budget.charge('alpha/a', { prompt_tokens: 4, completion_tokens: 3 }, true, 100);
+    expect(budget.state.usd).toBeCloseTo(0.01);
+    expect(budget.state.pauseReason).toBe('spend_cap');
+    expect(budget.tryReserve(NOON, 'alpha/a')).toBe(false);
+  });
+
+  it('charges max tokens times the completion price when usage is missing', () => {
+    const budget = createSpendBudget({
+      maxUsd: 100,
+      maxPosts: 10,
+      utcDay: '2026-10-27',
+      pricing: new Map([['alpha/a', { prompt: 1, completion: 0.5 }]]),
+    });
+    budget.charge('alpha/a', null, false, 4);
+    expect(budget.state.usd).toBe(2);
+    expect(budget.state.usageUnknownCharged).toBe(1);
+  });
+
+  it('continues after the post cap is raised', () => {
+    const budget = createSpendBudget({
+      maxUsd: 10,
+      maxPosts: 1,
+      utcDay: '2026-10-27',
+      pricing: new Map(),
+    });
+    expect(budget.tryReserve(NOON, 'alpha/a')).toBe(true);
+    expect(budget.tryReserve(NOON, 'alpha/a')).toBe(false);
+    expect(budget.state.pauseReason).toBe('spend_cap');
+    budget.state.maxPosts = 5;
+    budget.state.paused = false;
+    budget.state.pauseReason = null;
+    expect(budget.tryReserve(NOON, 'alpha/a')).toBe(true);
+    expect(budget.state.posts).toBe(2);
   });
 });

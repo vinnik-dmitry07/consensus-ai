@@ -5,8 +5,9 @@ import { canonicalCompletionRequest, setQueryHook } from '../src/engine/browser/
 import { catalogueId } from '../src/engine/browser/roster.js';
 import { STORAGE_KEY, resetSettingsState } from '../src/engine/browser/settings.js';
 import { ENGINE_RETRY_LIMIT } from './protocol.js';
-import { attemptStore } from './transport.js';
+import { attemptStore, isNetworkMessage } from './transport.js';
 import { BudgetPaused } from './budget.js';
+import { activeQuestion } from './questionScope.js';
 import { sha256, stableStringify } from './util.js';
 
 const LOCAL_KEYS = [
@@ -15,9 +16,42 @@ const LOCAL_KEYS = [
   'llm-council-model-cooldowns',
 ];
 const TERMINAL = new Set(['completed', 'failed', 'skipped']);
+const NETWORK_BACKOFF_MS = 30_000;
 
 export function slotKey(slot) {
-  return [slot.questionId, slot.branch, slot.stage, slot.sample, slot.model, slot.requestHash].join('|');
+  const parts = [slot.questionId, slot.branch, slot.stage, slot.sample, slot.model, slot.requestHash];
+  if ((slot.attempt || 0) > 0) parts.push(`a${slot.attempt}`);
+  return parts.join('|');
+}
+
+function attemptLabel(slotMeta) {
+  return slotMeta.attempt > 0 ? ` attempt ${slotMeta.attempt}` : '';
+}
+
+export function readSlotMap(file) {
+  const slots = new Map();
+  for (const event of readJsonl(file)) {
+    if (event.kind !== 'slot' || !event.key) continue;
+    const prev = slots.get(event.key) || {};
+    slots.set(event.key, { ...prev, ...event.slot });
+  }
+  return slots;
+}
+
+export function networkOutageCount(file) {
+  const byQuestion = new Map();
+  for (const slot of readSlotMap(file).values()) {
+    if (slot.meta?.branch !== 'council' || slot.meta?.stage !== 'stage1') continue;
+    if (!String(slot.meta.questionId || '').startsWith('test:')) continue;
+    const list = byQuestion.get(slot.meta.questionId) || [];
+    list.push(slot);
+    byQuestion.set(slot.meta.questionId, list);
+  }
+  let count = 0;
+  for (const list of byQuestion.values()) {
+    if (list.length && list.every((slot) => isNetworkMessage(slot.result?.error?.message))) count += 1;
+  }
+  return count;
 }
 
 function readJsonl(file) {
@@ -48,7 +82,14 @@ export function restoreLocal(snapshot) {
   resetSettingsState();
 }
 
-export function createSession({ runDir, budget, log = console.log }) {
+export function createSession({
+  runDir,
+  budget,
+  log = console.log,
+  replayFrom = null,
+  aliasOf = null,
+  replayTerminal = false,
+}) {
   mkdirSync(runDir, { recursive: true });
   mkdirSync(path.join(runDir, 'bodies'), { recursive: true });
   const journalPath = path.join(runDir, 'events.jsonl');
@@ -57,8 +98,7 @@ export function createSession({ runDir, budget, log = console.log }) {
   const inFlight = new Set();
   const cooldowns = new Map();
   let context = null;
-  let active = 0;
-  const idleWaiters = [];
+  const ownFlight = { active: 0, idle: [] };
   let bodySeq = 0;
   let ordinal = 0;
 
@@ -122,21 +162,47 @@ export function createSession({ runDir, budget, log = console.log }) {
     renameSync(tmp, cooldownPath);
   }
 
-  function enter() {
-    active += 1;
+  function flight() {
+    const scoped = activeQuestion();
+    if (scoped) {
+      if (scoped.active == null) scoped.active = 0;
+      if (!scoped.idle) scoped.idle = [];
+      return scoped;
+    }
+    return ownFlight;
   }
 
-  function leave() {
-    active -= 1;
-    if (active === 0) {
-      const waiters = idleWaiters.splice(0);
+  function currentContext() {
+    const scoped = activeQuestion();
+    if (scoped) return scoped.context;
+    return context;
+  }
+
+  function enter() {
+    const slot = flight();
+    slot.active += 1;
+    return slot;
+  }
+
+  function leave(slot) {
+    slot.active -= 1;
+    if (slot.active <= 0) {
+      slot.active = 0;
+      const waiters = slot.idle.splice(0);
       for (const resolve of waiters) resolve();
     }
   }
 
+  function emit(message) {
+    const worker = activeQuestion()?.worker;
+    const head = worker == null ? '' : `w${worker} `;
+    log(`${head}${message}`);
+  }
+
   async function drain() {
-    if (active === 0) return;
-    await new Promise((resolve) => idleWaiters.push(resolve));
+    const slot = flight();
+    if (slot.active === 0) return;
+    await new Promise((resolve) => slot.idle.push(resolve));
   }
 
   function onHttp(event) {
@@ -158,24 +224,57 @@ export function createSession({ runDir, budget, log = console.log }) {
     persistCooldowns();
   }
 
+  function reusedSource(model, messages, options, slotMeta) {
+    if (!replayFrom || !aliasOf) return null;
+    if ((slotMeta.attempt || 0) > 0) return null;
+    const sourceModel = aliasOf(model);
+    const sourceRequest = canonicalCompletionRequest(sourceModel, messages, options);
+    const sourceHash = sha256(stableStringify(sourceRequest));
+    const sourceKey = slotKey({ ...slotMeta, model: sourceModel, requestHash: sourceHash });
+    const source = replayFrom.get(sourceKey);
+    if (!source) return null;
+    const answered = source.state === 'completed' && source.result?.ok;
+    if (!answered && !(replayTerminal && TERMINAL.has(source.state))) return null;
+    return { sourceKey, source };
+  }
+
   async function hook({ model, messages, options, execute }) {
-    enter();
+    const flightSlot = enter();
     let key = null;
     try {
-      if (!context) throw new Error('Logical call context is not set');
+      const slotContext = currentContext();
+      if (!slotContext) throw new Error('Logical call context is not set');
       const request = canonicalCompletionRequest(model, messages, options);
       const requestHash = sha256(stableStringify(request));
       const slotMeta = {
-        questionId: context.questionId,
-        branch: context.branch,
-        stage: context.stage,
-        sample: context.sample ?? 1,
+        questionId: slotContext.questionId,
+        branch: slotContext.branch,
+        stage: slotContext.stage,
+        sample: slotContext.sample ?? 1,
         model,
         requestHash,
       };
+      if ((slotContext.attempt || 0) > 0) slotMeta.attempt = slotContext.attempt;
       key = slotKey(slotMeta);
       const existing = slots.get(key);
-      if (existing && TERMINAL.has(existing.state)) return existing.result;
+      const retrySkip = existing?.state === 'skipped' && (slotMeta.attempt || 0) > 0;
+      if (existing && TERMINAL.has(existing.state) && !retrySkip) return existing.result;
+      const reused = reusedSource(model, messages, options, slotMeta);
+      if (reused) {
+        writeSlot(key, {
+          key,
+          meta: slotMeta,
+          request,
+          state: reused.source.state || 'completed',
+          result: reused.source.result,
+          finishReason: reused.source.finishReason || null,
+          incompleteHttp: reused.source.incompleteHttp === true,
+          reusedFrom: reused.sourceKey,
+          httpAttempts: 0,
+        });
+        emit(`${slotMeta.branch} ${slotMeta.stage} ${slotMeta.model} sample ${slotMeta.sample}${attemptLabel(slotMeta)} reused`);
+        return reused.source.result;
+      }
       if (inFlight.has(key)) throw new Error(`Duplicate in-flight logical slot ${key}`);
       if (budget.state.paused) {
         throw new BudgetPaused(budget.state.pauseReason, budget.state.resumeAfter);
@@ -191,6 +290,7 @@ export function createSession({ runDir, budget, log = console.log }) {
           ...(existing || {}),
           key,
           meta: slotMeta,
+          request,
           state: 'skipped',
           result: skipped,
         });
@@ -235,6 +335,20 @@ export function createSession({ runDir, budget, log = console.log }) {
         throw error;
       }
       const current = slots.get(key) || {};
+      if (isNetworkMessage(result?.error?.message) || isNetworkMessage(result?.error?.kind)) {
+        writeSlot(key, {
+          ...current,
+          key,
+          meta: slotMeta,
+          request,
+          state: 'unknown',
+          result,
+          occupiedMs: Date.now() - started,
+        });
+        if (!budget.state.paused) budget.pause('network', Date.now() + NETWORK_BACKOFF_MS);
+        emit(`${slotMeta.branch} ${slotMeta.stage} ${slotMeta.model} sample ${slotMeta.sample}${attemptLabel(slotMeta)} unknown`);
+        return result;
+      }
       if (budget.state.paused && !result?.ok) {
         writeSlot(key, { ...current, state: 'pending', result: null, occupiedMs: Date.now() - started });
         return result;
@@ -255,11 +369,11 @@ export function createSession({ runDir, budget, log = console.log }) {
         occupiedMs: Date.now() - started,
         usageKnown: current.usageKnown === true,
       });
-      log(`${slotMeta.branch} ${slotMeta.stage} ${slotMeta.model} sample ${slotMeta.sample} ${state}`);
+      emit(`${slotMeta.branch} ${slotMeta.stage} ${slotMeta.model} sample ${slotMeta.sample}${attemptLabel(slotMeta)} ${state}`);
       return result;
     } finally {
       if (key) inFlight.delete(key);
-      leave();
+      leave(flightSlot);
     }
   }
 
@@ -280,7 +394,9 @@ export function createSession({ runDir, budget, log = console.log }) {
     onHttp,
     onCooldown,
     setContext(next) {
-      context = next;
+      const scoped = activeQuestion();
+      if (scoped) scoped.context = next;
+      else context = next;
     },
     snapshotLocal,
     restoreLocal,

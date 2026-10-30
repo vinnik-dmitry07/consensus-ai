@@ -73,6 +73,12 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 - Both engines must emit the same event objects (`stage1_*`, `stage2_*`, `redteam_*`, `stage3_*`, `title_complete`, `complete`, `error`) with the same payload shapes. Do not fork that contract per engine
 - `App.jsx` binds each run's events to the conversation id that started it. Switching chats does not retarget a run that is still going
 
+**`share/`**
+- Browser-only sharing. A finished conversation is snapshotted (allowlist of message fields, no id, no in-progress answer), compressed, and encrypted with AES-GCM. The ciphertext goes to a secret GitHub Gist or to dpaste; the key stays in the URL `#fragment`
+- `?share=<provider>:<id>#<key>` opens that conversation read-only. **Save to my chats** imports it through the current engine with a new id
+- The GitHub token and the list of links created on this device live in localStorage key `llm-council-share-settings`, separate from either engine. Each saved link includes its key. dpaste pastes expire and cannot be deleted; Gist shares can, and a failed delete does not drop the local link while the gist is still up
+- This does not change the engine event contract
+
 **`engine/browser/`**
 - Port of `council.py`, `openrouter.py`, `storage.py`, and `settings.py`
 - IndexedDB conversations (same JSON as `data/conversations/`). Each update is one readwrite transaction, so two tabs cannot clobber each other. localStorage settings reload when another tab writes them

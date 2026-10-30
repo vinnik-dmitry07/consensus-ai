@@ -19,6 +19,7 @@ export default function Stage1({
   failures = [],
   skipped = [],
   isRunning = false,
+  components = markdownComponents,
 }) {
   const [selectedSource, setSelectedSource] = useState(null);
   const [seenRunning, setSeenRunning] = useState(isRunning);
@@ -27,6 +28,8 @@ export default function Stage1({
     if (isRunning) setSelectedSource(null);
   }
 
+  const failureNotes = Array.isArray(failures) ? failures : [];
+  const skippedNotes = Array.isArray(skipped) ? skipped : [];
   const answerTabs = answerTabsFrom(responses);
   const active = pickAnswerTab(answerTabs, selectedSource);
   const showProgress = isRunning && progress != null;
@@ -91,7 +94,7 @@ export default function Stage1({
           <div className='tab-content'>
             <div className='model-name'>{active.model}</div>
             <div className='response-text markdown-content'>
-              <ReactMarkdown remarkPlugins={[remarkGfmPlugin]} components={markdownComponents}>
+              <ReactMarkdown remarkPlugins={[remarkGfmPlugin]} components={components}>
                 {active.response}
               </ReactMarkdown>
             </div>
@@ -106,12 +109,12 @@ export default function Stage1({
         <div className='waiting-message'>No successful responses</div>
       )}
 
-      {(failures.length > 0 || skipped.length > 0) && (
+      {(failureNotes.length > 0 || skippedNotes.length > 0) && (
         <div className='stage-skipped stage1-notes'>
-          {failures.map((item, index) => (
+          {failureNotes.map((item, index) => (
             <p key={`fail-${item?.model || 'model'}-${index}`}>{noteLine('fail', item)}</p>
           ))}
-          {skipped.map((item, index) => (
+          {skippedNotes.map((item, index) => (
             <p key={`skip-${item?.model || 'model'}-${index}`}>{noteLine('skip', item)}</p>
           ))}
         </div>

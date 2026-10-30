@@ -15,6 +15,12 @@ import {
   DEFAULT_COUNCIL_MODELS,
   DEFAULT_N_SAMPLES,
 } from '../engine/browser/settings.js';
+import {
+  forgetGithubToken,
+  getGithubToken,
+  maskToken,
+  setGithubToken,
+} from '../share/settings.js';
 import './Settings.css';
 
 const FREE_SAMPLE_NOTE = 'All-free councils use one sample per model to reduce requests. OpenRouter shares a 20-requests-per-minute limit across free models.';
@@ -47,11 +53,15 @@ export default function Settings({
   const [engineMode, setEngineModeState] = useState('browser');
   const [apiBase, setApiBaseState] = useState('http://localhost:8001');
   const [transferMessage, setTransferMessage] = useState(null);
+  const [githubTokenInput, setGithubTokenInput] = useState('');
+  const [savedGithubToken, setSavedGithubToken] = useState(null);
   const [loadedFrom, setLoadedFrom] = useState(null);
   const importInputRef = useRef(null);
   const failedMigration = useRef(null);
   const formDirty = useRef(false);
   const loadGeneration = useRef(0);
+  const hasGithubToken = Boolean(savedGithubToken);
+  const maskedGithubToken = maskToken(savedGithubToken);
 
   const markDirty = () => {
     formDirty.current = true;
@@ -182,10 +192,28 @@ export default function Settings({
     }
   };
 
+  const refreshGithubToken = () => {
+    setSavedGithubToken(getGithubToken());
+    setGithubTokenInput('');
+  };
+
+  const handleSaveGithubToken = () => {
+    const next = githubTokenInput.trim();
+    if (!next) return;
+    setGithubToken(next);
+    refreshGithubToken();
+  };
+
+  const handleForgetGithubToken = () => {
+    forgetGithubToken();
+    refreshGithubToken();
+  };
+
   const loadData = async () => {
     const generation = loadGeneration.current + 1;
     loadGeneration.current = generation;
     formDirty.current = false;
+    refreshGithubToken();
     setLoading(true);
     setError(null);
     setModelsError(null);
@@ -559,6 +587,62 @@ export default function Settings({
                   />
                 </div>
                 {transferMessage && <div className="n-samples-info">{transferMessage}</div>}
+              </div>
+
+              <div className="settings-section">
+                <h3>Sharing</h3>
+                <p className="settings-description">
+                  Share a conversation as an encrypted link. A GitHub token is only needed for Gist.
+                  Create a fine-grained personal access token with only the Gists: Read and write permission.
+                  The token and every share link created on this device stay in this browser&apos;s localStorage.
+                  A saved link includes its decryption key.
+                  A github.io project site shares that origin with the account&apos;s other Pages sites, so those sites can read this token and those links.
+                  {' '}
+                  <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">Create a token</a>
+                </p>
+                <div className="api-key-control">
+                  <div className="api-key-status">
+                    {hasGithubToken ? (
+                      <span className="api-key-configured">
+                        <span className="status-dot configured"></span>
+                        Configured: <code>{maskedGithubToken}</code>
+                      </span>
+                    ) : (
+                      <span className="api-key-missing">
+                        <span className="status-dot missing"></span>
+                        Not configured. dpaste sharing still works.
+                      </span>
+                    )}
+                  </div>
+                  <input
+                    type="password"
+                    placeholder={hasGithubToken ? 'Enter a new token to replace...' : 'GitHub token'}
+                    value={githubTokenInput}
+                    onChange={(e) => setGithubTokenInput(e.target.value)}
+                    className="api-key-input"
+                    autoComplete="off"
+                    spellCheck={false}
+                  />
+                  <div className="quick-actions">
+                    <button
+                      type="button"
+                      className="quick-action-btn"
+                      onClick={handleSaveGithubToken}
+                      disabled={!githubTokenInput.trim()}
+                    >
+                      Save token
+                    </button>
+                    {hasGithubToken && (
+                      <button
+                        type="button"
+                        className="quick-action-btn"
+                        onClick={handleForgetGithubToken}
+                      >
+                        Forget token
+                      </button>
+                    )}
+                  </div>
+                </div>
               </div>
 
               {/* API Key Setting */}

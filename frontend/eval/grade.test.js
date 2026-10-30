@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { buildBank, findOverlap, hamiltonQuotas, normalizeAime, permuteChoices } from './datasets.js';
-import { gradeResponse } from './grade.js';
+import { gradeResponse, gradeResponseLenient } from './grade.js';
 
 describe('exact grading', () => {
   it('keeps the gold choice attached to the same text after a permutation', () => {
@@ -30,6 +30,45 @@ describe('exact grading', () => {
     expect(gradeResponse(choice, 'Option A is tempting.\nANSWER: C').extracted).toBe('C');
     expect(gradeResponse(choice, 'I choose A').status).toBe('parse_error');
     expect(gradeResponse(choice, 'I cannot answer this.').status).toBe('refusal');
+  });
+
+  it('reads one unambiguous answer and leaves the strict grade unchanged', () => {
+    const numeric = { kind: 'integer', goldCanon: '7', choiceCount: 0 };
+    const choice = { kind: 'choice', goldCanon: 'C', choiceCount: 4 };
+    expect(gradeResponseLenient(numeric, 'Working.\nANSWER: 007')).toEqual(
+      gradeResponse(numeric, 'Working.\nANSWER: 007'),
+    );
+    expect(gradeResponseLenient(choice, 'Option A is tempting.\nANSWER: C')).toEqual(
+      gradeResponse(choice, 'Option A is tempting.\nANSWER: C'),
+    );
+
+    const plus = gradeResponseLenient(numeric, 'ANSWER: +7');
+    expect(plus).toMatchObject({ status: 'graded', extracted: '7', correct: 1, lenient: true, via: 'answer_line' });
+    expect(gradeResponseLenient(numeric, 'ANSWER: 7.0').extracted).toBe('7');
+    expect(gradeResponseLenient(choice, '**ANSWER: C**')).toMatchObject({ extracted: 'C', via: 'answer_line', lenient: true });
+    expect(gradeResponseLenient(choice, 'ANSWER: (C)').extracted).toBe('C');
+    expect(gradeResponseLenient(numeric, 'ANSWER: 7\nThanks for asking.').extracted).toBe('7');
+
+    const boxed = gradeResponseLenient(numeric, 'Reasoning without a line.\n\\boxed{7}');
+    expect(boxed).toMatchObject({ extracted: '7', via: 'boxed', lenient: true, correct: 1 });
+    const prose = gradeResponseLenient(numeric, 'Steps.\nThe final answer is 7.');
+    expect(prose).toMatchObject({ extracted: '7', via: 'prose', lenient: true });
+
+    expect(gradeResponseLenient(choice, 'ANSWER: A or B').reason).toBe('ambiguous');
+    expect(gradeResponseLenient(choice, 'ANSWER: B. It uses a plant and water.').extracted).toBe('B');
+    expect(gradeResponseLenient(choice, 'ANSWER: B and C').reason).toBe('ambiguous');
+    expect(gradeResponseLenient(numeric, 'Steps.\nThe final answer is 7. Step 4 remains.').extracted).toBe('7');
+    expect(gradeResponseLenient(numeric, 'ANSWER: 4 or 7').status).toBe('no_answer');
+    expect(gradeResponseLenient(choice, 'The answer is not B').status).toBe('no_answer');
+    expect(gradeResponseLenient(numeric, 'The answer is 7\nstill working').status).toBe('no_answer');
+    expect(gradeResponseLenient(numeric, 'I got halfway through the proof.', 'truncated')).toMatchObject({
+      status: 'no_answer',
+      reason: 'length',
+    });
+    expect(gradeResponseLenient(choice, 'I cannot answer this.')).toMatchObject({
+      status: 'no_answer',
+      reason: 'refusal',
+    });
   });
 
   it('accepts AIME leading zeros and rejects a short bank', () => {

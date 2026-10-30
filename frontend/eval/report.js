@@ -216,6 +216,11 @@ export function armStatuses(rows) {
       transport: 0,
       fallback: 0,
       missing: 0,
+      lenientCorrect: 0,
+      lenientWrong: 0,
+      resampledCorrect: 0,
+      resampledWrong: 0,
+      exhausted: 0,
     };
     for (const row of rows) {
       const grade = row.arms?.[arm];
@@ -224,13 +229,24 @@ export function armStatuses(rows) {
         continue;
       }
       if (grade.fallback) counts.fallback += 1;
-      if (grade.status === 'graded') {
+      if (grade.exhausted) {
+        counts.exhausted += 1;
+        counts.wrong += 1;
+      } else if (grade.status === 'graded') {
         if (grade.correct === 1) counts.correct += 1;
         else counts.wrong += 1;
       } else if (COUNTED_STATUSES.includes(grade.status)) {
         counts[grade.status] += 1;
       } else {
         counts.transport += 1;
+      }
+      if (grade.lenient) {
+        if (grade.correct === 1) counts.lenientCorrect += 1;
+        else counts.lenientWrong += 1;
+      }
+      if (grade.resampled) {
+        if (grade.correct === 1) counts.resampledCorrect += 1;
+        else counts.resampledWrong += 1;
       }
     }
     result[arm] = counts;
@@ -465,6 +481,30 @@ export function renderReport(analysis, context = {}) {
   }
   lines.push('Время на общем кэше ответов не является пользовательской задержкой.');
   lines.push('');
+  if (context.networkOutageQuestions) {
+    lines.push(`Вопросов, где все вызовы Stage 1 оборвались на сети клиента: ${context.networkOutageQuestions}. Они остаются в знаменателе as-run со счётом 0.`);
+    lines.push('');
+  }
+  if (context.repaired) {
+    const repair = context.repair || {};
+    lines.push('## Повтор транспортных отказов (вторичный слой)');
+    lines.push('');
+    lines.push(`Пересчитано ${context.repaired.scored} из ${context.repaired.expected ?? 'n/a'} уже завершённых вопросов. Это не заменяет заранее зарегистрированный as-run. Платные endpoint, где они есть, — другие деплои тех же весов; решение о повторе принято после просмотра as-run.`);
+    lines.push(`Повторно выполненные слоты: ${repair.liveSlots ?? 0}. Переиспользованы без запроса: ${repair.reusedSlots ?? 0}. Расход по счётчику ключа $${repair.keySpend == null ? 'n/a' : Number(repair.keySpend).toFixed(4)}, локальная оценка для лимита $${repair.usdEstimate == null ? 'n/a' : Number(repair.usdEstimate).toFixed(4)}.`);
+    lines.push(`A6 pooled после повтора: ${pct(context.repaired.pooled.A6)}. A1 pooled: ${pct(context.repaired.pooled.A1)}.`);
+    lines.push('Таблицы на английском — в summary.md и в разделе README.');
+    lines.push('');
+  }
+  if (context.completed) {
+    const completion = context.completion || {};
+    const samples = (completion.attempts || 0) + 1;
+    lines.push('## Все ячейки с ответом (вторичный слой)');
+    lines.push('');
+    lines.push(`Перечитано и, где ответа не было, дорисовано ${context.completed.scored} из ${context.completed.expected ?? 'n/a'} вопросов. Однозначный ответ в тексте засчитан без нового вызова. Ячейка без ответа рисовалась заново до ${completion.attempts ?? 'n/a'} раз; после ${samples} образцов без ответа она считается неверной. Stage 2, red team и Stage 3 повторены без изменений. Это не заменяет as-run и строгий repaired.`);
+    lines.push(`Слоты, прочитанные заново без запроса: ${completion.reusedSlots ?? 0}. Новые розыгрыши: ${completion.resamplePosts ?? 0} POST. Расход по счётчику ключа $${completion.keySpend == null ? 'n/a' : Number(completion.keySpend).toFixed(4)}, локальная оценка для лимита $${completion.usdEstimate == null ? 'n/a' : Number(completion.usdEstimate).toFixed(4)}.`);
+    lines.push(`A6 pooled: ${pct(context.completed.pooled.A6)}. A1 pooled: ${pct(context.completed.pooled.A1)}.`);
+    lines.push('');
+  }
   lines.push('Этот отчёт не меняет Stage 2 и интерфейс. Решение об изменении продукта принимается отдельно.');
   lines.push('');
   return lines.join('\n');
@@ -528,13 +568,18 @@ export function renderSummary(analysis, context = {}) {
   if (context.costs) {
     lines.push(`HTTP POSTs so far (smoke, dev, and test, including retries): ${context.costs.attempted}. Responses without a usage block: ${context.costs.usageUnknown} (not counted as zero cost).`);
   }
+  if (context.networkOutageQuestions) {
+    lines.push(`${context.networkOutageQuestions} questions had every Stage 1 call fail at the client network level. Those questions stay in the as-run denominator as failures.`);
+  }
   lines.push('');
   if (manifest.councilModels) {
     lines.push(`Frozen council (${manifest.label || 'dev-selected'}): ${manifest.councilModels.map((model) => `\`${model}\``).join(', ')}.`);
     lines.push(`Chairman H: \`${manifest.chairmanModel}\`. Single-model baseline B: \`${manifest.bModel}\`.${manifest.a0AliasesA1 ? ' H = B, so A0 reuses the A1 call and is not a separate comparison.' : ''}`);
     lines.push('');
   }
-  lines.push('#### Accuracy by arm');
+  lines.push(context.repaired
+    ? '#### As run on free endpoints (operational, pre-registered)'
+    : '#### Accuracy by arm');
   lines.push('');
   lines.push(...tableEn(
     ['Arm', 'What it is', 'Calls per question', 'Pooled', 'Macro (mean of blocks)', 'AIME', 'GPQA', 'MMLU-Pro'],
@@ -635,6 +680,134 @@ export function renderSummary(analysis, context = {}) {
   lines.push('');
   lines.push(`Selection: P(A5 correct | some council answer correct) = ${pctEn(analysis.selection?.leaderGivenOracle)} over ${analysis.selection?.oracleDenominator ?? 0}; P(A4 correct | same) = ${pctEn(analysis.selection?.pluralityGivenOracle)}. A6 produced a correct answer that no council member had ${analysis.transitions?.A6?.novelWhenOracleMissed ?? 0} times, A7 ${analysis.transitions?.A7?.novelWhenOracleMissed ?? 0} times.`);
   lines.push('');
+  if (context.repaired) lines.push(...repairedSection(context.repaired, context));
+  if (context.completed) lines.push(...completeSection(context.completed, context));
   lines.push('This table is a measurement, not a product decision. It does not change Stage 2 or the UI. Numbers refresh with `npm --prefix frontend run eval -- report`.');
   return lines.join('\n');
+}
+
+function repairedSection(analysis, context) {
+  const repair = context.repair || {};
+  const nominal = context.nominal || {};
+  const lines = ['', '#### Transport failures retried via paid endpoints (secondary, exploratory)', ''];
+  const unrepaired = analysis.expected == null ? 'n/a' : Math.max(0, analysis.expected - analysis.scored);
+  lines.push(`Re-scored ${analysis.scored} of ${analysis.expected ?? 'n/a'} questions that already have an as-run result. ${unrepaired} of those are not repaired yet. ${repair.amendment || 'This layer does not replace the pre-registered as-run result.'}`);
+  lines.push(`Slots reused from the free run: ${repair.reusedSlots ?? 0}. Slots executed again: ${repair.liveSlots ?? 0} (paid posts ${repair.paidPosts ?? 0}, free posts ${repair.freePosts ?? 0}).`);
+  const usd = repair.usdEstimate == null ? 'n/a' : `$${Number(repair.usdEstimate).toFixed(4)}`;
+  const spent = repair.keySpend == null ? 'n/a' : `$${Number(repair.keySpend).toFixed(4)}`;
+  lines.push(`Spend on the paid key (OpenRouter key usage counter): ${spent}. Local estimate used for the cap: ${usd}; calls with unknown usage are charged there at max_tokens × completion price (${repair.usageUnknownCharged ?? 0} calls).`);
+  if (repair.mapping) {
+    const moved = Object.entries(repair.mapping).filter(([source, repairId]) => source !== repairId);
+    lines.push(moved.length
+      ? `Paid stand-ins: ${moved.map(([source, repairId]) => `\`${source}\` → \`${repairId}\``).join('; ')}.`
+      : 'No paid stand-in was available; retries used the same free ids.');
+  }
+  lines.push('');
+  lines.push(...tableEn(
+    ['Arm', 'Calls per question', 'Pooled', 'Macro', 'AIME', 'GPQA', 'MMLU-Pro'],
+    ARMS.map((arm) => [
+      arm,
+      nominal[arm] ?? 'n/a',
+      pctEn(analysis.pooled[arm]),
+      pctEn(analysis.macro[arm]),
+      pctEn(analysis.byBlock.aime.arms[arm]),
+      pctEn(analysis.byBlock.gpqa.arms[arm]),
+      pctEn(analysis.byBlock.mmlu.arms[arm]),
+    ]),
+  ));
+  lines.push('');
+  lines.push(...tableEn(
+    ['Comparison', 'Δ pp (A6 − alt)', 'Wins / losses / ties', 'Holm p', 'Bonferroni CI (pp)', 'Reading at δmin = 5 pp'],
+    analysis.family.map((item) => [
+      `A6 − ${item.right}`,
+      ppEn(item.delta),
+      `${item.wins} / ${item.losses} / ${item.ties}`,
+      pEn(item.adjustedP),
+      intervalEn(item.bonferroni),
+      readingEn(item.familyClaim),
+    ]),
+  ));
+  lines.push('');
+  lines.push('#### Re-executed slots and residual failures');
+  lines.push('');
+  lines.push(...tableEn(
+    ['Arm', 'Correct', 'Wrong answer', 'Parse error', 'No answer', 'Not run', 'Transport failure'],
+    ARMS.map((arm) => {
+      const counts = analysis.armStatus?.[arm] || {};
+      return [
+        arm,
+        counts.correct ?? 0,
+        counts.wrong ?? 0,
+        counts.parse_error ?? 0,
+        counts.no_answer ?? 0,
+        counts.not_run ?? 0,
+        counts.transport ?? 0,
+      ];
+    }),
+  ));
+  lines.push('');
+  lines.push('Paid endpoints are other deployments of the same weights, not a different model choice. The decision to retry was made after seeing the as-run data, so this layer is not the pre-registered comparison. A residual transport failure still scores 0.');
+  lines.push('');
+  return lines;
+}
+
+function completeSection(analysis, context) {
+  const completion = context.completion || {};
+  const nominal = context.nominal || {};
+  const samples = (completion.attempts || 0) + 1;
+  const lines = ['', '#### Every cell answered: lenient read + re-sampled non-answers (secondary, exploratory)', ''];
+  lines.push(completion.amendment || 'This layer does not replace the pre-registered as-run result or the strict repaired result.');
+  lines.push(`Reading: ${completion.lenientRules || 'lenient rules were not recorded.'} A cell with no such answer is drawn again up to ${completion.attempts ?? 'n/a'} times on the same request. Stage 2, the red team, and Stage 3 are replayed unchanged, so a new Stage 1 draw is used only to grade the cells that read it.`);
+  lines.push(`Slots replayed from the repaired journal: ${completion.reusedSlots ?? 0}. Fresh draws: ${completion.resamplePosts ?? 0} posts across ${completion.resampledCells ?? 0} cells that then answered and ${completion.exhaustedCells ?? 0} cells that still did not.`);
+  const usd = completion.usdEstimate == null ? 'n/a' : `$${Number(completion.usdEstimate).toFixed(4)}`;
+  const spent = completion.keySpend == null ? 'n/a' : `$${Number(completion.keySpend).toFixed(4)}`;
+  lines.push(`Spend on the paid key (OpenRouter key usage counter): ${spent}. Local estimate used for the cap: ${usd}; calls with unknown usage are charged there at max_tokens × completion price (${completion.usageUnknownCharged ?? 0} calls).`);
+  lines.push('');
+  lines.push(...tableEn(
+    ['Arm', 'Calls per question', 'Pooled', 'Macro', 'AIME', 'GPQA', 'MMLU-Pro'],
+    ARMS.map((arm) => [
+      arm,
+      nominal[arm] ?? 'n/a',
+      pctEn(analysis.pooled[arm]),
+      pctEn(analysis.macro[arm]),
+      pctEn(analysis.byBlock.aime.arms[arm]),
+      pctEn(analysis.byBlock.gpqa.arms[arm]),
+      pctEn(analysis.byBlock.mmlu.arms[arm]),
+    ]),
+  ));
+  lines.push('');
+  lines.push(...tableEn(
+    ['Comparison', 'Δ pp (A6 − alt)', 'Wins / losses / ties', 'Holm p', 'Bonferroni CI (pp)', 'Reading at δmin = 5 pp'],
+    analysis.family.map((item) => [
+      `A6 − ${item.right}`,
+      ppEn(item.delta),
+      `${item.wins} / ${item.losses} / ${item.ties}`,
+      pEn(item.adjustedP),
+      intervalEn(item.bonferroni),
+      readingEn(item.familyClaim),
+    ]),
+  ));
+  lines.push('');
+  lines.push('#### Where the new answers came from');
+  lines.push('');
+  lines.push(...tableEn(
+    ['Arm', 'Correct', 'Wrong', 'Lenient, correct', 'Lenient, wrong', 'Re-sampled, correct', 'Re-sampled, wrong', `No answer after ${samples} samples (scored wrong)`],
+    ARMS.map((arm) => {
+      const counts = analysis.armStatus?.[arm] || {};
+      return [
+        arm,
+        counts.correct ?? 0,
+        counts.wrong ?? 0,
+        counts.lenientCorrect ?? 0,
+        counts.lenientWrong ?? 0,
+        counts.resampledCorrect ?? 0,
+        counts.resampledWrong ?? 0,
+        counts.exhausted ?? 0,
+      ];
+    }),
+  ));
+  lines.push('');
+  lines.push('Correct and wrong are the whole arm, so they sum to the scored questions. Lenient and re-sampled are subsets of those answers: a lenient cell kept the repaired text, and a re-sampled cell is the first later draw that contained an answer. "No answer after N samples" is already inside Wrong. A vote is lenient or re-sampled when a ballot for the winning answer was. This layer does not replace the pre-registered or the strict repaired result.');
+  lines.push('');
+  return lines;
 }

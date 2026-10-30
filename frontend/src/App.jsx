@@ -7,6 +7,7 @@ import { applyStage1Event, knownList, stageRetryPatch } from './stage1State.js';
 import { getEngineMode } from './engine/index.js';
 import { runAllowedBySettings } from './engine/browser/roster.js';
 import { SETTINGS_CHANGED_EVENT, STORAGE_KEY } from './engine/browser/settings.js';
+import { openShare, parseShareLocation, sameShareRef } from './share/index.js';
 import './App.css';
 
 function App() {
@@ -19,10 +20,15 @@ function App() {
   const [isLoading, setIsLoading] = useState(false);
   const activeRunsRef = useRef(new Set());
   const currentIdRef = useRef(currentConversationId);
+  const shareTokenRef = useRef(0);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [settingsVersion, setSettingsVersion] = useState(0);
   const [darkMode, setDarkMode] = useState(() => localStorage.getItem('theme') === 'dark');
   const [engineMode, setEngineMode] = useState(() => getEngineMode());
+  const [shareRef, setShareRef] = useState(() => parseShareLocation(window.location));
+  const [sharedView, setSharedView] = useState(null);
+  const [shareSaving, setShareSaving] = useState(false);
+  const [shareSaveError, setShareSaveError] = useState(null);
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', darkMode ? 'dark' : 'light');
@@ -51,6 +57,8 @@ function App() {
   useEffect(() => {
     currentIdRef.current = currentConversationId;
     const url = new URL(window.location);
+    // A share link keeps its query and the key in the fragment.
+    if (url.searchParams.has('share')) return;
     if (currentConversationId) {
       url.searchParams.set('c', currentConversationId);
     } else {
@@ -59,9 +67,38 @@ function App() {
     window.history.replaceState({}, '', url);
   }, [currentConversationId]);
 
+  useEffect(() => {
+    if (!shareRef) return undefined;
+    let active = true;
+    setShareSaving(false);
+    setShareSaveError(null);
+    setSharedView({ status: 'loading' });
+    openShare(shareRef)
+      .then((conversation) => {
+        if (active) setSharedView({ status: 'ready', conversation });
+      })
+      .catch((error) => {
+        if (!active) return;
+        setSharedView({
+          status: 'error',
+          message: error instanceof Error ? error.message : 'Could not open this share.',
+        });
+      });
+    return () => {
+      active = false;
+    };
+  }, [shareRef]);
+
   // Handle browser back/forward
   useEffect(() => {
     const handlePopState = () => {
+      const nextShare = parseShareLocation(window.location);
+      setShareRef((current) => {
+        if (sameShareRef(current, nextShare)) return current;
+        shareTokenRef.current += 1;
+        return nextShare;
+      });
+      if (!nextShare) setSharedView(null);
       const params = new URLSearchParams(window.location.search);
       setCurrentConversationId(params.get('c'));
     };
@@ -76,10 +113,11 @@ function App() {
 
   // Load conversation details when selected
   useEffect(() => {
+    if (shareRef) return;
     if (currentConversationId) {
       loadConversation(currentConversationId);
     }
-  }, [currentConversationId]);
+  }, [currentConversationId, shareRef]);
 
   const loadConversations = async () => {
     try {
@@ -106,13 +144,24 @@ function App() {
     }
   };
 
+  const leaveShareUrl = (adjust) => {
+    shareTokenRef.current += 1;
+    const url = new URL(window.location);
+    url.searchParams.delete('share');
+    url.hash = '';
+    if (adjust) adjust(url);
+    window.history.pushState({}, '', url);
+    setShareRef(null);
+    setSharedView(null);
+    setShareSaving(false);
+    setShareSaveError(null);
+  };
+
   const handleNewConversation = () => {
     currentIdRef.current = null;
     setIsLoading(false);
     // Don't create on backend yet - wait for first message
-    const url = new URL(window.location);
-    url.searchParams.delete('c');
-    window.history.pushState({}, '', url);
+    leaveShareUrl((url) => url.searchParams.delete('c'));
     setCurrentConversationId(null);
     setCurrentConversation({ id: null, messages: [], title: 'New Conversation' });
   };
@@ -120,14 +169,37 @@ function App() {
   const handleSelectConversation = (id) => {
     currentIdRef.current = id;
     setIsLoading(activeRunsRef.current.has(id));
-    const url = new URL(window.location);
-    if (id) {
-      url.searchParams.set('c', id);
-    } else {
-      url.searchParams.delete('c');
-    }
-    window.history.pushState({}, '', url);
+    leaveShareUrl((url) => {
+      if (id) url.searchParams.set('c', id);
+      else url.searchParams.delete('c');
+    });
     setCurrentConversationId(id);
+  };
+
+  const closeShare = () => {
+    leaveShareUrl();
+    if (!currentConversationId) {
+      setCurrentConversation({ id: null, messages: [], title: 'New Conversation' });
+    }
+  };
+
+  const handleSaveShare = async () => {
+    const conversation = sharedView?.status === 'ready' ? sharedView.conversation : null;
+    if (!conversation || shareSaving) return;
+    const token = shareTokenRef.current;
+    setShareSaving(true);
+    setShareSaveError(null);
+    try {
+      await api.importConversations({ conversations: [conversation] });
+      await loadConversations();
+      if (shareTokenRef.current !== token) return;
+      setCurrentConversation(conversation);
+      handleSelectConversation(conversation.id);
+    } catch (error) {
+      if (shareTokenRef.current !== token) return;
+      setShareSaveError(error instanceof Error ? error.message : 'Could not save this conversation.');
+      setShareSaving(false);
+    }
   };
 
   const handleRemoveConversation = async (id) => {
@@ -532,11 +604,23 @@ function App() {
     }
   };
 
+  const viewingShare = Boolean(shareRef);
+  const shownConversation = viewingShare
+    ? (sharedView?.status === 'ready'
+      ? sharedView.conversation
+      : { id: null, messages: [], title: 'Shared conversation' })
+    : currentConversation;
+  const shareStatus = sharedView?.status;
+  let shareBanner = 'Opening shared conversation...';
+  if (shareStatus === 'error') shareBanner = sharedView.message || 'Could not open this share.';
+  if (shareStatus === 'ready') shareBanner = 'Shared conversation, read-only';
+  if (shareSaveError) shareBanner = `${shareBanner} ${shareSaveError}`;
+
   return (
     <div className="app">
       <Sidebar
         conversations={conversations}
-        currentConversationId={currentConversationId}
+        currentConversationId={viewingShare ? null : currentConversationId}
         onSelectConversation={handleSelectConversation}
         onNewConversation={handleNewConversation}
         onRemoveConversation={handleRemoveConversation}
@@ -546,15 +630,36 @@ function App() {
         engineMode={engineMode}
         settingsVersion={settingsVersion}
       />
-      <ChatInterface
-        key={currentConversationId ?? 'new'}
-        conversation={currentConversation}
-        onSendMessage={handleSendMessage}
-        onRetryStage={handleRetryStage}
-        isLoading={isLoading}
-        settingsVersion={settingsVersion}
-        onOpenSettings={() => setIsSettingsOpen(true)}
-      />
+      <div className="main-column">
+        {viewingShare && (
+          <div className="share-banner" role="status">
+            <div className="share-banner-text">{shareBanner}</div>
+            <div className="share-banner-actions">
+              {shareStatus === 'ready' && (
+                <button
+                  type="button"
+                  className="share-banner-save"
+                  onClick={handleSaveShare}
+                  disabled={shareSaving}
+                >
+                  {shareSaving ? 'Saving...' : 'Save to my chats'}
+                </button>
+              )}
+              <button type="button" onClick={closeShare}>Close</button>
+            </div>
+          </div>
+        )}
+        <ChatInterface
+          key={viewingShare ? `share:${shareRef.provider || 'invalid'}:${shareRef.id || 'link'}` : (currentConversationId ?? 'new')}
+          conversation={shownConversation}
+          onSendMessage={handleSendMessage}
+          onRetryStage={handleRetryStage}
+          isLoading={viewingShare ? false : isLoading}
+          settingsVersion={settingsVersion}
+          onOpenSettings={() => setIsSettingsOpen(true)}
+          readOnly={viewingShare}
+        />
+      </div>
       <Settings
         isOpen={isSettingsOpen}
         onClose={() => setIsSettingsOpen(false)}

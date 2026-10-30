@@ -112,4 +112,74 @@ describe('interim summary', () => {
     expect(replaceSection(text, '<!-- a -->', '<!-- b -->', 'new')).toBe('before\n<!-- a -->\nnew\n<!-- b -->\nafter');
     expect(replaceSection('no markers', '<!-- a -->', '<!-- b -->', 'new')).toBe(null);
   });
+
+  it('renders the as-run table and the paid repair table', () => {
+    const analysis = analyze(rows.slice(0, 2), { alternatives: ['A1'], expected: 2 });
+    const text = renderSummary(analysis, {
+      complete: true,
+      networkOutageQuestions: 3,
+      repaired: analysis,
+      nominal: { A0: 1, A1: 1, A2: 5, A3: 6, A4: 5, A5: 10, A6: 12, A7: 11 },
+      repair: {
+        reusedSlots: 4,
+        liveSlots: 2,
+        paidPosts: 2,
+        freePosts: 0,
+        usdEstimate: 0.125,
+        keySpend: 0.2,
+        usageUnknownCharged: 1,
+        amendment: 'secondary layer',
+        mapping: { 'alpha/a:free': 'alpha/a' },
+      },
+    });
+    expect(text).toContain('As run on free endpoints');
+    expect(text).toContain('Transport failures retried via paid endpoints');
+    expect(text).toContain('3 questions had every Stage 1 call fail');
+    expect(text).toContain('secondary layer');
+    expect(text).toContain('`alpha/a:free` → `alpha/a`');
+    expect(text).toContain('key usage counter): $0.2000');
+    expect(text).not.toContain('undefined');
+  });
+
+  it('counts a lenient read and an exhausted redraw as subsets of correct and wrong', () => {
+    const status = armStatuses([
+      row('aime', {
+        A1: { correct: 0, status: 'no_answer', exhausted: true },
+        A6: { correct: 1, status: 'graded', lenient: true, via: 'boxed' },
+      }),
+    ]);
+    expect(status.A1).toMatchObject({ wrong: 1, exhausted: 1, no_answer: 0 });
+    expect(status.A6).toMatchObject({ correct: 1, lenientCorrect: 1, lenientWrong: 0 });
+    const analysis = analyze([
+      row('aime', {
+        A1: { correct: 0, status: 'no_answer', exhausted: true },
+        A6: { correct: 1, status: 'graded', lenient: true },
+      }),
+      row('gpqa', {
+        A1: { correct: 1, status: 'graded', resampled: 2 },
+        A6: { correct: 0, status: 'graded', resampled: 1 },
+      }),
+    ], { alternatives: ['A1'], expected: 2 });
+    const text = renderSummary(analysis, {
+      complete: true,
+      completed: analysis,
+      completion: {
+        attempts: 3,
+        lenientRules: 'lenient-v1: one unambiguous answer',
+        amendment: 'answer-complete layer',
+        reusedSlots: 9,
+        resamplePosts: 4,
+        resampledCells: 2,
+        exhaustedCells: 1,
+        usdEstimate: 0.5,
+        keySpend: 0.4,
+        usageUnknownCharged: 0,
+      },
+    });
+    expect(text).toContain('Every cell answered: lenient read + re-sampled non-answers');
+    expect(text).toContain('No answer after 4 samples (scored wrong)');
+    expect(text).toContain('lenient-v1: one unambiguous answer');
+    expect(text).toContain('answer-complete layer');
+    expect(text).not.toContain('undefined');
+  });
 });

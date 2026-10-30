@@ -96,9 +96,26 @@ function load() {
   }
 }
 
+function evalQuestion() {
+  const scope = globalThis.__consensusEvalQuestion;
+  if (!scope || typeof scope.getStore !== 'function') return null;
+  return scope.getStore() || null;
+}
+
 function current() {
+  const scoped = evalQuestion();
+  if (scoped) {
+    if (!scoped.settingsState) scoped.settingsState = load();
+    return scoped.settingsState;
+  }
   if (!state) state = load();
   return state;
+}
+
+function assignState(next) {
+  const scoped = evalQuestion();
+  if (scoped) scoped.settingsState = next;
+  else state = next;
 }
 
 function persist() {
@@ -106,7 +123,9 @@ function persist() {
 }
 
 export function resetSettingsState() {
-  state = null;
+  const scoped = evalQuestion();
+  if (scoped) scoped.settingsState = null;
+  else state = null;
 }
 
 function maskedKey(apiKey) {
@@ -208,8 +227,9 @@ export const settings = {
 
   resetToDefaults() {
     const apiKey = current().api_key;
-    state = freshState();
-    state.api_key = apiKey;
+    const next = freshState();
+    next.api_key = apiKey;
+    assignState(next);
     persist();
   },
 
@@ -230,17 +250,17 @@ export const settings = {
   },
 
   reloadFromStorage() {
-    state = load();
+    assignState(load());
   },
 
   writeFreeTierDefaults(snapshot, roster) {
-    state = {
+    assignState({
       ...snapshot,
       council_models: [...roster.councilModels],
       chairman_model: roster.chairmanModel,
       n_samples: clampInt(roster.nSamples, 1, 10),
       use_free_tier_default: false,
-    };
+    });
     persist();
   },
 

@@ -1,6 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
-import { markdownComponents, remarkGfmPlugin } from '../markdownComponents';
+import { markdownComponents, remarkGfmPlugin, shareMarkdownComponents } from '../markdownComponents';
 import { api } from '../api';
 import { runAllowedBySettings } from '../engine/browser/roster.js';
 import { catalogueModelId, modelFamily } from '../engine/browser/openrouter.js';
@@ -15,6 +15,7 @@ import Stage1 from './Stage1';
 import Stage2 from './Stage2';
 import Stage3 from './Stage3';
 import CopyButton from './CopyButton';
+import ShareDialog from './ShareDialog';
 import './ChatInterface.css';
 
 const MAX_FILE_SIZE = 100 * 1024;
@@ -32,6 +33,24 @@ function stage2Diagnostic(failure, kind) {
   const reason = safeNoteReason(kind, failure?.error?.message);
   if (kind === 'skip') return `${name}: ${reason || 'Skipped'}`;
   return `${name}: ${reason}`;
+}
+
+function messageInProgress(message) {
+  if (message.streaming) return true;
+  const loading = message.loading || {};
+  return Boolean(loading.stage1 || loading.stage2 || loading.redteam || loading.stage3);
+}
+
+function hasShareableAnswer(message) {
+  if (!message || message.role !== 'assistant' || messageInProgress(message)) return false;
+  if (Array.isArray(message.stage1) && message.stage1.length > 0) return true;
+  if (message.stage2) return true;
+  return Boolean(message.stage3);
+}
+
+function canShareConversation(conversation, isLoading) {
+  if (!conversation || isLoading) return false;
+  return (conversation.messages || []).some(hasShareableAnswer);
 }
 
 const INPUT_MIN_HEIGHT = 48;
@@ -283,9 +302,9 @@ function calculateActualUsage(msg) {
   };
   
   // Stage 1 usage
-  if (msg.stage1) {
+  if (Array.isArray(msg.stage1)) {
     for (const resp of msg.stage1) {
-      if (resp.usage) {
+      if (resp?.usage) {
         usage.stage1.promptTokens += resp.usage.prompt_tokens || 0;
         usage.stage1.completionTokens += resp.usage.completion_tokens || 0;
         usage.stage1.totalTokens += resp.usage.total_tokens || 0;
@@ -295,9 +314,9 @@ function calculateActualUsage(msg) {
   }
   
   // Stage 2 usage
-  if (msg.stage2) {
+  if (Array.isArray(msg.stage2)) {
     for (const resp of msg.stage2) {
-      if (resp.usage) {
+      if (resp?.usage) {
         usage.stage2.promptTokens += resp.usage.prompt_tokens || 0;
         usage.stage2.completionTokens += resp.usage.completion_tokens || 0;
         usage.stage2.totalTokens += resp.usage.total_tokens || 0;
@@ -344,8 +363,10 @@ export default function ChatInterface({
   isLoading,
   settingsVersion = 0,
   onOpenSettings,
+  readOnly = false,
 }) {
   const [input, setInput] = useState('');
+  const [shareOpen, setShareOpen] = useState(false);
   const [gate, setGate] = useState('loading');
   const [gateVersion, setGateVersion] = useState(settingsVersion);
   const settingsRequest = useRef(settingsVersion);
@@ -387,6 +408,7 @@ export default function ChatInterface({
   }, []);
 
   useEffect(() => {
+    if (readOnly) return undefined;
     const version = settingsVersion;
     let active = true;
     Promise.resolve(api.getSettings())
@@ -401,14 +423,21 @@ export default function ChatInterface({
     return () => {
       active = false;
     };
-  }, [settingsVersion]);
+  }, [settingsVersion, readOnly]);
 
   const needsPersonalKey = gate === 'blocked';
   const settingsUnavailable = gate === 'error';
   const runBlocked = isLoading || gate !== 'allowed';
+  const showRetry = !readOnly;
+  const showShare = canShareConversation(conversation, isLoading) && !readOnly;
+  const messageMarkdown = readOnly ? shareMarkdownComponents : markdownComponents;
+  const shareLocked = isLoading || (conversation?.messages || []).some(
+    (message) => message && messageInProgress(message),
+  );
 
   // Fetch pricing data on mount and when settings change
   useEffect(() => {
+    if (readOnly) return undefined;
     const fetchPricing = async () => {
       try {
         const data = await api.getPricing();
@@ -418,7 +447,7 @@ export default function ChatInterface({
       }
     };
     fetchPricing();
-  }, [settingsVersion]);
+  }, [settingsVersion, readOnly]);
 
   // Calculate estimated cost when input or attachments change
   const estimatedCost = useMemo(() => {
@@ -629,19 +658,34 @@ export default function ChatInterface({
     <div className="chat-interface">
       <div className="messages-area">
       <div className="messages-container" ref={containerRef} onScroll={handleScroll}>
+        {showShare && (
+          <div className="share-toolbar">
+            <button
+              type="button"
+              className="share-open-button"
+              onClick={() => setShareOpen(true)}
+            >
+              Share
+            </button>
+          </div>
+        )}
         {conversation.messages.length === 0 ? (
-          <EmptyState
-            title="Start a conversation"
-            detail="Ask a question to consult the LLM Council"
-          />
+          readOnly ? null : (
+            <EmptyState
+              title="Start a conversation"
+              detail="Ask a question to consult the LLM Council"
+            />
+          )
         ) : (
-          conversation.messages.map((msg, index) => (
+          conversation.messages.map((msg, index) => {
+            if (!msg || typeof msg !== 'object') return null;
+            return (
             <div key={index} className="message-group">
               {msg.role === 'user' ? (
                 <div className="user-message">
                   <div className="message-label">You</div>
                   <div className="message-content">
-                    {msg.images && msg.images.length > 0 && (
+                    {Array.isArray(msg.images) && msg.images.length > 0 && (
                       <div className="message-images">
                         {msg.images.map((img, imgIndex) => (
                           <img
@@ -649,24 +693,25 @@ export default function ChatInterface({
                             src={img}
                             alt={`Attached ${imgIndex + 1}`}
                             className="message-image"
+                            referrerPolicy="no-referrer"
                           />
                         ))}
                       </div>
                     )}
-                    {msg.files && msg.files.length > 0 && (
+                    {Array.isArray(msg.files) && msg.files.length > 0 && (
                       <div className="message-files">
                         {msg.files.map((file, fileIndex) => (
                           <span key={fileIndex} className="message-file-chip">
-                            📄 {file.name}
+                            📄 {file?.name || 'file'}
                           </span>
                         ))}
                       </div>
                     )}
                     <div className="markdown-content">
-                      <ReactMarkdown remarkPlugins={[remarkGfmPlugin]} components={markdownComponents}>{msg.content}</ReactMarkdown>
+                      <ReactMarkdown remarkPlugins={[remarkGfmPlugin]} components={messageMarkdown}>{typeof msg.content === 'string' ? msg.content : ''}</ReactMarkdown>
                     </div>
                     <div className="copy-row">
-                      <CopyButton text={msg.content} label="Copy message" />
+                      <CopyButton text={typeof msg.content === 'string' ? msg.content : ''} label="Copy message" />
                     </div>
                   </div>
                 </div>
@@ -688,6 +733,7 @@ export default function ChatInterface({
                       failures={msg.stage1_failures || []}
                       skipped={msg.stage1_skipped || []}
                       isRunning={Boolean(msg.loading?.stage1)}
+                      components={messageMarkdown}
                     />
                   )}
                   {/* Interrupted during Stage 1 - no usable answers yet */}
@@ -700,13 +746,15 @@ export default function ChatInterface({
                           {!stage1HasNotes(msg) && <p>No responses collected yet</p>}
                         </div>
                       </div>
-                      <button 
-                        className="retry-button"
-                        onClick={() => onRetryStage(index, 1)}
-                        disabled={runBlocked}
-                      >
-                        Resume from Stage 1
-                      </button>
+                      {showRetry && (
+                        <button
+                          className="retry-button"
+                          onClick={() => onRetryStage(index, 1)}
+                          disabled={runBlocked}
+                        >
+                          Resume from Stage 1
+                        </button>
+                      )}
                     </div>
                   )}
                   {/* Interrupted during Stage 1 - some results collected but not complete */}
@@ -719,22 +767,24 @@ export default function ChatInterface({
                           <p>{stage1AnswerCount(msg)} response(s) collected. Resume to continue or restart.</p>
                         </div>
                       </div>
-                      <div className="interrupted-buttons">
-                        <button 
-                          className="retry-button"
-                          onClick={() => onRetryStage(index, 1)}
-                          disabled={runBlocked}
-                        >
-                          Resume Stage 1
-                        </button>
-                        <button 
-                          className="retry-button secondary"
-                          onClick={() => onRetryStage(index, 2)}
-                          disabled={runBlocked}
-                        >
-                          Skip to Stage 2
-                        </button>
-                      </div>
+                      {showRetry && (
+                        <div className="interrupted-buttons">
+                          <button
+                            className="retry-button"
+                            onClick={() => onRetryStage(index, 1)}
+                            disabled={runBlocked}
+                          >
+                            Resume Stage 1
+                          </button>
+                          <button
+                            className="retry-button secondary"
+                            onClick={() => onRetryStage(index, 2)}
+                            disabled={runBlocked}
+                          >
+                            Skip to Stage 2
+                          </button>
+                        </div>
+                      )}
                     </div>
                   )}
                   {/* Stage 1 complete but Stage 2 was interrupted */}
@@ -747,13 +797,15 @@ export default function ChatInterface({
                           <p>Stage 1 complete. Ready for peer rankings.</p>
                         </div>
                       </div>
-                      <button 
-                        className="retry-button"
-                        onClick={() => onRetryStage(index, 2)}
-                        disabled={runBlocked}
-                      >
-                        Resume from Stage 2
-                      </button>
+                      {showRetry && (
+                        <button
+                          className="retry-button"
+                          onClick={() => onRetryStage(index, 2)}
+                          disabled={runBlocked}
+                        >
+                          Resume from Stage 2
+                        </button>
+                      )}
                     </div>
                   )}
                   {msg.error && msg.error.stage == null && (
@@ -765,13 +817,15 @@ export default function ChatInterface({
                           <p>{msg.error.message}</p>
                         </div>
                       </div>
-                      <button
-                        className="retry-button"
-                        onClick={() => onRetryStage(index, 1)}
-                        disabled={runBlocked}
-                      >
-                        Retry Stage 1
-                      </button>
+                      {showRetry && (
+                        <button
+                          className="retry-button"
+                          onClick={() => onRetryStage(index, 1)}
+                          disabled={runBlocked}
+                        >
+                          Retry Stage 1
+                        </button>
+                      )}
                     </div>
                   )}
                   {msg.error?.stage === 1 && (
@@ -783,13 +837,15 @@ export default function ChatInterface({
                           <p>{msg.error.message}</p>
                         </div>
                       </div>
-                      <button 
-                        className="retry-button"
-                        onClick={() => onRetryStage(index, 1)}
-                        disabled={runBlocked}
-                      >
-                        Retry Stage 1
-                      </button>
+                      {showRetry && (
+                        <button
+                          className="retry-button"
+                          onClick={() => onRetryStage(index, 1)}
+                          disabled={runBlocked}
+                        >
+                          Retry Stage 1
+                        </button>
+                      )}
                     </div>
                   )}
 
@@ -814,9 +870,10 @@ export default function ChatInterface({
                       topKIndices={msg.metadata?.top_k_indices}
                       consensus={msg.metadata?.consensus}
                       redTeam={msg.metadata?.red_team}
+                      components={messageMarkdown}
                     />
                   )}
-                  {msg.stage2_skipped?.length > 0 && (
+                  {Array.isArray(msg.stage2_skipped) && msg.stage2_skipped.length > 0 && (
                     <div className="stage-skipped">
                       <div className="error-details">
                         <strong>Some judges were skipped</strong>
@@ -826,7 +883,7 @@ export default function ChatInterface({
                       </div>
                     </div>
                   )}
-                  {msg.stage2_failures?.length > 0 && (
+                  {Array.isArray(msg.stage2_failures) && msg.stage2_failures.length > 0 && (
                     <div className="stage-error">
                       <div className="error-content">
                         <span className="error-icon">⚠️</span>
@@ -854,13 +911,15 @@ export default function ChatInterface({
                           <p>{msg.error.message}</p>
                         </div>
                       </div>
-                      <button 
-                        className="retry-button"
-                        onClick={() => onRetryStage(index, 2)}
-                        disabled={runBlocked}
-                      >
-                        Retry Stage 2
-                      </button>
+                      {showRetry && (
+                        <button
+                          className="retry-button"
+                          onClick={() => onRetryStage(index, 2)}
+                          disabled={runBlocked}
+                        >
+                          Retry Stage 2
+                        </button>
+                      )}
                     </div>
                   )}
                   {/* Stage 3 */}
@@ -876,6 +935,7 @@ export default function ChatInterface({
                       consensus={msg.metadata?.consensus}
                       labelToModel={msg.metadata?.label_to_model}
                       topKIndices={msg.metadata?.top_k_indices}
+                      components={messageMarkdown}
                     />
                   )}
                   {(msg.error?.stage === 3 || (msg.stage3 && !usableFinalAnswer(msg.stage3))) && (
@@ -893,13 +953,15 @@ export default function ChatInterface({
                           </p>
                         </div>
                       </div>
-                      <button 
-                        className="retry-button"
-                        onClick={() => onRetryStage(index, 3)}
-                        disabled={runBlocked}
-                      >
-                        Retry Stage 3
-                      </button>
+                      {showRetry && (
+                        <button
+                          className="retry-button"
+                          onClick={() => onRetryStage(index, 3)}
+                          disabled={runBlocked}
+                        >
+                          Retry Stage 3
+                        </button>
+                      )}
                     </div>
                   )}
                   {/* Interrupted after Stage 2 complete, before Stage 3 */}
@@ -912,13 +974,15 @@ export default function ChatInterface({
                           <p>Rankings complete. Ready for final synthesis.</p>
                         </div>
                       </div>
-                      <button 
-                        className="retry-button"
-                        onClick={() => onRetryStage(index, 3)}
-                        disabled={runBlocked}
-                      >
-                        Resume from Stage 3
-                      </button>
+                      {showRetry && (
+                        <button
+                          className="retry-button"
+                          onClick={() => onRetryStage(index, 3)}
+                          disabled={runBlocked}
+                        >
+                          Resume from Stage 3
+                        </button>
+                      )}
                     </div>
                   )}
 
@@ -957,7 +1021,8 @@ export default function ChatInterface({
                 </div>
               )}
             </div>
-          ))
+            );
+          })
         )}
 
         <div ref={messagesEndRef} data-scroll-anchor />
@@ -976,6 +1041,7 @@ export default function ChatInterface({
         </button>
       </div>
 
+      {!readOnly && (
       <form className="input-form" onSubmit={handleSubmit}>
           {needsPersonalKey && (
             <div className="api-key-required" role="status">
@@ -1126,6 +1192,14 @@ export default function ChatInterface({
             className="hidden-file-input"
           />
         </form>
+      )}
+      {shareOpen && (
+        <ShareDialog
+          conversation={conversation}
+          locked={shareLocked}
+          onClose={() => setShareOpen(false)}
+        />
+      )}
     </div>
   );
 }

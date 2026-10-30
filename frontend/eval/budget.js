@@ -1,3 +1,4 @@
+import { catalogueId, isFreeModel } from '../src/engine/browser/roster.js';
 import { CONSERVATIVE_DAILY_POSTS, TOTAL_POST_CAP } from './protocol.js';
 
 export class BudgetPaused extends Error {
@@ -102,6 +103,124 @@ export function createBudget(options = {}) {
       return { ...state };
     },
     restore(saved) {
+      Object.assign(state, saved);
+    },
+  };
+}
+
+export function createSpendBudget(options = {}) {
+  const pricing = options.pricing || new Map();
+  const state = {
+    maxPosts: options.maxPosts ?? 1500,
+    maxUsd: options.maxUsd ?? 15,
+    posts: options.posts ?? 0,
+    attempted: options.posts ?? 0,
+    usd: options.usd ?? 0,
+    usageUnknownCharged: options.usageUnknownCharged ?? 0,
+    freePostsToday: options.freePostsToday ?? 0,
+    freeRemaining: options.freeRemaining ?? null,
+    freeLimit: options.freeLimit ?? null,
+    conservativeDaily: options.conservativeDaily ?? CONSERVATIVE_DAILY_POSTS,
+    utcDay: options.utcDay ?? new Date().toISOString().slice(0, 10),
+    paused: false,
+    pauseReason: null,
+    resumeAfter: null,
+  };
+
+  function rollDay(now = Date.now()) {
+    const day = new Date(now).toISOString().slice(0, 10);
+    if (day === state.utcDay) return false;
+    state.utcDay = day;
+    state.freePostsToday = 0;
+    state.freeRemaining = null;
+    state.freeLimit = null;
+    return true;
+  }
+
+  function pauseSpend() {
+    state.paused = true;
+    state.pauseReason = 'spend_cap';
+    state.resumeAfter = null;
+  }
+
+  return {
+    state,
+    rollDay,
+    noteServer(info) {
+      if (!info) return;
+      const bucket = info.free_model_daily_requests || info.freeModelDailyRequests || null;
+      if (bucket && bucket.remaining != null) state.freeRemaining = Number(bucket.remaining);
+      else if (bucket && bucket.limit != null && bucket.used != null) {
+        state.freeRemaining = Number(bucket.limit) - Number(bucket.used);
+      } else {
+        state.freeRemaining = null;
+      }
+      if (bucket && bucket.limit != null) state.freeLimit = Number(bucket.limit);
+    },
+    tryReserve(now = Date.now(), model = '') {
+      rollDay(now);
+      if (state.paused) return false;
+      if (state.posts >= state.maxPosts || state.usd >= state.maxUsd) {
+        pauseSpend();
+        return false;
+      }
+      if (isFreeModel(model)) {
+        const dayExhausted = state.freeRemaining != null
+          ? state.freeRemaining <= 0
+          : state.freePostsToday >= state.conservativeDaily;
+        if (dayExhausted) {
+          state.paused = true;
+          state.pauseReason = 'platform_day';
+          state.resumeAfter = nextUtcMidnight(now);
+          return false;
+        }
+      }
+      state.posts += 1;
+      state.attempted += 1;
+      if (isFreeModel(model)) {
+        state.freePostsToday += 1;
+        if (state.freeRemaining != null) state.freeRemaining -= 1;
+      }
+      return true;
+    },
+    charge(model, usage, usageKnown, maxTokens = 0) {
+      const price = pricing.get(catalogueId(model)) || { prompt: 0, completion: 0 };
+      let cost = 0;
+      if (usageKnown && usage) {
+        cost = Number(usage.prompt_tokens || 0) * price.prompt
+          + Number(usage.completion_tokens || 0) * price.completion;
+      } else {
+        cost = Number(maxTokens || 0) * price.completion;
+        state.usageUnknownCharged += 1;
+      }
+      state.usd += Number.isFinite(cost) ? cost : 0;
+      if (state.usd >= state.maxUsd || state.posts >= state.maxPosts) {
+        state.paused = true;
+        state.pauseReason = 'spend_cap';
+        state.resumeAfter = null;
+      }
+    },
+    pause(reason, resumeAfter = null) {
+      state.paused = true;
+      state.pauseReason = reason;
+      state.resumeAfter = resumeAfter;
+    },
+    resumeIfDue(now = Date.now()) {
+      if (!state.paused) return false;
+      if (state.resumeAfter != null && now >= state.resumeAfter) {
+        state.paused = false;
+        state.pauseReason = null;
+        state.resumeAfter = null;
+        rollDay(now);
+        return true;
+      }
+      return false;
+    },
+    snapshot() {
+      return { ...state };
+    },
+    restore(saved) {
+      if (!saved) return;
       Object.assign(state, saved);
     },
   };

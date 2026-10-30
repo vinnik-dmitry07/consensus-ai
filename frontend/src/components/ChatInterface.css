@@ -1,8 +1,8 @@
 .chat-interface {
   flex: 1;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  height: 100vh;
   background: var(--bg-primary);
   overflow: hidden;
   position: relative;
@@ -22,6 +22,27 @@
   overflow-x: hidden;
   padding: 24px;
   scrollbar-gutter: stable both-edges;
+}
+
+.share-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 8px;
+}
+
+.share-open-button {
+  border: none;
+  border-radius: 8px;
+  padding: 8px 14px;
+  background: var(--accent);
+  color: white;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.share-open-button:hover {
+  background: var(--accent-hover);
 }
 
 .scroll-to-bottom-btn {

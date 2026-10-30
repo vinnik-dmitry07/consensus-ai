@@ -4,7 +4,7 @@ import CopyButton from './CopyButton';
 import './Stage3.css';
 
 function shortName(model) {
-  if (!model) return '';
+  if (typeof model !== 'string' || !model) return '';
   return model.split('/')[1] || model;
 }
 
@@ -12,7 +12,7 @@ function displayNameForIndex(index, labelToModel) {
   if (index == null || !labelToModel) return null;
   const label = `Response ${index + 1}`;
   const model = labelToModel[label];
-  if (!model) return null;
+  if (typeof model !== 'string' || !model) return null;
 
   const totals = {};
   Object.values(labelToModel).forEach((id) => {
@@ -38,13 +38,15 @@ export default function Stage3({
   consensus,
   labelToModel,
   topKIndices,
+  components = markdownComponents,
 }) {
   if (!finalResponse) {
     return null;
   }
-  const answer = finalResponse.response;
+  const answer = typeof finalResponse.response === 'string' ? finalResponse.response : '';
 
-  const level = finalResponse.consensus_level || consensus?.level;
+  const rawLevel = finalResponse.consensus_level || consensus?.level;
+  const level = typeof rawLevel === 'string' ? rawLevel : '';
   const basedOn =
     finalResponse.based_on_index ?? consensus?.leader_index ?? null;
   const basedOnName = displayNameForIndex(basedOn, labelToModel);
@@ -71,7 +73,7 @@ export default function Stage3({
           </div>
         )}
         <div className="final-text markdown-content">
-          <ReactMarkdown remarkPlugins={[remarkGfmPlugin]} components={markdownComponents}>
+          <ReactMarkdown remarkPlugins={[remarkGfmPlugin]} components={components}>
             {answer}
           </ReactMarkdown>
         </div>

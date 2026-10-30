@@ -13,3 +13,55 @@
     'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
     sans-serif;
 }
+
+.main-column {
+  flex: 1;
+  min-width: 0;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.share-banner {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 20px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.share-banner-text {
+  min-width: 0;
+  font-size: 0.95rem;
+}
+
+.share-banner-actions {
+  display: flex;
+  flex: none;
+  gap: 8px;
+}
+
+.share-banner button {
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+.share-banner button.share-banner-save {
+  border: none;
+  background: var(--accent);
+  color: white;
+}
+
+.share-banner button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}

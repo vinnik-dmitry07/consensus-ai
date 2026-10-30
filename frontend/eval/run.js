@@ -11,15 +11,16 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  OPENROUTER_CREDITS_URL,
   OPENROUTER_KEY_URL,
   OPENROUTER_MODELS_URL,
   queryModelResult,
 } from '../src/engine/browser/openrouter.js';
-import { catalogueId, readBlockedIds } from '../src/engine/browser/roster.js';
+import { catalogueId, isFreeModel, readBlockedIds } from '../src/engine/browser/roster.js';
 import { settings } from '../src/engine/browser/settings.js';
-import { createBudget } from './budget.js';
+import { createBudget, createSpendBudget } from './budget.js';
 import { buildBank, taskPublicId } from './datasets.js';
-import { answerPrompt, failureKind, gradeResponse } from './grade.js';
+import { answerPrompt, failureKind, gradeResponse, gradeResponseLenient, LENIENT_RULES } from './grade.js';
 import {
   INCIDENT,
   PUBLISHED_KEY_SHA256,
@@ -28,11 +29,12 @@ import {
   TOTAL_POST_CAP,
   protocolHash,
 } from './protocol.js';
+import { runIsolated } from './questionScope.js';
 import { analyze, renderReport, renderSummary, replaceSection } from './report.js';
-import { createSession, snapshotLocal } from './runtime.js';
+import { createSession, networkOutageCount, readSlotMap, snapshotLocal } from './runtime.js';
 import { configsFor, selectFromDev, selectSearchPool } from './select.js';
 import { loadRawSources, sourceMetadata } from './sources.js';
-import { installTransport } from './transport.js';
+import { installTransport, isNetworkMessage } from './transport.js';
 import { compareHash, sha256 } from './util.js';
 import { runQuestion } from './variants.js';
 
@@ -42,6 +44,20 @@ const RUNS_DIR = path.join(EVAL_ROOT, '.runs');
 const README_PATH = path.resolve(EVAL_ROOT, '../../README.md');
 const README_START = '<!-- eval-results:start -->';
 const README_END = '<!-- eval-results:end -->';
+const REPAIR_AMENDMENT = 'Transport failures were re-executed after the as-run data were inspected. Paid endpoints, where the catalogue has them, are separate deployments of the same weights. This layer is secondary and exploratory; the pre-registered as-run result is unchanged.';
+const COMPLETE_AMENDMENT = 'Format slips with one unambiguous answer are read from the repaired text. Cells with no answer were drawn again, up to the recorded attempt limit, on the same request. Stage 2, the red team, and Stage 3 were replayed unchanged. This layer is secondary and exploratory; the pre-registered as-run result and the strict repaired result are unchanged.';
+
+const NETWORK_RETRY_MS = 30_000;
+
+export function isNetworkError(error) {
+  return [error?.message, error?.cause?.code, error?.cause?.message].some((text) => isNetworkMessage(text));
+}
+
+function pauseForNetwork(budget, error) {
+  budget.pause('network', Date.now() + NETWORK_RETRY_MS);
+  console.log(`Network unavailable (${error?.cause?.code || error?.message}). Paused; run the same command again.`);
+  return 2;
+}
 
 function writeJson(file, value) {
   mkdirSync(path.dirname(file), { recursive: true });
@@ -588,6 +604,9 @@ async function testSplit(runId) {
     const result = await runSplit(run, 'test', items, manifest);
     console.log(`Test ${result.status}.`);
     return exitCodeFor(result);
+  } catch (error) {
+    if (!isNetworkError(error)) throw error;
+    return pauseForNetwork(run.budget, error);
   } finally {
     run.close();
   }
@@ -631,6 +650,547 @@ export function costsFromJournal(dir) {
   return { attempted, usageKnown, usageUnknown, serviceMs };
 }
 
+function flagNumber(argv, name, fallback) {
+  const index = argv.indexOf(name);
+  if (index < 0 || argv[index + 1] == null) return fallback;
+  const value = Number(argv[index + 1]);
+  if (!Number.isFinite(value) || value < 0) throw new Error(`${name} needs a non-negative number`);
+  return value;
+}
+
+function loadPaidKey() {
+  const key = String(process.env.or_key || process.env.OR_KEY || '').trim();
+  if (!key) {
+    throw new Error('or_key is missing. In PowerShell: $env:or_key = [Environment]::GetEnvironmentVariable(\'or_key\',\'User\')');
+  }
+  if (sha256(key) === PUBLISHED_KEY_SHA256) {
+    throw new Error('Refusing the published OpenRouter key.');
+  }
+  return key;
+}
+
+function questionFile(dir, id) {
+  return path.join(dir, `${String(id).replace(/[^a-zA-Z0-9._-]+/g, '_')}.json`);
+}
+
+export function repairModelId(frozenId, catalogueIds) {
+  const base = catalogueId(frozenId);
+  const paidBase = base.replace(/:free$/, '');
+  const suffix = frozenId.endsWith('-reasoning-high')
+    ? '-reasoning-high'
+    : (frozenId.endsWith('-reasoning') ? '-reasoning' : '');
+  if (paidBase !== base && catalogueIds.has(paidBase)) return `${paidBase}${suffix}`;
+  return frozenId;
+}
+
+export function paidRoster(manifest, catalogue) {
+  const models = catalogue?.models || catalogue?.data || [];
+  const ids = new Set(models.map((model) => model?.id).filter(Boolean));
+  const frozenIds = [...new Set([
+    ...(manifest.councilModels || []),
+    manifest.chairmanModel,
+    manifest.bModel,
+  ].filter(Boolean))];
+  const mapping = {};
+  for (const id of frozenIds) mapping[id] = repairModelId(id, ids);
+  const pricing = {};
+  for (const repairId of Object.values(mapping)) {
+    const base = catalogueId(repairId);
+    const model = models.find((item) => item.id === base);
+    pricing[base] = {
+      prompt: Number(model?.pricing?.prompt || 0),
+      completion: Number(model?.pricing?.completion || 0),
+    };
+  }
+  return { mapping, pricing };
+}
+
+function aliasOfMapping(mapping) {
+  const reverse = new Map(Object.entries(mapping).map(([source, repairId]) => [repairId, source]));
+  return (model) => reverse.get(model) || model;
+}
+
+async function authorizedGet(url, key) {
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${key}` },
+  });
+  if (!response.ok) throw new Error(`OpenRouter ${new URL(url).pathname} HTTP ${response.status}`);
+  const body = await response.json();
+  return body.data || body;
+}
+
+function creditBalance(info) {
+  if (!info || info.total_credits == null || info.total_usage == null) return null;
+  return Number(info.total_credits) - Number(info.total_usage);
+}
+
+export function spendFromJournal(file, pricing) {
+  const prices = pricing instanceof Map ? pricing : new Map(Object.entries(pricing || {}));
+  const priceOf = (model) => prices.get(catalogueId(model)) || { prompt: 0, completion: 0 };
+  const open = new Map();
+  const totals = { posts: 0, usd: 0, unknown: 0 };
+  if (!existsSync(file)) return totals;
+  for (const line of readFileSync(file, 'utf8').split(/\n/)) {
+    if (!line.includes('"kind":"http"')) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (event.phase === 'reserved') {
+      totals.posts += 1;
+      const list = open.get(event.key) || [];
+      list.push({ model: event.model, maxTokens: Number(event.body?.max_tokens || 0) });
+      open.set(event.key, list);
+      continue;
+    }
+    if (event.phase !== 'finished' && event.phase !== 'error') continue;
+    const attempt = open.get(event.key)?.shift() || { model: event.model, maxTokens: 0 };
+    if (event.phase === 'error') continue;
+    const price = priceOf(event.model);
+    if (event.usageKnown && event.usage) {
+      totals.usd += Number(event.usage.prompt_tokens || 0) * price.prompt
+        + Number(event.usage.completion_tokens || 0) * price.completion;
+    } else {
+      totals.usd += attempt.maxTokens * price.completion;
+      totals.unknown += 1;
+    }
+  }
+  for (const list of open.values()) {
+    for (const attempt of list) {
+      totals.usd += attempt.maxTokens * priceOf(attempt.model).completion;
+      totals.unknown += 1;
+    }
+  }
+  return totals;
+}
+
+export function keyFingerprint(key) {
+  return sha256(String(key)).slice(0, 16);
+}
+
+export function noteKeyUsage(state, fingerprint, usage) {
+  if (usage == null) return;
+  const value = Number(usage);
+  if (state.keyFingerprint != null && state.keyFingerprint !== fingerprint) {
+    const used = Math.max(0, (state.keyUsageLast ?? 0) - (state.keyUsageAtStart ?? 0));
+    state.priorKeySpend = (state.priorKeySpend || 0) + used;
+    state.keyUsageAtStart = value;
+  }
+  if (state.keyUsageAtStart == null) state.keyUsageAtStart = value;
+  state.keyFingerprint = fingerprint;
+  state.keyUsageLast = value;
+}
+
+function reconcileSpend(budget, journal) {
+  if (journal.usd > budget.state.usd) budget.state.usd = journal.usd;
+  if (journal.posts > budget.state.posts) {
+    budget.state.attempted += journal.posts - budget.state.posts;
+    budget.state.posts = journal.posts;
+  }
+  if (journal.unknown > budget.state.usageUnknownCharged) {
+    budget.state.usageUnknownCharged = journal.unknown;
+  }
+}
+
+function applySpendLimits(budget, maxUsd, maxPosts) {
+  budget.state.maxUsd = maxUsd;
+  budget.state.maxPosts = maxPosts;
+  if (
+    budget.state.pauseReason === 'spend_cap'
+    && budget.state.usd < maxUsd
+    && budget.state.posts < maxPosts
+  ) {
+    budget.state.paused = false;
+    budget.state.pauseReason = null;
+    budget.state.resumeAfter = null;
+  }
+}
+
+function residualFailures(arms) {
+  const residual = {};
+  for (const [arm, grade] of Object.entries(arms || {})) {
+    if (!grade || grade.status === 'graded') continue;
+    residual[arm] = grade.status;
+  }
+  return residual;
+}
+
+function repairSlotStats(session, questionId) {
+  const stats = { reusedSlots: 0, liveSlots: 0, paidPosts: 0, freePosts: 0 };
+  for (const slot of session.slots()) {
+    if (slot.meta?.questionId !== questionId) continue;
+    if (slot.reusedFrom) {
+      stats.reusedSlots += 1;
+      continue;
+    }
+    if (slot.state === 'completed' || slot.state === 'failed' || slot.state === 'skipped') {
+      stats.liveSlots += 1;
+    }
+    const attempts = slot.httpAttempts || 0;
+    if (isFreeModel(slot.meta?.model)) stats.freePosts += attempts;
+    else stats.paidPosts += attempts;
+  }
+  return stats;
+}
+
+function openLayerRun(runId, {
+  dirName,
+  maxUsd,
+  maxPosts,
+  mapping,
+  pricing,
+  replayFrom,
+  aliasOf,
+  replayTerminal = false,
+}) {
+  const paths = runPaths(runId);
+  const dir = path.join(paths.dir, dirName);
+  const release = acquireLock(dir);
+  const stateFile = path.join(dir, 'state.json');
+  const state = readJson(stateFile, {
+    creditsAtStart: null,
+    creditsLast: null,
+    budget: null,
+  });
+  const budget = createSpendBudget({
+    maxUsd,
+    maxPosts,
+    pricing: new Map(Object.entries(pricing || {})),
+  });
+  if (state.budget) budget.restore(state.budget);
+  reconcileSpend(budget, spendFromJournal(path.join(dir, 'events.jsonl'), pricing));
+  applySpendLimits(budget, maxUsd, maxPosts);
+  budget.resumeIfDue();
+  const session = createSession({
+    runDir: dir,
+    budget,
+    replayFrom,
+    aliasOf,
+    replayTerminal,
+  });
+  session.install();
+  const allow = new Set(Object.values(mapping).map((model) => catalogueId(model)));
+  const restoreFetch = installTransport({
+    allowModels: allow,
+    allowPaid: true,
+    budget,
+    onHttp: session.onHttp,
+    onCooldown: session.onCooldown,
+  });
+  return {
+    dir,
+    paths,
+    state,
+    budget,
+    session,
+    allow,
+    close() {
+      session.uninstall();
+      restoreFetch();
+      state.budget = budget.snapshot();
+      writeJson(stateFile, state);
+      release();
+    },
+  };
+}
+
+function frozenFromMapping(manifest, mapping) {
+  return {
+    councilModels: manifest.councilModels.map((model) => mapping[model]),
+    chairmanModel: mapping[manifest.chairmanModel],
+    bModel: mapping[manifest.bModel],
+  };
+}
+
+async function runLayer(runId, argv, layer) {
+  const key = loadPaidKey();
+  const maxUsd = flagNumber(argv, '--max-usd', layer.maxUsd);
+  const maxPosts = flagNumber(argv, '--max-posts', layer.maxPosts);
+  const jobs = Math.max(1, Math.trunc(flagNumber(argv, '--jobs', 4)));
+  const attempts = layer.attempts == null
+    ? 0
+    : Math.max(0, Math.trunc(flagNumber(argv, '--attempts', layer.attempts)));
+  const paths = runPaths(runId);
+  const manifest = readJson(paths.manifest);
+  if (!manifest?.frozen) throw new Error(`Freeze the dev manifest before ${layer.name}.`);
+  if (manifest.protocolHash !== protocolHash()) throw new Error('Manifest protocol hash does not match.');
+  const prepared = layer.prepare({
+    argv,
+    manifest,
+    paths,
+    maxUsd,
+    maxPosts,
+    attempts,
+  });
+  const replayFrom = new Map();
+  const run = openLayerRun(runId, {
+    dirName: layer.dirName,
+    maxUsd,
+    maxPosts,
+    mapping: prepared.mapping,
+    pricing: prepared.pricing,
+    replayFrom,
+    aliasOf: prepared.aliasOf,
+    replayTerminal: layer.replayTerminal,
+  });
+  try {
+    const models = await authorizedGet(OPENROUTER_MODELS_URL, key);
+    if (!models) throw new Error('Model catalogue was empty.');
+    if (run.budget.state.pauseReason === 'network' || run.budget.state.pauseReason === 'cooldown') {
+      run.budget.state.paused = false;
+      if (run.budget.state.pauseReason === 'network') {
+        run.budget.state.pauseReason = null;
+        run.budget.state.resumeAfter = null;
+      }
+    }
+    const keyInfo = await authorizedGet(OPENROUTER_KEY_URL, key);
+    const credits = await authorizedGet(OPENROUTER_CREDITS_URL, key);
+    run.budget.noteServer(keyInfo);
+    const balance = creditBalance(credits);
+    if (run.state.creditsAtStart == null && balance != null) run.state.creditsAtStart = balance;
+    if (balance != null) run.state.creditsLast = balance;
+    noteKeyUsage(run.state, keyFingerprint(key), keyInfo?.usage);
+    run.state.budget = run.budget.snapshot();
+    writeJson(path.join(run.dir, 'state.json'), run.state);
+    const freeRemaining = keyInfo?.free_model_daily_requests?.remaining;
+    const keyLimit = keyInfo?.limit == null
+      ? 'none'
+      : `$${Number(keyInfo.limit_remaining ?? 0).toFixed(2)} of $${Number(keyInfo.limit).toFixed(2)}`;
+    console.log(`${layer.verb} balance: ${balance == null ? 'unknown' : `$${balance.toFixed(2)}`}. Free-model requests left today: ${freeRemaining ?? 'unknown'}. Key spending limit left: ${keyLimit}.`);
+    if (balance != null && balance < 10) {
+      console.log('Balance is under $10. Free ids without a paid variant will follow the key\'s free daily cap, otherwise 50/day.');
+    }
+    const attemptText = attempts > 0 ? `, ${attempts} draws` : '';
+    console.log(`Spend cap $${maxUsd}, ${maxPosts} posts, ${jobs} jobs${attemptText}. Local estimate so far $${run.budget.state.usd.toFixed(4)}.`);
+    if (run.budget.state.paused) {
+      console.log(`${layer.verb} paused before the first question: ${run.budget.state.pauseReason}`);
+      return 2;
+    }
+    for (const [slotKeyName, slot] of readSlotMap(prepared.replayFile)) {
+      replayFrom.set(slotKeyName, slot);
+    }
+    applyFrozen(prepared.frozen, key);
+    const baseSnap = snapshotLocal();
+    const bank = loadBank();
+    const items = identify(bank.items.filter((item) => item.split === 'test'));
+    const byId = new Map(items.map((item) => [item.id, item]));
+    const { ready, orderLength } = prepared.ready(paths);
+    const pending = [];
+    let done = 0;
+    for (const id of ready) {
+      const file = questionFile(path.join(run.dir, 'questions'), id);
+      if (readJson(file)?.status === 'complete') done += 1;
+      else pending.push(id);
+    }
+    const initialDone = done;
+    let cursor = 0;
+    let stop = false;
+    let cooled = false;
+    let exitCode = 0;
+    const overCap = () => (
+      run.budget.state.paused
+      || run.budget.state.usd >= maxUsd
+      || run.budget.state.posts >= maxPosts
+    );
+    function take() {
+      if (stop || overCap()) return null;
+      if (cursor >= pending.length) return null;
+      cursor += 1;
+      return { id: pending[cursor - 1], place: initialDone + cursor };
+    }
+    function noteExit(code) {
+      if (exitCode === 1) return;
+      if (code === 1 || exitCode === 0) exitCode = code;
+    }
+    const workers = Math.min(jobs, Math.max(pending.length, 1));
+    async function worker(index) {
+      while (true) {
+        const next = take();
+        if (!next) return;
+        const file = questionFile(path.join(run.dir, 'questions'), next.id);
+        const task = byId.get(next.id);
+        if (!task) throw new Error('Test order contains an id that is not in the bank.');
+        console.log(`w${index} ${layer.name} ${next.place}/${ready.length} ${task.block}`);
+        const usdBefore = run.budget.state.usd;
+        const result = await runIsolated(baseSnap, index, () => (
+          runQuestion(task, run.session, prepared.frozen, baseSnap, prepared.questionOptions || {})
+        ));
+        const stats = repairSlotStats(run.session, task.id);
+        const annotated = {
+          ...result,
+          ...stats,
+          usdEstimate: run.budget.state.usd - usdBefore,
+          residualFailures: residualFailures(result.arms),
+        };
+        writeJson(file, annotated);
+        run.state.budget = run.budget.snapshot();
+        writeJson(path.join(run.dir, 'state.json'), run.state);
+        if (result.status !== 'complete') {
+          if (result.reason === 'cooldown') {
+            cooled = true;
+            console.log(`w${index} ${layer.verb} cooldown at ${done}/${ready.length}. Other questions continue. USD $${run.budget.state.usd.toFixed(4)}.`);
+            continue;
+          }
+          stop = true;
+          noteExit(exitCodeFor(result));
+          console.log(`w${index} ${layer.verb} ${result.status} at ${done}/${ready.length}: ${result.reason}. USD $${run.budget.state.usd.toFixed(4)}.`);
+          return;
+        }
+        done += 1;
+        console.log(`w${index} ${layer.name} ${done}/${ready.length} reused ${stats.reusedSlots}, live ${stats.liveSlots}, usd $${run.budget.state.usd.toFixed(4)}`);
+      }
+    }
+    await Promise.all(Array.from({ length: workers }, (_, index) => worker(index)));
+    if (exitCode === 1) return 1;
+    if (exitCode || overCap()) {
+      const reason = run.budget.state.pauseReason || 'spend_cap';
+      console.log(`${layer.verb} paused after ${done} questions: ${reason}. USD $${run.budget.state.usd.toFixed(4)}.`);
+      return exitCode || 2;
+    }
+    if (cooled) {
+      console.log(`${layer.verb} paused after ${done} questions: cooldown. USD $${run.budget.state.usd.toFixed(4)}.`);
+      return 2;
+    }
+    if (layer.followSource && ready.length < orderLength) {
+      console.log(`${layer.verb} caught up: ${done} questions. Main still has ${orderLength - ready.length} unfinished. USD $${run.budget.state.usd.toFixed(4)}.`);
+      return 2;
+    }
+    console.log(`${layer.verb} complete. Posts ${run.budget.state.posts}. USD $${run.budget.state.usd.toFixed(4)}.`);
+    return 0;
+  } catch (error) {
+    if (!isNetworkError(error)) throw error;
+    return pauseForNetwork(run.budget, error);
+  } finally {
+    try {
+      const info = await authorizedGet(OPENROUTER_KEY_URL, key);
+      noteKeyUsage(run.state, keyFingerprint(key), info?.usage);
+    } catch {
+      // The next start records the counter.
+    }
+    run.close();
+  }
+}
+
+function repairLayer() {
+  return {
+    name: 'repair',
+    dirName: 'repair',
+    verb: 'Repair',
+    maxUsd: 15,
+    maxPosts: 1500,
+    replayTerminal: false,
+    followSource: true,
+    prepare({ manifest, paths, maxUsd, maxPosts }) {
+      const catalogue = readJson(path.join(CACHE_DIR, 'catalogue.json'), {});
+      const roster = paidRoster(manifest, catalogue);
+      const repairManifestPath = path.join(paths.dir, 'repair', 'manifest.json');
+      const existingRepair = readJson(repairManifestPath);
+      if (existingRepair && JSON.stringify(existingRepair.mapping) !== JSON.stringify(roster.mapping)) {
+        throw new Error('Repair manifest mapping does not match the catalogue. Refusing to mix endpoints.');
+      }
+      writeJson(repairManifestPath, {
+        repairOf: manifest.protocolHash,
+        mapping: roster.mapping,
+        pricing: roster.pricing,
+        maxUsd,
+        maxPosts,
+        startedAt: existingRepair?.startedAt || new Date().toISOString(),
+        amendment: REPAIR_AMENDMENT,
+      });
+      return {
+        mapping: roster.mapping,
+        pricing: roster.pricing,
+        frozen: frozenFromMapping(manifest, roster.mapping),
+        aliasOf: aliasOfMapping(roster.mapping),
+        replayFile: path.join(paths.dir, 'events.jsonl'),
+        questionOptions: {},
+        ready(sourcePaths) {
+          const order = readJson(path.join(sourcePaths.dir, 'test-order.json'));
+          if (!Array.isArray(order) || !order.length) throw new Error('The main test has no saved order yet.');
+          const ready = [];
+          for (const id of order) {
+            const saved = readJson(questionFile(sourcePaths.questions, id));
+            if (saved?.status !== 'complete') break;
+            ready.push(id);
+          }
+          return { ready, orderLength: order.length };
+        },
+      };
+    },
+  };
+}
+
+function completeLayer() {
+  return {
+    name: 'complete',
+    dirName: 'complete',
+    verb: 'Complete',
+    maxUsd: 5,
+    maxPosts: 600,
+    attempts: 3,
+    replayTerminal: true,
+    followSource: false,
+    prepare({ manifest, paths, maxUsd, maxPosts, attempts }) {
+      const repairManifest = readJson(path.join(paths.dir, 'repair', 'manifest.json'));
+      if (!repairManifest?.mapping) throw new Error('Finish the repair layer before the answer-complete layer.');
+      const expected = manifest.bankCounts?.test
+        ?? Object.values(TEST_COUNTS).reduce((sum, count) => sum + count, 0);
+      const order = readJson(path.join(paths.dir, 'test-order.json'));
+      if (!Array.isArray(order) || !order.length) throw new Error('The main test has no saved order yet.');
+      const repaired = new Set(
+        readQuestions(path.join(paths.dir, 'repair', 'questions'))
+          .filter((row) => row.split === 'test' && row.status === 'complete')
+          .map((row) => row.id),
+      );
+      const ready = order.filter((id) => repaired.has(id));
+      if (ready.length < expected) {
+        throw new Error(`Repair has ${ready.length}/${expected} complete questions. Finish repair before complete.`);
+      }
+      const manifestPath = path.join(paths.dir, 'complete', 'manifest.json');
+      const existing = readJson(manifestPath);
+      const sameReading = existing
+        && existing.attempts === attempts
+        && existing.lenientRules === LENIENT_RULES
+        && JSON.stringify(existing.completeOf) === JSON.stringify(repairManifest.mapping);
+      if (existing && !sameReading) {
+        throw new Error('Complete manifest does not match this reading. Refusing to mix layers.');
+      }
+      writeJson(manifestPath, {
+        completeOf: repairManifest.mapping,
+        repairOf: repairManifest.repairOf,
+        attempts,
+        lenientRules: LENIENT_RULES,
+        pricing: repairManifest.pricing,
+        maxUsd,
+        maxPosts,
+        startedAt: existing?.startedAt || new Date().toISOString(),
+        amendment: COMPLETE_AMENDMENT,
+      });
+      return {
+        mapping: repairManifest.mapping,
+        pricing: repairManifest.pricing,
+        frozen: frozenFromMapping(manifest, repairManifest.mapping),
+        aliasOf: (model) => model,
+        replayFile: path.join(paths.dir, 'repair', 'events.jsonl'),
+        questionOptions: { grader: gradeResponseLenient, attempts },
+        ready() {
+          return { ready, orderLength: order.length };
+        },
+      };
+    },
+  };
+}
+
+async function repair(runId, argv) {
+  return runLayer(runId, argv, repairLayer());
+}
+
+async function complete(runId, argv) {
+  return runLayer(runId, argv, completeLayer());
+}
+
 export function updateReadme(file, summary) {
   if (!existsSync(file)) return false;
   const current = readFileSync(file, 'utf8');
@@ -651,6 +1211,83 @@ function report(runId, argv = []) {
   const analysis = analyze(testRows, { alternatives, expected });
   const costs = costsFromJournal(paths.dir);
   const complete = analysis.scored === expected && analysis.pending === 0 && analysis.notStarted === 0;
+  const repairDir = path.join(paths.dir, 'repair');
+  const repairManifest = readJson(path.join(repairDir, 'manifest.json'));
+  const repairState = readJson(path.join(repairDir, 'state.json'), {});
+  const repairRows = readQuestions(path.join(repairDir, 'questions')).filter((row) => row.split === 'test');
+  const repaired = repairRows.length
+    ? analyze(repairRows, { alternatives, expected: analysis.scored })
+    : null;
+  const repairUsage = repairRows.reduce((sum, row) => ({
+    reusedSlots: sum.reusedSlots + (row.reusedSlots || 0),
+    liveSlots: sum.liveSlots + (row.liveSlots || 0),
+    paidPosts: sum.paidPosts + (row.paidPosts || 0),
+    freePosts: sum.freePosts + (row.freePosts || 0),
+  }), { reusedSlots: 0, liveSlots: 0, paidPosts: 0, freePosts: 0 });
+  const creditsAtStart = repairState?.creditsAtStart ?? null;
+  const creditsLast = repairState?.creditsLast ?? null;
+  const keyUsageAtStart = repairState?.keyUsageAtStart ?? null;
+  const keyUsageLast = repairState?.keyUsageLast ?? null;
+  const priorKeySpend = repairState?.priorKeySpend ?? 0;
+  const repair = {
+    mapping: repairManifest?.mapping || null,
+    amendment: repairManifest?.amendment || null,
+    posts: repairState?.budget?.posts ?? null,
+    usdEstimate: repairState?.budget?.usd ?? null,
+    usageUnknownCharged: repairState?.budget?.usageUnknownCharged ?? null,
+    creditsAtStart,
+    creditsLast,
+    keyUsageAtStart,
+    keyUsageLast,
+    priorKeySpend,
+    keySpend: keyUsageAtStart != null && keyUsageLast != null
+      ? priorKeySpend + keyUsageLast - keyUsageAtStart
+      : null,
+    ...repairUsage,
+    residualByArm: repaired?.armStatus || null,
+    networkOutageQuestions: networkOutageCount(path.join(paths.dir, 'events.jsonl')),
+  };
+  const completeDir = path.join(paths.dir, 'complete');
+  const completeManifest = readJson(path.join(completeDir, 'manifest.json'));
+  const completeState = readJson(path.join(completeDir, 'state.json'), {});
+  const completeRows = readQuestions(path.join(completeDir, 'questions')).filter((row) => row.split === 'test');
+  const completed = completeRows.length
+    ? analyze(completeRows, { alternatives, expected: analysis.scored })
+    : null;
+  const completeUsage = completeRows.reduce((sum, row) => ({
+    reusedSlots: sum.reusedSlots + (row.reusedSlots || 0),
+    liveSlots: sum.liveSlots + (row.liveSlots || 0),
+    paidPosts: sum.paidPosts + (row.paidPosts || 0),
+    freePosts: sum.freePosts + (row.freePosts || 0),
+    lenientCells: sum.lenientCells + (row.lenientCells || 0),
+    resampledCells: sum.resampledCells + (row.resampledCells || 0),
+    exhaustedCells: sum.exhaustedCells + (row.exhaustedCells || 0),
+    resamplePosts: sum.resamplePosts + (row.resamplePosts || 0),
+  }), {
+    reusedSlots: 0,
+    liveSlots: 0,
+    paidPosts: 0,
+    freePosts: 0,
+    lenientCells: 0,
+    resampledCells: 0,
+    exhaustedCells: 0,
+    resamplePosts: 0,
+  });
+  const completeKeyAtStart = completeState?.keyUsageAtStart ?? null;
+  const completeKeyLast = completeState?.keyUsageLast ?? null;
+  const completePrior = completeState?.priorKeySpend ?? 0;
+  const completion = {
+    attempts: completeManifest?.attempts ?? null,
+    lenientRules: completeManifest?.lenientRules || null,
+    amendment: completeManifest?.amendment || null,
+    posts: completeState?.budget?.posts ?? null,
+    usdEstimate: completeState?.budget?.usd ?? null,
+    usageUnknownCharged: completeState?.budget?.usageUnknownCharged ?? null,
+    keySpend: completeKeyAtStart != null && completeKeyLast != null
+      ? completePrior + completeKeyLast - completeKeyAtStart
+      : null,
+    ...completeUsage,
+  };
   const context = {
     complete,
     costs,
@@ -667,6 +1304,11 @@ function report(runId, argv = []) {
       bModel: manifest.bModel,
       a0AliasesA1: manifest.a0AliasesA1,
     } : null,
+    repaired,
+    repair,
+    completed,
+    completion,
+    networkOutageQuestions: repair.networkOutageQuestions,
   };
   const body = {
     protocolHash: protocolHash(),
@@ -678,6 +1320,11 @@ function report(runId, argv = []) {
     nominal: manifest.nominal || null,
     costs,
     analysis,
+    primary: analysis,
+    repaired,
+    repair,
+    completed,
+    completion,
   };
   writeJson(paths.reportJson, body);
   writeFileSync(paths.reportMd, renderReport(analysis, context), 'utf8');
@@ -702,6 +1349,8 @@ export async function main(argv) {
   if (command === 'smoke') return smoke(runId);
   if (command === 'dev') return dev(runId);
   if (command === 'test') return testSplit(runId);
+  if (command === 'repair') return repair(runId, argv);
+  if (command === 'complete') return complete(runId, argv);
   if (command === 'report') return report(runId, argv);
   if (command === 'hash') {
     console.log(protocolHash());

@@ -9,6 +9,7 @@ import {
   stage3SynthesizeFinal,
 } from '../src/engine/browser/council.js';
 import { queryModelResult } from '../src/engine/browser/openrouter.js';
+import { catalogueId } from '../src/engine/browser/roster.js';
 import { settings } from '../src/engine/browser/settings.js';
 import { answerPrompt, failureKind, gradeResponse, plurality } from './grade.js';
 import { SELF_MOA_LEAD, SCHEDULE_SEED, PLURALITY_SEED } from './protocol.js';
@@ -16,6 +17,22 @@ import { BudgetPaused } from './budget.js';
 import { compareHash } from './util.js';
 
 const TERMINAL = new Set(['completed', 'failed', 'skipped']);
+const modelGates = new Map();
+
+function withModelGate(model, task) {
+  const id = catalogueId(model);
+  let run = modelGates.get(id);
+  if (!run) {
+    let chain = Promise.resolve();
+    run = (job) => {
+      const result = chain.then(job, job);
+      chain = result.then(() => {}, () => {});
+      return result;
+    };
+    modelGates.set(id, run);
+  }
+  return run(task);
+}
 
 function messages(content) {
   return [{ role: 'user', content }];
@@ -53,20 +70,33 @@ function findSlot(session, meta) {
     && slot.meta.stage === meta.stage
     && slot.meta.sample === meta.sample
     && slot.meta.model === meta.model
+    && (slot.meta.attempt || 0) === (meta.attempt || 0)
   )) || null;
 }
 
-function gradeSlot(task, slot) {
+function gradeSlot(task, slot, grader = gradeResponse) {
   if (!slot || !TERMINAL.has(slot.state)) return null;
   if (slot.state !== 'completed' || !slot.result?.ok) {
     const kind = slot.incompleteHttp ? 'truncated' : failureKind(slot.result);
-    return gradeResponse(task, '', kind);
+    return grader(task, '', kind);
   }
   if (slot.finishReason === 'length') {
-    const graded = gradeResponse(task, slot.result.content || '');
+    const graded = grader(task, slot.result.content || '');
+    if (graded.status === 'graded') return { ...graded, truncated: true };
+    if (grader !== gradeResponse) {
+      return {
+        ...graded,
+        status: 'no_answer',
+        reason: 'length',
+        truncated: true,
+        correct: 0,
+        formatCompliant: false,
+        extracted: null,
+      };
+    }
     return { ...graded, truncated: true };
   }
-  return gradeResponse(task, slot.result.content || '');
+  return grader(task, slot.result.content || '');
 }
 
 function withGold(task, grade) {
@@ -77,7 +107,7 @@ function withGold(task, grade) {
   return {
     ...grade,
     correct: grade.extracted === task.goldCanon ? 1 : 0,
-    formatCompliant: true,
+    formatCompliant: grade.lenient ? false : true,
   };
 }
 
@@ -121,7 +151,9 @@ function sortByCouncil(rows, council) {
   ));
 }
 
-export async function runQuestion(task, session, frozen, baseSnap) {
+export async function runQuestion(task, session, frozen, baseSnap, options = {}) {
+  const grader = options.grader || gradeResponse;
+  const attempts = Math.max(0, Math.trunc(options.attempts || 0));
   const questionId = task.id;
   const prompt = answerPrompt(task);
   const user = messages(prompt);
@@ -222,8 +254,8 @@ export async function runQuestion(task, session, frozen, baseSnap) {
     })) || gradeResponse(task, '', 'provider_error'));
   }
 
-  const bGrades = [1, 2, 3, 4, 5].map((sample) => bGrade(sample) || gradeResponse(task, '', 'provider_error'));
-  const council = councilGrades();
+  let bGrades = [1, 2, 3, 4, 5].map((sample) => bGrade(sample) || gradeResponse(task, '', 'provider_error'));
+  let council = councilGrades();
   const arms = {
     A1: withGold(task, bGrades[0]),
     A2: withGold(task, plurality(bGrades, (tied) => pickTied(task, tied))),
@@ -376,6 +408,269 @@ export async function runQuestion(task, session, frozen, baseSnap) {
     const result = await synthesis[id]();
     if (result?.paused) return stop('paused', session.budget.state.pauseReason);
     if (result?.stopped) return stop('stopped', 'roster_mutation');
+  }
+
+  if (attempts > 0 || grader !== gradeResponse) {
+    const seen = new Set();
+    const cells = [];
+    const cellOf = (branch, stage, sample, model) => ({
+      questionId, branch, stage, sample, model,
+    });
+    const cellId = (meta) => [meta.branch, meta.stage, meta.sample, meta.model].join('|');
+    function addCell(meta) {
+      if (!meta?.model) return;
+      const id = cellId(meta);
+      if (seen.has(id)) return;
+      seen.add(id);
+      cells.push({
+        questionId: meta.questionId,
+        branch: meta.branch,
+        stage: meta.stage,
+        sample: meta.sample,
+        model: meta.model,
+      });
+    }
+    const bMeta = (sample) => (
+      sample === 1
+        ? cellOf('council', 'stage1', 1, frozen.bModel)
+        : cellOf('replicates', 'sample', sample, frozen.bModel)
+    );
+    function originalSlot(branch, stage) {
+      return session.slots().find((slot) => (
+        slot.meta?.questionId === questionId
+        && slot.meta.branch === branch
+        && slot.meta.stage === stage
+        && (slot.meta.attempt || 0) === 0
+      )) || null;
+    }
+    for (const sample of [1, 2, 3, 4, 5]) addCell(bMeta(sample));
+    for (const model of frozen.councilModels) addCell(cellOf('council', 'stage1', 1, model));
+    if (!aliasA0) addCell(cellOf('direct', 'A0', 1, frozen.chairmanModel));
+    for (const slot of [
+      originalSlot('A3', 'selfmoa'),
+      originalSlot('A6', 'stage3'),
+      originalSlot('A7', 'stage3'),
+    ]) {
+      if (slot?.meta) addCell(slot.meta);
+    }
+
+    function fallbackMessages(meta) {
+      if (meta.stage === 'stage1' || meta.stage === 'sample' || meta.stage === 'A0') return user;
+      if (meta.branch !== 'A3' || meta.stage !== 'selfmoa') return null;
+      const samples = [1, 2, 3, 4, 5].flatMap((sample) => {
+        const slot = sample === 1
+          ? findSlot(session, { questionId, branch: 'council', stage: 'stage1', sample: 1, model: frozen.bModel })
+          : findSlot(session, { questionId, branch: 'replicates', stage: 'sample', sample, model: frozen.bModel });
+        if (slot?.state === 'completed' && slot.result?.content) return [{ sample, text: slot.result.content }];
+        return [];
+      });
+      if (!samples.length) return null;
+      return messages(selfMoaPrompt(prompt, samples));
+    }
+
+    function laterAttemptAnswered(meta, attempt) {
+      for (let next = attempt + 1; next <= attempts; next += 1) {
+        const grade = gradeSlot(task, findSlot(session, { ...meta, attempt: next }), grader);
+        if (grade?.status === 'graded') return true;
+      }
+      return false;
+    }
+
+    function coolingUntil(model) {
+      return session.cooldowns.get(catalogueId(model)) || 0;
+    }
+
+    function needsDraw(meta) {
+      const original = findSlot(session, { ...meta, attempt: 0 });
+      if (!original) return false;
+      const replayMessages = Array.isArray(original.request?.messages)
+        ? original.request.messages
+        : fallbackMessages(meta);
+      if (!replayMessages) return false;
+      if (gradeSlot(task, original, grader)?.status === 'graded') return false;
+      let finished = 0;
+      for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        const existing = findSlot(session, { ...meta, attempt });
+        if (!existing || !TERMINAL.has(existing.state)) return true;
+        if (existing.state === 'skipped') continue;
+        finished += 1;
+        if (gradeSlot(task, existing, grader)?.status === 'graded') return false;
+      }
+      return finished < attempts;
+    }
+
+    function noteCooldown(model) {
+      const until = coolingUntil(model) || (Date.now() + 60_000);
+      const state = session.budget.state;
+      if (state.paused) return;
+      state.pauseReason = 'cooldown';
+      state.resumeAfter = Math.max(state.resumeAfter || 0, until);
+    }
+
+    async function drawAttempts(meta) {
+      const original = findSlot(session, { ...meta, attempt: 0 });
+      if (!original) return { paused: false };
+      const replayMessages = Array.isArray(original.request?.messages)
+        ? original.request.messages
+        : fallbackMessages(meta);
+      if (!replayMessages) return { paused: false };
+      if (gradeSlot(task, original, grader)?.status === 'graded') return { paused: false };
+      let attempt = 1;
+      while (attempt <= attempts) {
+        const existing = findSlot(session, { ...meta, attempt });
+        if (existing?.state === 'skipped') {
+          if (laterAttemptAnswered(meta, attempt)) return { paused: false };
+          if (coolingUntil(meta.model) > Date.now()) return { paused: true, reason: 'cooldown' };
+        } else if (existing && TERMINAL.has(existing.state)) {
+          if (gradeSlot(task, existing, grader)?.status === 'graded') return { paused: false };
+          attempt += 1;
+          continue;
+        }
+        const postOnce = async () => {
+          if (coolingUntil(meta.model) > Date.now()) return { paused: true, reason: 'cooldown' };
+          session.setContext({
+            questionId: meta.questionId,
+            branch: meta.branch,
+            stage: meta.stage,
+            sample: meta.sample,
+            attempt,
+          });
+          try {
+            await queryModelResult(meta.model, replayMessages);
+            await session.drain();
+          } catch (error) {
+            await session.drain();
+            if (session.budget.state.paused || error instanceof BudgetPaused) return { paused: true };
+            throw error;
+          }
+          if (session.budget.state.paused) return { paused: true };
+          const drawn = findSlot(session, { ...meta, attempt });
+          if (!drawn || drawn.state === 'unknown') return { paused: true };
+          if (rosterDrift(frozen)) return { stopped: true };
+          if (drawn.state === 'skipped') return { paused: true, reason: 'cooldown' };
+          if (gradeSlot(task, drawn, grader)?.status === 'graded') return { paused: false };
+          return null;
+        };
+        const posted = session.cooldowns.has(catalogueId(meta.model))
+          ? await withModelGate(meta.model, postOnce)
+          : await postOnce();
+        if (posted) return posted;
+        attempt += 1;
+      }
+      return { paused: false };
+    }
+
+    if (attempts > 0) {
+      const ordered = [...cells].sort((left, right) => {
+        const leftCool = coolingUntil(left.model) > Date.now() ? 1 : 0;
+        const rightCool = coolingUntil(right.model) > Date.now() ? 1 : 0;
+        return leftCool - rightCool;
+      });
+      let deferred = false;
+      for (const meta of ordered) {
+        if (!needsDraw(meta)) continue;
+        if (coolingUntil(meta.model) > Date.now()) {
+          noteCooldown(meta.model);
+          deferred = true;
+          continue;
+        }
+        const drawn = await drawAttempts(meta);
+        if (drawn.reason === 'cooldown') {
+          noteCooldown(meta.model);
+          deferred = true;
+          continue;
+        }
+        if (drawn.paused) return stop('paused', drawn.reason || session.budget.state.pauseReason);
+        if (drawn.stopped) return stop('stopped', 'roster_mutation');
+      }
+      if (deferred) return stop('paused', 'cooldown');
+    }
+
+    function bestGrade(meta) {
+      const slot = findSlot(session, { ...meta, attempt: 0 });
+      if (!slot) return null;
+      const original = gradeSlot(task, slot, grader);
+      if (original?.status === 'graded') return original;
+      let last = original;
+      let finished = 0;
+      for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        const drawn = findSlot(session, { ...meta, attempt });
+        if (!drawn || !TERMINAL.has(drawn.state)) break;
+        if (drawn.state === 'skipped') continue;
+        finished += 1;
+        const grade = gradeSlot(task, drawn, grader);
+        if (grade?.status === 'graded') return { ...grade, resampled: attempt };
+        last = grade;
+      }
+      if (attempts > 0 && finished >= attempts) {
+        return {
+          ...(last || {}),
+          correct: 0,
+          status: 'no_answer',
+          exhausted: true,
+          formatCompliant: false,
+          extracted: null,
+          reason: last?.reason || 'no_answer',
+        };
+      }
+      return last;
+    }
+
+    const gradedCells = new Map();
+    function take(meta) {
+      const id = cellId(meta);
+      if (!gradedCells.has(id)) {
+        gradedCells.set(id, bestGrade(meta) || grader(task, '', 'provider_error'));
+      }
+      return gradedCells.get(id);
+    }
+    function voted(grades) {
+      const vote = withGold(task, plurality(grades, (tied) => pickTied(task, tied)));
+      const winners = grades.filter((grade) => (
+        grade?.status === 'graded' && grade.extracted === vote.extracted
+      ));
+      if (winners.some((grade) => grade.lenient)) vote.lenient = true;
+      const drawn = winners.map((grade) => grade.resampled || 0).filter((value) => value > 0);
+      if (drawn.length) vote.resampled = Math.max(...drawn);
+      if (vote.status !== 'graded' && grades.some((grade) => grade?.exhausted)) vote.exhausted = true;
+      return vote;
+    }
+    function synthesisGrade(branch, stage, previous) {
+      const slot = originalSlot(branch, stage);
+      if (!slot?.meta) return previous;
+      const grade = withGold(task, take(slot.meta));
+      if (grade?.resampled) {
+        grade.model = slot.meta.model;
+        grade.fallback = slot.meta.model !== frozen.chairmanModel;
+      } else if (previous?.model) {
+        grade.model = previous.model;
+        grade.fallback = previous.fallback;
+      }
+      return grade;
+    }
+
+    bGrades = [1, 2, 3, 4, 5].map((sample) => take(bMeta(sample)));
+    council = frozen.councilModels.map((model) => take(cellOf('council', 'stage1', 1, model)));
+    arms.A1 = withGold(task, bGrades[0]);
+    arms.A2 = voted(bGrades);
+    arms.A4 = voted(council);
+    if (aliasA0) arms.A0 = { ...arms.A1, aliased: true };
+    else arms.A0 = withGold(task, take(cellOf('direct', 'A0', 1, frozen.chairmanModel)));
+    const board = ranked || (stage2Results.length ? rankingsFrom(stage1Results, stage2Results) : null);
+    const leader = board?.responseRankings?.[0];
+    const leaderModel = leader ? stage1Results[leader.index]?.model : null;
+    if (leaderModel) arms.A5 = withGold(task, take(cellOf('council', 'stage1', 1, leaderModel)));
+    arms.A3 = synthesisGrade('A3', 'selfmoa', arms.A3);
+    arms.A6 = synthesisGrade('A6', 'stage3', arms.A6);
+    arms.A7 = synthesisGrade('A7', 'stage3', arms.A7);
+    const tracked = [...gradedCells.values()];
+    outcome.lenientCells = tracked.filter((grade) => grade.lenient && !grade.resampled).length;
+    outcome.resampledCells = tracked.filter((grade) => grade.resampled).length;
+    outcome.exhaustedCells = tracked.filter((grade) => grade.exhausted).length;
+    outcome.resamplePosts = session.slots().reduce((sum, slot) => {
+      if (slot.meta?.questionId !== questionId || (slot.meta.attempt || 0) <= 0) return sum;
+      return sum + (slot.httpAttempts || 0);
+    }, 0);
   }
 
   outcome.arms = arms;

@@ -4,23 +4,21 @@ import { beforeEach, vi } from 'vitest';
 import { clearModelsCache, resetFreeQueueForTests, setQueryHook } from '../engine/browser/openrouter.js';
 import { clearBlockedIds, clearModelCooldowns } from '../engine/browser/roster.js';
 import { resetSettingsState } from '../engine/browser/settings.js';
+import { resetShareSettingsForTests } from '../share/settings.js';
 import { resetStorageForTests } from '../engine/browser/storage.js';
+import { createOverlayStorage } from '../../eval/questionScope.js';
 
-const memory = new Map();
+const overlay = createOverlayStorage();
 
 Object.defineProperty(globalThis, 'localStorage', {
   configurable: true,
-  value: {
-    getItem: (key) => (memory.has(key) ? memory.get(key) : null),
-    setItem: (key, value) => memory.set(key, String(value)),
-    removeItem: (key) => memory.delete(key),
-    clear: () => memory.clear(),
-  },
+  value: overlay.storage,
 });
 
 beforeEach(async () => {
-  memory.clear();
+  overlay.clearGlobal();
   resetSettingsState();
+  resetShareSettingsForTests();
   clearBlockedIds();
   clearModelCooldowns();
   resetFreeQueueForTests();

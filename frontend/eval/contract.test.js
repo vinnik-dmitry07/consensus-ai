@@ -1,15 +1,18 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { queryModelResult, resetFreeQueueForTests } from '../src/engine/browser/openrouter.js';
+import { canonicalCompletionRequest, queryModelResult, resetFreeQueueForTests } from '../src/engine/browser/openrouter.js';
 import { rememberModelCooldown } from '../src/engine/browser/roster.js';
 import { settings } from '../src/engine/browser/settings.js';
 import { createBudget } from './budget.js';
-import { costsFromJournal } from './run.js';
-import { createSession, snapshotLocal } from './runtime.js';
+import { gradeResponseLenient } from './grade.js';
+import { runIsolated } from './questionScope.js';
+import { costsFromJournal, isNetworkError, noteKeyUsage, spendFromJournal } from './run.js';
+import { createSession, readSlotMap, slotKey, snapshotLocal } from './runtime.js';
 import { attemptStore, installTransport } from './transport.js';
+import { sha256, stableStringify } from './util.js';
 import { runQuestion } from './variants.js';
 
 const MODELS = [
@@ -314,6 +317,90 @@ describe('eval contract', () => {
     expect(posts.some((post) => post.key.includes('|A6|stage3|'))).toBe(false);
   });
 
+  it('keeps a network failure unknown and counts the resumed call as another attempt', async () => {
+    useFreeClock();
+    let tries = 0;
+    const { budget, posts } = openHarness(() => {
+      tries += 1;
+      if (tries === 1) throw new TypeError('fetch failed');
+      return asResponse(jsonBody('ANSWER: 7'));
+    });
+    session.setContext({ questionId: 'q', branch: 'direct', stage: 'A0', sample: 1 });
+    const messages = [{ role: 'user', content: 'Hi' }];
+    const failed = await settle(queryModelResult(MODELS[0], messages));
+    expect(failed.ok).toBe(false);
+    expect(session.slots()[0].state).toBe('unknown');
+    expect(budget.state.pauseReason).toBe('network');
+    expect(posts).toHaveLength(1);
+    budget.state.paused = false;
+    budget.state.pauseReason = null;
+    budget.state.resumeAfter = null;
+    const again = await settle(queryModelResult(MODELS[0], messages));
+    expect(again.ok).toBe(true);
+    expect(posts).toHaveLength(2);
+    expect(session.slots()[0].state).toBe('completed');
+    expect(session.slots()[0].httpAttempts).toBe(2);
+  });
+
+  it('reuses a completed free slot for the paid alias and re-executes a failed one', async () => {
+    const messages = [{ role: 'user', content: 'Hi' }];
+    const sourceModel = MODELS[0];
+    const paidModel = 'alpha/a';
+    const requestHash = sha256(stableStringify(canonicalCompletionRequest(sourceModel, messages, {})));
+    const sourceFor = (questionId) => slotKey({
+      questionId, branch: 'direct', stage: 'A0', sample: 1, model: sourceModel, requestHash,
+    });
+    const replayFrom = new Map([
+      [sourceFor('q-ok'), { state: 'completed', result: { ok: true, content: 'ANSWER: 7' } }],
+      [sourceFor('q-bad'), { state: 'failed', result: { ok: false, error: { message: 'total' } } }],
+      [sourceFor('q-free'), { state: 'skipped', result: { ok: false, skipped: true } }],
+    ]);
+    runDir = mkdtempSync(path.join(tmpdir(), 'council-eval-'));
+    const budget = createBudget({ dailyLimit: 20, conservativeDaily: 20, totalCap: 20 });
+    session = createSession({
+      runDir,
+      budget,
+      log() {},
+      replayFrom,
+      aliasOf: (model) => (model === paidModel ? sourceModel : model),
+    });
+    session.install();
+    const posts = [];
+    restore = installTransport({
+      nativeFetch: async (_url, init) => {
+        posts.push(JSON.parse(init.body || '{}'));
+        return asResponse(jsonBody('ANSWER: 7'));
+      },
+      allowModels: new Set([sourceModel, paidModel]),
+      allowPaid: true,
+      budget,
+      onHttp: session.onHttp,
+      onCooldown: session.onCooldown,
+    });
+    session.setContext({ questionId: 'q-ok', branch: 'direct', stage: 'A0', sample: 1 });
+    const reused = await settle(queryModelResult(paidModel, messages));
+    expect(reused.content).toBe('ANSWER: 7');
+    expect(posts).toHaveLength(0);
+    expect(session.slots().find((slot) => slot.meta?.questionId === 'q-ok').reusedFrom).toBe(sourceFor('q-ok'));
+
+    session.setContext({ questionId: 'q-bad', branch: 'direct', stage: 'A0', sample: 1 });
+    const live = await settle(queryModelResult(paidModel, messages));
+    expect(live.ok).toBe(true);
+    expect(posts).toHaveLength(1);
+    expect(posts[0].model).toBe(paidModel);
+
+    session.setContext({ questionId: 'q-free', branch: 'direct', stage: 'A0', sample: 1 });
+    await settle(queryModelResult(sourceModel, messages));
+    expect(posts).toHaveLength(2);
+    expect(posts[1].model).toBe(sourceModel);
+
+    session.setContext({ questionId: 'q-block', branch: 'direct', stage: 'A0', sample: 1 });
+    const blocked = await settle(queryModelResult('openai/gpt-4.1', messages));
+    expect(blocked.ok).toBe(false);
+    expect(blocked.error.message).toMatch(/Blocked model/);
+    expect(posts).toHaveLength(2);
+  });
+
   it('rejects a paid model before the network and stops after a harness 403', async () => {
     const { posts } = openHarness((body, key) => {
       if (key.includes(MODELS[4]) && key.includes('|council|stage1|')) {
@@ -412,6 +499,373 @@ describe('eval contract', () => {
       expect(result.ok).toBe(true);
     }
     expect(postsAfter).toHaveLength(0);
+  });
+
+  it('keeps concurrent questions on their own council and slot keys', async () => {
+    const seen = [];
+    openHarness((body) => {
+      seen.push({
+        council: settings.councilModels[0],
+        chairman: settings.chairmanModel,
+        key: attemptStore.getStore()?.key || '',
+      });
+      return defaultRespond(body);
+    });
+    const councilA = [...MODELS];
+    const councilB = [MODELS[1], MODELS[0], MODELS[2], MODELS[3], MODELS[4]];
+    function snapFor(council, chairman) {
+      settings.councilModels = council;
+      settings.chairmanModel = chairman;
+      settings.redTeamModel = null;
+      settings.nSamples = 1;
+      settings.topK = 3;
+      settings.selfExclusion = true;
+      settings.apiKey = 'sk-user-test';
+      return snapshotLocal();
+    }
+    const snapA = snapFor(councilA, MODELS[0]);
+    const snapB = snapFor(councilB, MODELS[1]);
+    const taskA = { ...task, id: 'contract-a' };
+    const taskB = { ...task, id: 'contract-b' };
+    const frozenA = { councilModels: councilA, chairmanModel: MODELS[0], bModel: MODELS[0] };
+    const frozenB = { councilModels: councilB, chairmanModel: MODELS[1], bModel: MODELS[1] };
+    const [outA, outB] = await settle(Promise.all([
+      runIsolated(snapA, 0, () => runQuestion(taskA, session, frozenA, snapA)),
+      runIsolated(snapB, 1, () => runQuestion(taskB, session, frozenB, snapB)),
+    ]));
+    expect(outA.status).toBe('complete');
+    expect(outB.status).toBe('complete');
+    expect(settings.councilModels[0]).toBe(MODELS[1]);
+    expect(settings.chairmanModel).toBe(MODELS[1]);
+    const rowsA = seen.filter((row) => row.key.includes('contract-a|'));
+    const rowsB = seen.filter((row) => row.key.includes('contract-b|'));
+    expect(rowsA.length).toBeGreaterThan(0);
+    expect(rowsB.length).toBeGreaterThan(0);
+    expect(rowsA.every((row) => row.council === MODELS[0] && row.chairman === MODELS[0])).toBe(true);
+    expect(rowsB.every((row) => row.council === MODELS[1] && row.chairman === MODELS[1])).toBe(true);
+    const slots = readFileSync(path.join(runDir, 'events.jsonl'), 'utf8')
+      .split(/\n/)
+      .filter((line) => line.includes('"kind":"slot"'))
+      .map((line) => JSON.parse(line));
+    const slotA = slots.filter((event) => event.slot?.meta?.questionId === 'contract-a');
+    const slotB = slots.filter((event) => event.slot?.meta?.questionId === 'contract-b');
+    expect(slotA.length).toBeGreaterThan(0);
+    expect(slotB.length).toBeGreaterThan(0);
+    expect(slotA.every((event) => event.key.startsWith('contract-a|'))).toBe(true);
+    expect(slotB.every((event) => event.key.startsWith('contract-b|'))).toBe(true);
+  });
+
+  it('rebuilds repair spend from the journal, charging calls left open by a kill', () => {
+    runDir = mkdtempSync(path.join(tmpdir(), 'council-eval-'));
+    const http = (event) => JSON.stringify({ kind: 'http', ...event });
+    const lines = [
+      http({ phase: 'reserved', key: 'a', model: 'paid/p', body: { max_tokens: 100 } }),
+      http({ phase: 'finished', key: 'a', model: 'paid/p', usageKnown: true, usage: { prompt_tokens: 4, completion_tokens: 3 } }),
+      http({ phase: 'reserved', key: 'b', model: 'paid/p', body: { max_tokens: 100 } }),
+      http({ phase: 'finished', key: 'b', model: 'paid/p', usageKnown: false, usage: null }),
+      http({ phase: 'reserved', key: 'c', model: 'paid/p', body: { max_tokens: 100 } }),
+      http({ phase: 'error', key: 'c', model: 'paid/p', error: 'fetch failed' }),
+      http({ phase: 'reserved', key: 'd', model: 'paid/p-reasoning-high', body: { max_tokens: 50 } }),
+      JSON.stringify({ kind: 'slot', key: 'a', slot: { state: 'completed' } }),
+    ];
+    const file = path.join(runDir, 'events.jsonl');
+    writeFileSync(file, `${lines.join('\n')}\n`, 'utf8');
+    const spent = spendFromJournal(file, { 'paid/p': { prompt: 0.001, completion: 0.01 } });
+    expect(spent.posts).toBe(4);
+    expect(spent.unknown).toBe(2);
+    expect(spent.usd).toBeCloseTo(4 * 0.001 + 3 * 0.01 + 100 * 0.01 + 50 * 0.01, 10);
+  });
+
+  it('carries spend from a replaced paid key into the total', () => {
+    const state = {};
+    noteKeyUsage(state, 'old', 0);
+    noteKeyUsage(state, 'old', 14.5);
+    noteKeyUsage(state, 'new', 0);
+    noteKeyUsage(state, 'new', 2);
+    expect(state.priorKeySpend).toBeCloseTo(14.5, 10);
+    expect(state.priorKeySpend + state.keyUsageLast - state.keyUsageAtStart).toBeCloseTo(16.5, 10);
+  });
+
+  it('treats a startup DNS failure as a network pause, not a protocol error', () => {
+    const dns = new TypeError('fetch failed', { cause: Object.assign(new Error('getaddrinfo ENOTFOUND openrouter.ai'), { code: 'ENOTFOUND' }) });
+    expect(isNetworkError(dns)).toBe(true);
+    expect(isNetworkError(new Error('OpenRouter /api/v1/key HTTP 401'))).toBe(false);
+  });
+
+  it('keeps attempt 0 keys unchanged and suffixes later draws', () => {
+    const base = {
+      questionId: 'q',
+      branch: 'council',
+      stage: 'stage1',
+      sample: 1,
+      model: MODELS[0],
+      requestHash: 'abc',
+    };
+    expect(slotKey(base)).toBe('q|council|stage1|1|alpha/a:free|abc');
+    expect(slotKey({ ...base, attempt: 0 })).toBe(slotKey(base));
+    expect(slotKey({ ...base, attempt: 2 })).toBe(`${slotKey(base)}|a2`);
+  });
+
+  it('replays a failed source slot when the layer asks for every terminal result', async () => {
+    const messages = [{ role: 'user', content: 'Hi' }];
+    const requestHash = sha256(stableStringify(canonicalCompletionRequest(MODELS[0], messages, {})));
+    const sourceKey = slotKey({
+      questionId: 'q-bad', branch: 'direct', stage: 'A0', sample: 1, model: MODELS[0], requestHash,
+    });
+    const replayFrom = new Map([
+      [sourceKey, { state: 'failed', result: { ok: false, error: { message: 'down' } } }],
+    ]);
+    runDir = mkdtempSync(path.join(tmpdir(), 'council-eval-'));
+    const budget = createBudget({ dailyLimit: 20, conservativeDaily: 20, totalCap: 20 });
+    session = createSession({
+      runDir,
+      budget,
+      log() {},
+      replayFrom,
+      aliasOf: (model) => model,
+      replayTerminal: true,
+    });
+    session.install();
+    const posts = [];
+    restore = installTransport({
+      nativeFetch: async (_url, init) => {
+        posts.push(JSON.parse(init.body || '{}'));
+        return asResponse(jsonBody('ANSWER: 7'));
+      },
+      allowModels: new Set(MODELS),
+      budget,
+      onHttp: session.onHttp,
+      onCooldown: session.onCooldown,
+    });
+    session.setContext({ questionId: 'q-bad', branch: 'direct', stage: 'A0', sample: 1 });
+    const replayed = await settle(queryModelResult(MODELS[0], messages));
+    expect(replayed.ok).toBe(false);
+    expect(posts).toHaveLength(0);
+    const slot = session.slots().find((item) => item.meta?.questionId === 'q-bad');
+    expect(slot.state).toBe('failed');
+    expect(slot.reusedFrom).toBe(sourceKey);
+
+    session.setContext({ questionId: 'q-bad', branch: 'direct', stage: 'A0', sample: 1, attempt: 1 });
+    const redraw = await settle(queryModelResult(MODELS[0], messages));
+    expect(redraw.ok).toBe(true);
+    expect(posts).toHaveLength(1);
+    expect(session.slots().some((item) => item.key?.endsWith('|a1'))).toBe(true);
+  });
+
+  it('calls a cooled redraw again after the cooldown instead of keeping the skip', async () => {
+    const messages = [{ role: 'user', content: 'Hi' }];
+    const { posts } = openHarness(() => asResponse(jsonBody('ANSWER: 7')));
+    session.cooldowns.set(MODELS[0], Date.now() + 60_000);
+    session.setContext({ questionId: 'q', branch: 'direct', stage: 'A0', sample: 1, attempt: 1 });
+    const skipped = await settle(queryModelResult(MODELS[0], messages));
+    expect(skipped.skipped).toBe(true);
+    expect(posts).toHaveLength(0);
+    session.cooldowns.set(MODELS[0], 0);
+    const again = await settle(queryModelResult(MODELS[0], messages));
+    expect(again.ok).toBe(true);
+    expect(posts).toHaveLength(1);
+    expect(session.slots().find((slot) => (slot.key || '').endsWith('|a1')).state).toBe('completed');
+  });
+
+  it('reads a bold answer line without a new draw', async () => {
+    const { posts } = openHarness((body) => {
+      const text = body.messages?.[0]?.content || '';
+      if (
+        text.includes('You are evaluating different responses')
+        || text.includes('You are an adversarial reviewer')
+        || text.includes('You are the Chairman')
+        || text.includes('You are aggregating independent answers')
+      ) {
+        return defaultRespond(body);
+      }
+      return asResponse(jsonBody('**ANSWER: 7**'));
+    });
+    const outcome = await settle(runQuestion(task, session, frozenCouncil(), snapshotLocal(), {
+      grader: gradeResponseLenient,
+      attempts: 2,
+    }));
+    expect(outcome.status).toBe('complete');
+    expect(outcome.arms.A1).toMatchObject({ correct: 1, lenient: true, via: 'answer_line' });
+    expect(outcome.exhaustedCells).toBe(0);
+    expect(outcome.resamplePosts).toBe(0);
+    expect(posts.some((post) => /\|a\d/.test(post.key))).toBe(false);
+  });
+
+  it('finishes when a cooling model already has an answer', async () => {
+    openHarness(defaultRespond);
+    const first = await settle(runQuestion(task, session, frozenCouncil(), snapshotLocal()));
+    expect(first.status).toBe('complete');
+    const source = readSlotMap(path.join(runDir, 'events.jsonl'));
+    const firstDir = runDir;
+    session.uninstall();
+    restore();
+    resetFreeQueueForTests();
+    try {
+      runDir = mkdtempSync(path.join(tmpdir(), 'council-eval-'));
+      const budget = createBudget({ dailyLimit: 80, conservativeDaily: 80, totalCap: 80 });
+      session = createSession({
+        runDir,
+        budget,
+        log() {},
+        replayFrom: source,
+        aliasOf: (model) => model,
+        replayTerminal: true,
+      });
+      session.install();
+      session.cooldowns.set(MODELS[4], Date.now() + 60_000);
+      const redraws = [];
+      restore = installTransport({
+        nativeFetch: async (_url, init) => {
+          redraws.push(JSON.parse(init.body || '{}').model);
+          return defaultRespond(JSON.parse(init.body || '{}'));
+        },
+        allowModels: new Set(MODELS),
+        budget,
+        onHttp: session.onHttp,
+        onCooldown: session.onCooldown,
+      });
+      const outcome = await settle(runQuestion(task, session, frozenCouncil(), snapshotLocal(), {
+        grader: gradeResponseLenient,
+        attempts: 2,
+      }));
+      expect(outcome.status).toBe('complete');
+      expect(redraws).toHaveLength(0);
+    } finally {
+      rmSync(firstDir, { recursive: true, force: true });
+    }
+  });
+
+  it('defers a missing answer while that model is cooling and does not post', async () => {
+    const respond = (body, key) => {
+      if (key.includes(MODELS[4]) && key.includes('|stage1|')) return asResponse(jsonBody('still thinking'));
+      return defaultRespond(body);
+    };
+    openHarness(respond);
+    const first = await settle(runQuestion(task, session, frozenCouncil(), snapshotLocal()));
+    expect(first.status).toBe('complete');
+    const source = readSlotMap(path.join(runDir, 'events.jsonl'));
+    const firstDir = runDir;
+    session.uninstall();
+    restore();
+    resetFreeQueueForTests();
+    try {
+      runDir = mkdtempSync(path.join(tmpdir(), 'council-eval-'));
+      const budget = createBudget({ dailyLimit: 80, conservativeDaily: 80, totalCap: 80 });
+      session = createSession({
+        runDir,
+        budget,
+        log() {},
+        replayFrom: source,
+        aliasOf: (model) => model,
+        replayTerminal: true,
+      });
+      session.install();
+      session.cooldowns.set(MODELS[4], Date.now() + 60_000);
+      const redraws = [];
+      restore = installTransport({
+        nativeFetch: async (_url, init) => {
+          redraws.push(attemptStore.getStore()?.key || '');
+          return asResponse(jsonBody('ANSWER: 7'));
+        },
+        allowModels: new Set(MODELS),
+        budget,
+        onHttp: session.onHttp,
+        onCooldown: session.onCooldown,
+      });
+      const outcome = await settle(runQuestion(task, session, frozenCouncil(), snapshotLocal(), {
+        grader: gradeResponseLenient,
+        attempts: 2,
+      }));
+      expect(outcome.status).toBe('paused');
+      expect(outcome.reason).toBe('cooldown');
+      expect(redraws).toHaveLength(0);
+    } finally {
+      rmSync(firstDir, { recursive: true, force: true });
+    }
+  });
+
+  it('redraws only the cell with no answer and replays Stage 2 and Stage 3', async () => {
+    const respond = (body, key) => {
+      if (/\|a\d/.test(key)) return asResponse(jsonBody('ANSWER: 7'));
+      if (key.includes(MODELS[4]) && key.includes('|stage1|')) return asResponse(jsonBody('still thinking'));
+      return defaultRespond(body);
+    };
+    openHarness(respond);
+    const first = await settle(runQuestion(task, session, frozenCouncil(), snapshotLocal()));
+    expect(first.status).toBe('complete');
+    expect(first.arms.A1.correct).toBe(1);
+    const source = readSlotMap(path.join(runDir, 'events.jsonl'));
+    const firstDir = runDir;
+    session.uninstall();
+    restore();
+    resetFreeQueueForTests();
+    try {
+      runDir = mkdtempSync(path.join(tmpdir(), 'council-eval-'));
+      const budget = createBudget({ dailyLimit: 80, conservativeDaily: 80, totalCap: 80 });
+      session = createSession({
+        runDir,
+        budget,
+        log() {},
+        replayFrom: source,
+        aliasOf: (model) => model,
+        replayTerminal: true,
+      });
+      session.install();
+      const redraws = [];
+      restore = installTransport({
+        nativeFetch: async (_url, init) => {
+          const body = JSON.parse(init.body || '{}');
+          const key = attemptStore.getStore()?.key || '';
+          redraws.push({ key, model: body.model });
+          return respond(body, key);
+        },
+        allowModels: new Set(MODELS),
+        budget,
+        onHttp: session.onHttp,
+        onCooldown: session.onCooldown,
+      });
+      const outcome = await settle(runQuestion(task, session, frozenCouncil(), snapshotLocal(), {
+        grader: gradeResponseLenient,
+        attempts: 2,
+      }));
+      expect(outcome.status).toBe('complete');
+      expect(outcome.resampledCells).toBe(1);
+      expect(outcome.exhaustedCells).toBe(0);
+      expect(redraws).toHaveLength(1);
+      expect(redraws[0].key).toContain('|a1');
+      expect(redraws[0].key).toContain(MODELS[4]);
+      expect(redraws.some((post) => /\|(stage2|stage3|redteam|selfmoa)\|/.test(post.key))).toBe(false);
+      const replayed = session.slots().filter((slot) => slot.meta?.stage === 'stage2' || slot.meta?.stage === 'stage3');
+      expect(replayed.length).toBeGreaterThan(0);
+      expect(replayed.every((slot) => slot.reusedFrom)).toBe(true);
+      const again = await settle(runQuestion(task, session, frozenCouncil(), snapshotLocal(), {
+        grader: gradeResponseLenient,
+        attempts: 2,
+      }));
+      expect(again.status).toBe('complete');
+      expect(redraws).toHaveLength(1);
+    } finally {
+      rmSync(firstDir, { recursive: true, force: true });
+    }
+  });
+
+  it('scores a cell wrong after the last draw still has no answer', async () => {
+    openHarness((body, key) => {
+      if (key.includes(MODELS[4]) && (key.includes('|stage1|') || /\|a\d/.test(key))) {
+        return asResponse(jsonBody('still thinking'));
+      }
+      return defaultRespond(body);
+    });
+    const outcome = await settle(runQuestion(task, session, frozenCouncil(), snapshotLocal(), {
+      grader: gradeResponseLenient,
+      attempts: 1,
+    }));
+    expect(outcome.status).toBe('complete');
+    expect(outcome.exhaustedCells).toBe(1);
+    expect(outcome.resamplePosts).toBe(1);
+    const keys = session.slots().map((slot) => slot.key || '');
+    expect(keys.some((key) => key.includes(MODELS[4]) && key.endsWith('|a1'))).toBe(true);
+    expect(keys.some((key) => key.endsWith('|a2'))).toBe(false);
   });
 
   it('counts a retry as another reserved post', async () => {

@@ -12,6 +12,7 @@ function getLabelToDisplayName(labelToModel) {
   const modelTotalCounts = {};
 
   Object.values(labelToModel).forEach((model) => {
+    if (typeof model !== 'string') return;
     modelTotalCounts[model] = (modelTotalCounts[model] || 0) + 1;
   });
 
@@ -19,6 +20,7 @@ function getLabelToDisplayName(labelToModel) {
     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
     .forEach((label) => {
       const model = labelToModel[label];
+      if (typeof model !== 'string') return;
       if (!modelCounts[model]) modelCounts[model] = 0;
       modelCounts[model]++;
 
@@ -45,21 +47,33 @@ function getIndexToDisplayName(labelToModel) {
 function displayNameForIndex(index, indexToName, labelToModel) {
   if (indexToName[index]) return indexToName[index];
   const label = `Response ${index + 1}`;
-  if (labelToModel?.[label]) {
-    return labelToModel[label].split('/')[1] || labelToModel[label];
-  }
-  return label;
+  const model = labelToModel?.[label];
+  if (typeof model !== 'string' || !model) return label;
+  return model.split('/')[1] || model;
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function modelTabLabel(model) {
+  if (typeof model !== 'string' || !model) return 'unknown';
+  return model.split('/')[1] || model;
 }
 
 function deAnonymizeText(text, labelToDisplayName) {
-  if (!labelToDisplayName) return text;
+  if (typeof text !== 'string') return '';
+  if (!labelToDisplayName || typeof labelToDisplayName !== 'object') return text;
 
   let result = text;
-  const sortedLabels = Object.keys(labelToDisplayName).sort((a, b) => b.length - a.length);
+  const sortedLabels = Object.keys(labelToDisplayName)
+    .filter((label) => label.length > 0 && label.length <= 80)
+    .sort((a, b) => b.length - a.length);
 
   sortedLabels.forEach((label) => {
     const displayName = labelToDisplayName[label];
-    result = result.replace(new RegExp(label, 'g'), `**${displayName}**`);
+    if (typeof displayName !== 'string') return;
+    result = result.replace(new RegExp(escapeRegExp(label), 'g'), `**${displayName}**`);
   });
   return result;
 }
@@ -80,14 +94,14 @@ function scoreLabel(value) {
   return Number(value).toFixed(2);
 }
 
-function ConsensusPanel({ consensus, redTeam, indexToName, labelToModel }) {
+function ConsensusPanel({ consensus, redTeam, indexToName, labelToModel, components }) {
   const [critiqueOpen, setCritiqueOpen] = useState(false);
 
   if (!consensus && !redTeam) return null;
 
-  const level = consensus?.level || 'UNKNOWN';
-  const reasons = consensus?.reasons || [];
-  const disputed = consensus?.disputed_claims || [];
+  const level = typeof consensus?.level === 'string' && consensus.level ? consensus.level : 'UNKNOWN';
+  const reasons = Array.isArray(consensus?.reasons) ? consensus.reasons : [];
+  const disputed = Array.isArray(consensus?.disputed_claims) ? consensus.disputed_claims : [];
   const leaderName =
     consensus?.leader_index != null
       ? displayNameForIndex(consensus.leader_index, indexToName, labelToModel)
@@ -156,9 +170,9 @@ function ConsensusPanel({ consensus, redTeam, indexToName, labelToModel }) {
           >
             {critiqueOpen ? 'Hide critique' : 'Show critique'}
           </button>
-          {critiqueOpen && redTeam.critique && (
+          {typeof redTeam.critique === 'string' && critiqueOpen && redTeam.critique && (
             <div className="red-team-critique markdown-content">
-              <ReactMarkdown remarkPlugins={[remarkGfmPlugin]} components={markdownComponents}>
+              <ReactMarkdown remarkPlugins={[remarkGfmPlugin]} components={components}>
                 {redTeam.critique}
               </ReactMarkdown>
             </div>
@@ -177,20 +191,28 @@ export default function Stage2({
   topKIndices,
   consensus,
   redTeam,
+  components = markdownComponents,
 }) {
   const [activeTab, setActiveTab] = useState(0);
+  const rows = Array.isArray(rankings) ? rankings : [];
 
-  if (!rankings || rankings.length === 0) {
+  if (rows.length === 0) {
     return null;
   }
 
   const { labelToName, indexToName } = getIndexToDisplayName(labelToModel);
-  const active = rankings[activeTab] || rankings[0];
+  const active = rows[activeTab] || rows[0];
+  if (!active || typeof active !== 'object') return null;
   const judgeMap = judgeLabelMap(active, indexToName, labelToName);
-  const topK = (topKIndices || []).map((idx) => {
-    const row = (responseRankings || []).find((item) => item.index === idx);
+  const responseRows = Array.isArray(responseRankings) ? responseRankings : [];
+  const topK = (Array.isArray(topKIndices) ? topKIndices : []).map((idx) => {
+    const row = responseRows.find((item) => item.index === idx);
     return { index: idx, row };
   });
+  const aggregates = Array.isArray(aggregateRankings) ? aggregateRankings : [];
+  const parsed = Array.isArray(active.parsed_ranking) ? active.parsed_ranking : [];
+  const claims = Array.isArray(active.disputed_claims) ? active.disputed_claims : [];
+  const rankingText = deAnonymizeText(active.ranking, judgeMap);
 
   return (
     <div className="stage stage2">
@@ -203,40 +225,40 @@ export default function Stage2({
       </p>
 
       <div className="tabs">
-        {rankings.map((rank, index) => (
+        {rows.map((rank, index) => (
           <button
             key={index}
             className={`tab ${activeTab === index ? 'active' : ''}`}
             onClick={() => setActiveTab(index)}
           >
-            {rank.model.split('/')[1] || rank.model}
+            {modelTabLabel(rank?.model)}
           </button>
         ))}
       </div>
 
       <div className="tab-content">
         <div className="ranking-model">
-          {active.model}
+          {typeof active.model === 'string' ? active.model : 'unknown'}
           {active.self_excluded && (
             <span className="self-exclusion-note"> · own family excluded</span>
           )}
         </div>
         <div className="ranking-content markdown-content">
-          <ReactMarkdown remarkPlugins={[remarkGfmPlugin]} components={markdownComponents}>
-            {deAnonymizeText(active.ranking, judgeMap)}
+          <ReactMarkdown remarkPlugins={[remarkGfmPlugin]} components={components}>
+            {rankingText}
           </ReactMarkdown>
         </div>
 
-        {active.parsed_ranking && active.parsed_ranking.length > 0 && (
+        {parsed.length > 0 && (
           <div className="parsed-ranking">
             <strong>Extracted Ranking:</strong>
             <ol>
-              {active.parsed_ranking.map((label, i) => {
+              {parsed.map((label, i) => {
                 const idx = active.label_to_index?.[label];
-                const name =
-                  idx != null
-                    ? displayNameForIndex(idx, indexToName, labelToModel)
-                    : (judgeMap[label] || label);
+                const rawName = idx != null
+                  ? displayNameForIndex(idx, indexToName, labelToModel)
+                  : (judgeMap[label] || label);
+                const name = typeof rawName === 'string' ? rawName : '';
                 const corr =
                   idx != null
                     ? (active.correctness?.[idx] ?? active.correctness?.[String(idx)])
@@ -254,11 +276,11 @@ export default function Stage2({
           </div>
         )}
 
-        {active.disputed_claims && active.disputed_claims.length > 0 && (
+        {claims.length > 0 && (
           <div className="judge-disputed">
             <strong>Disputed claims from this judge:</strong>
             <ul>
-              {active.disputed_claims.map((claim, i) => (
+              {claims.map((claim, i) => (
                 <li key={i}>{deAnonymizeText(claim, judgeMap).replace(/\*\*/g, '')}</li>
               ))}
             </ul>
@@ -267,24 +289,24 @@ export default function Stage2({
 
         <div className="copy-row">
           <CopyButton
-            text={deAnonymizeText(active.ranking, judgeMap).replace(/\*\*/g, '')}
+            text={rankingText.replace(/\*\*/g, '')}
             label="Copy ranking"
           />
         </div>
       </div>
 
-      {aggregateRankings && aggregateRankings.length > 0 && (
+      {aggregates.length > 0 && (
         <div className="aggregate-rankings">
           <h4>Aggregate Rankings (Street Cred)</h4>
           <p className="stage-description">
             Macro average across each model's samples (higher score is better):
           </p>
           <div className="aggregate-list">
-            {aggregateRankings.map((agg, index) => (
+            {aggregates.map((agg, index) => (
               <div key={index} className="aggregate-item">
                 <span className="rank-position">#{index + 1}</span>
                 <span className="rank-model">
-                  {agg.model.split('/')[1] || agg.model}
+                  {modelTabLabel(agg?.model)}
                 </span>
                 <span className="rank-score">
                   {agg.score != null
@@ -342,6 +364,7 @@ export default function Stage2({
         redTeam={redTeam}
         indexToName={indexToName}
         labelToModel={labelToModel}
+        components={components}
       />
     </div>
   );

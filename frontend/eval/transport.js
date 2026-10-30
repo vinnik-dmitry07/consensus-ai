@@ -10,6 +10,22 @@ import { BudgetPaused, classifyLimitMessage, nextUtcMidnight } from './budget.js
 
 export const attemptStore = new AsyncLocalStorage();
 
+const NETWORK_MARKERS = [
+  'fetch failed',
+  'terminated',
+  'econnreset',
+  'enotfound',
+  'eai_again',
+  'etimedout',
+  'socket hang up',
+  'other side closed',
+];
+
+export function isNetworkMessage(message) {
+  const lowered = String(message || '').toLowerCase();
+  return NETWORK_MARKERS.some((part) => lowered.includes(part));
+}
+
 const ALLOWED_GET = new Set([
   '/api/v1/models',
   '/api/v1/key',
@@ -120,6 +136,7 @@ function usageFromText(text, contentType) {
 export function installTransport({
   nativeFetch,
   allowModels,
+  allowPaid = false,
   budget,
   onHttp,
   onCooldown,
@@ -144,7 +161,7 @@ export function installTransport({
       throw new Error('Blocked request with an unreadable body');
     }
     const model = String(body.model || '');
-    if (!model.endsWith(':free') || !allowModels.has(model)) {
+    if ((!allowPaid && !model.endsWith(':free')) || !allowModels.has(model)) {
       throw new Error(`Blocked model ${model || '(missing)'}`);
     }
     const store = attemptStore.getStore();
@@ -165,11 +182,13 @@ export function installTransport({
     try {
       response = await native(url, init);
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
       onHttp?.({
         phase: 'error',
         key: store.key,
         model,
-        error: error instanceof Error ? error.message : String(error),
+        error: message,
+        network: isNetworkMessage(message),
         serviceMs: Date.now() - started,
       });
       throw error;
@@ -201,12 +220,15 @@ export function installTransport({
         error,
         usage: parsed.usage,
         usageKnown: parsed.known,
+        promptTokens: parsed.usage?.prompt_tokens ?? null,
+        completionTokens: parsed.usage?.completion_tokens ?? null,
         finishReason: parsed.finishReason,
         limit,
         serviceMs: Date.now() - started,
         provider: response.headers.get('x-openrouter-provider') || response.headers.get('openrouter-provider') || null,
         requestId: response.headers.get('x-request-id') || null,
       });
+      budget.charge?.(model, parsed.usage, parsed.known, body.max_tokens);
     });
   };
   globalThis.fetch = wrapped;
