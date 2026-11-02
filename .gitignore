@@ -21,9 +21,6 @@ conversations_old/
 # IDE
 .idea/
 
-# Local Cursor plans
-.cursor/plans/
-
 # Frontend
 frontend/node_modules/
 frontend/dist/
