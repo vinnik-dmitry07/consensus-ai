@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { createBudget, createSpendBudget } from './budget.js';
+import { classifyLimitMessage, createBudget, createSpendBudget } from './budget.js';
 
 const NOON = Date.parse('2026-10-27T12:00:00Z');
 const NEXT_NOON = Date.parse('2026-10-28T12:00:00Z');
@@ -49,6 +49,15 @@ describe('daily post budget', () => {
     expect(budget.tryReserve(NEXT_NOON)).toBe(true);
     expect(budget.tryReserve(NEXT_NOON)).toBe(true);
     expect(budget.tryReserve(NEXT_NOON)).toBe(false);
+  });
+});
+
+describe('account limit text', () => {
+  it('only treats the OpenRouter free-day slug as a platform day cap', () => {
+    expect(classifyLimitMessage('Rate limit exceeded: free-models-per-min')).toBe('platform_minute');
+    expect(classifyLimitMessage('Rate limit exceeded: free-models-per-day')).toBe('platform_day');
+    expect(classifyLimitMessage('Provider daily limit exceeded')).toBeNull();
+    expect(classifyLimitMessage('per-day quota')).toBeNull();
   });
 });
 

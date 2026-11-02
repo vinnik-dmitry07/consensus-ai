@@ -140,6 +140,7 @@ export function installTransport({
   budget,
   onHttp,
   onCooldown,
+  maxCooldownMs = null,
 }) {
   const native = nativeFetch || globalThis.fetch;
   const wrapped = async (url, init = {}) => {
@@ -203,11 +204,12 @@ export function installTransport({
         budget.pause('platform_day', nextUtcMidnight());
       }
       if (response.status === 429 && isUpstreamLimited(text)) {
-        const wait = parseRetryAfter(
+        let wait = parseRetryAfter(
           response.headers.get('Retry-After'),
           MODEL_COOLDOWN_MS / 1000,
           MODEL_COOLDOWN_MAX_MS / 1000,
         );
+        if (maxCooldownMs != null) wait = Math.min(wait, maxCooldownMs / 1000);
         onCooldown?.(model, Date.now() + wait * 1000);
       }
       onHttp?.({

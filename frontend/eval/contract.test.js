@@ -868,6 +868,83 @@ describe('eval contract', () => {
     expect(keys.some((key) => key.endsWith('|a2'))).toBe(false);
   });
 
+  it('scores a cooling cell as provider unavailable and keeps the other votes', async () => {
+    const respond = (body, key) => {
+      if (key.includes(MODELS[4]) && key.includes('|stage1|')) return asResponse(jsonBody('still thinking'));
+      return defaultRespond(body);
+    };
+    openHarness(respond);
+    const first = await settle(runQuestion(task, session, frozenCouncil(), snapshotLocal()));
+    expect(first.status).toBe('complete');
+    const source = readSlotMap(path.join(runDir, 'events.jsonl'));
+    const firstDir = runDir;
+    session.uninstall();
+    restore();
+    resetFreeQueueForTests();
+    try {
+      runDir = mkdtempSync(path.join(tmpdir(), 'council-eval-'));
+      const budget = createBudget({ dailyLimit: 80, conservativeDaily: 80, totalCap: 80 });
+      session = createSession({
+        runDir,
+        budget,
+        log() {},
+        replayFrom: source,
+        aliasOf: (model) => model,
+        replayTerminal: true,
+      });
+      session.install();
+      session.cooldowns.set(MODELS[4], Date.now() + 60_000);
+      const redraws = [];
+      restore = installTransport({
+        nativeFetch: async () => {
+          redraws.push('post');
+          return asResponse(jsonBody('ANSWER: 7'));
+        },
+        allowModels: new Set(MODELS),
+        budget,
+        onHttp: session.onHttp,
+        onCooldown: session.onCooldown,
+      });
+      const outcome = await settle(runQuestion(task, session, frozenCouncil(), snapshotLocal(), {
+        grader: gradeResponseLenient,
+        attempts: 2,
+        unavailable: 'score',
+      }));
+      expect(outcome.status).toBe('complete');
+      expect(outcome.unavailableCells).toBe(1);
+      expect(outcome.unavailableModels).toContain(MODELS[4]);
+      expect(outcome.arms.A4.status).toBe('graded');
+      expect(redraws).toHaveLength(0);
+    } finally {
+      rmSync(firstDir, { recursive: true, force: true });
+    }
+  });
+
+  it('caps an upstream cooldown at the layer maximum', async () => {
+    runDir = mkdtempSync(path.join(tmpdir(), 'council-eval-'));
+    const budget = createBudget({ dailyLimit: 80, conservativeDaily: 80, totalCap: 80 });
+    session = createSession({ runDir, budget, log() {} });
+    session.install();
+    restore = installTransport({
+      nativeFetch: async () => asResponse(JSON.stringify({
+        error: {
+          message: 'Provider returned error',
+          metadata: { raw: 'model is temporarily rate-limited upstream' },
+        },
+      }), { status: 429 }),
+      allowModels: new Set(MODELS),
+      budget,
+      onHttp: session.onHttp,
+      onCooldown: session.onCooldown,
+      maxCooldownMs: 120_000,
+    });
+    session.setContext({ questionId: 'q', branch: 'direct', stage: 'A0', sample: 1 });
+    await settle(queryModelResult(MODELS[0], [{ role: 'user', content: 'Hi' }]));
+    const until = session.cooldowns.get(MODELS[0]);
+    expect(until).toBeGreaterThan(Date.now());
+    expect(until).toBeLessThanOrEqual(Date.now() + 120_000);
+  });
+
   it('counts a retry as another reserved post', async () => {
     let tries = 0;
     const { budget } = openHarness(() => {

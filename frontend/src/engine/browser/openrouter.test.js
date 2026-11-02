@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { browserEngine } from './engine.js';
+import { browserEngine, modelsFromPricing } from './engine.js';
 import {
   CatalogueUnavailable,
   CATALOGUE_FAILURE_COOLDOWN_MS,
@@ -26,7 +26,7 @@ import {
   resolveMaxTokens,
   unknownCatalogueIds,
 } from './openrouter.js';
-import { clearModelCooldowns, modelIsCooling, readBlockedIds } from './roster.js';
+import { clearModelCooldowns, modelIsCooling, modelIsQuarantined, readBlockedIds } from './roster.js';
 import { settings } from './settings.js';
 
 function jsonResponse(status, body, headers = {}) {
@@ -836,16 +836,17 @@ describe('getModelsPricing', () => {
     try {
       const fetchMock = vi.fn()
         .mockRejectedValueOnce(new Error('network down'))
+        .mockRejectedValueOnce(new Error('network down'))
         .mockResolvedValueOnce(jsonResponse(200, {
           data: [{ id: 'test/alpha-100b:free', name: 'Alpha', pricing: {}, description: '' }],
         }));
       vi.stubGlobal('fetch', fetchMock);
       expect(await getModelsPricing()).toEqual({});
       expect(await getModelsPricing()).toEqual({});
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
       await vi.advanceTimersByTimeAsync(CATALOGUE_FAILURE_COOLDOWN_MS);
       const later = await getModelsPricing();
-      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
       expect(later['test/alpha-100b:free'].name).toBe('Alpha');
     } finally {
       vi.useRealTimers();
@@ -1478,3 +1479,184 @@ function hangingFetchBody(firstChunk) {
     aborted: () => aborted,
   };
 }
+
+describe('catalogue metadata', () => {
+  afterEach(() => {
+    clearModelsCache();
+    vi.unstubAllGlobals();
+  });
+
+  it('keeps weekly order and does not turn a null benchmark into zero', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      expect(String(url)).toContain('sort=top-weekly');
+      return jsonResponse(200, {
+        data: [
+          {
+            id: 'b/two:free',
+            canonical_slug: 'b/two',
+            name: 'Two',
+            pricing: { prompt: '0', completion: '0' },
+            description: 'mentions 900b somewhere',
+            context_length: 32000,
+            architecture: { input_modalities: ['text'], output_modalities: ['text'] },
+            supported_parameters: ['temperature'],
+            top_provider: { max_completion_tokens: 4096 },
+            benchmarks: null,
+            reasoning: null,
+          },
+          {
+            id: 'a/one:free',
+            name: 'One',
+            pricing: { prompt: '0', completion: '0', request: '0' },
+            benchmarks: { artificial_analysis: { intelligence: null, coding: 12 } },
+          },
+        ],
+      });
+    }));
+    const pricing = await getModelsPricing();
+    expect(pricing['b/two:free'].weeklyRank).toBe(1);
+    expect(pricing['a/one:free'].weeklyRank).toBe(2);
+    expect(pricing['b/two:free'].benchmarks).toBeNull();
+    expect(Object.prototype.hasOwnProperty.call(pricing['b/two:free'], 'reasoning')).toBe(true);
+    expect(pricing['b/two:free'].reasoning).toBeNull();
+    expect(Object.prototype.hasOwnProperty.call(pricing['a/one:free'], 'reasoning')).toBe(false);
+    expect(pricing['a/one:free'].benchmarks.artificial_analysis.intelligence).toBeNull();
+    expect(pricing['a/one:free'].benchmarks.artificial_analysis.coding).toBe(12);
+    const models = modelsFromPricing(pricing);
+    expect(models.map((model) => model.name)).toEqual(['One', 'Two']);
+    expect(models.map((model) => model.weeklyRank)).toEqual([2, 1]);
+    const two = models.find((model) => model.id === 'b/two:free');
+    const one = models.find((model) => model.id === 'a/one:free');
+    expect(Object.prototype.hasOwnProperty.call(two, 'reasoning')).toBe(true);
+    expect(two.reasoning).toBeNull();
+    expect(Object.prototype.hasOwnProperty.call(one, 'reasoning')).toBe(false);
+    expect(one.benchmarks.artificial_analysis.intelligence).toBeNull();
+  });
+
+  it('marks the size fallback when the weekly catalogue cannot be read', async () => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new Error('weekly down'))
+      .mockResolvedValueOnce(jsonResponse(200, {
+        data: [{ id: 'a/one:free', name: 'One', pricing: { prompt: '0', completion: '0' } }],
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+    const pricing = await getModelsPricing();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(String(fetchMock.mock.calls[1][0])).not.toContain('sort=');
+    expect(pricing['a/one:free'].weeklyRank).toBeNull();
+  });
+});
+
+describe('upstream incidents', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    clearModelCooldowns();
+  });
+
+  function upstreamBody() {
+    return {
+      error: {
+        message: 'Provider returned error',
+        code: 429,
+        metadata: {
+          raw: 'temporarily rate-limited upstream',
+          provider_name: 'Phala',
+          limit_source: 'upstream_provider_shared_pool',
+          is_byok: false,
+        },
+      },
+    };
+  }
+
+  async function take(model, runId, wait = 0) {
+    const pending = queryModelResult(model, [{ role: 'user', content: 'q' }], { runId });
+    await vi.advanceTimersByTimeAsync(wait);
+    return pending;
+  }
+
+  it('keeps provider metadata and counts one strike per run', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    settings.councilModels = ['a/one:free', 'b/two:free'];
+    const fetchMock = vi.fn(async () => jsonResponse(429, upstreamBody()));
+    vi.stubGlobal('fetch', fetchMock);
+    const first = await take('a/one:free', 'run-1');
+    const again = await take('a/one:free', 'run-1');
+    expect(first.skipped).toBe(true);
+    expect(first.error.metadata.limit_source).toBe('upstream_provider_shared_pool');
+    expect(first.error.metadata.provider_name).toBe('Phala');
+    expect(first.error.metadata.is_byok).toBe(false);
+    expect(again.skipped).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(modelIsQuarantined('a/one:free')).toBe(false);
+    expect(settings.councilModels).toEqual(['a/one:free', 'b/two:free']);
+    clearModelCooldowns();
+    await take('a/one:free', 'run-1', 3000);
+    expect(modelIsQuarantined('a/one:free')).toBe(false);
+    clearModelCooldowns();
+    await take('a/one:free', 'run-2', 3000);
+    expect(modelIsQuarantined('a/one:free')).toBe(false);
+    clearModelCooldowns();
+    await take('a/one:free', 'run-3', 3000);
+    expect(modelIsQuarantined('a/one:free')).toBe(true);
+    expect(settings.councilModels).toEqual(['a/one:free', 'b/two:free']);
+  });
+
+  it('does not strike a 200 JSON error that only names an upstream source', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    settings.councilModels = ['a/one:free'];
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(200, {
+      error: {
+        message: 'Provider returned error',
+        metadata: { limit_source: 'upstream_provider_shared_pool' },
+      },
+    })));
+    await take('a/one:free', 'json-1');
+    await take('a/one:free', 'json-2', 3000);
+    await take('a/one:free', 'json-3', 3000);
+    expect(modelIsQuarantined('a/one:free')).toBe(false);
+  });
+
+  it('does not quarantine a model for an account-wide free limit', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    settings.councilModels = ['a/one:free'];
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(429, {
+      error: {
+        message: 'Provider returned error',
+        metadata: { raw: 'Rate limit exceeded: free-models-per-day', limit_source: 'account' },
+      },
+    })));
+    const result = await take('a/one:free', 'day-1');
+    expect(result.ok).toBe(false);
+    expect(result.accountLimit).toBe('day');
+    expect(modelIsCooling('a/one:free')).toBe(false);
+    expect(modelIsQuarantined('a/one:free')).toBe(false);
+    expect(settings.councilModels).toEqual(['a/one:free']);
+  });
+
+  it('counts an SSE upstream error once for the same run', async () => {
+    useFreeClock();
+    settings.apiKey = 'sk-test';
+    const sse = [
+      'event: error',
+      'data: {"error":{"message":"temporarily rate-limited upstream","code":429,"metadata":{"provider_name":"Phala","limit_source":"upstream_provider_shared_pool","is_byok":false}}}',
+      '',
+    ].join('\n') + '\n';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(sse, {
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+    })));
+    const result = await take('a/one:free', 'sse-1');
+    expect(result.ok).toBe(false);
+    expect(result.error && result.error.message).toBe('temporarily rate-limited upstream');
+    expect(result.error.metadata.provider_name).toBe('Phala');
+    expect(modelIsQuarantined('a/one:free')).toBe(false);
+    await take('a/one:free', 'sse-1', 3000);
+    await take('a/one:free', 'sse-2', 3000);
+    await take('a/one:free', 'sse-3', 3000);
+    expect(modelIsQuarantined('a/one:free')).toBe(true);
+  });
+});

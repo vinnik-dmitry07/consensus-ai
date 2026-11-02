@@ -1,13 +1,23 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { applyFreeTierDefaultRoster } from './freeRoster.js';
 import {
-  applyFreeTierDefaultRoster,
+  accountRateLimitKind,
+  chooseFreeChairman,
   clearBlockedIds,
+  clearUpstreamIncidents,
   dropBlockedModel,
   freeTierDefaultRoster,
+  intelligenceScore,
+  modelIsQuarantined,
   pruneRoster,
   rankTopFreeModels,
+  recordUpstreamIncident,
   rememberModelCooldown,
+  selectFreeCandidateIds,
+  supportsReasoningHigh,
+  UPSTREAM_QUARANTINE_MS,
+  UPSTREAM_STRIKE_WINDOW_MS,
   runAllowedBySettings,
   stage1SampleLimit,
   storePrunedRoster,
@@ -71,8 +81,19 @@ describe('pruneRoster', () => {
   });
 });
 
-function freeRow(id, name = id, description = '') {
-  return { id, name, description };
+function freeRow(id, name = id, description = '', extra = {}) {
+  return {
+    id,
+    name,
+    description,
+    pricing: extra.pricing || { prompt: '0', completion: '0' },
+    context_length: extra.context_length ?? 32000,
+    max_completion_tokens: extra.max_completion_tokens ?? 4096,
+    architecture: extra.architecture || {
+      input_modalities: ['text'],
+      output_modalities: ['text'],
+    },
+  };
 }
 
 describe('rankTopFreeModels', () => {
@@ -272,14 +293,14 @@ describe('freeTierDefaultRoster', () => {
     });
   });
 
-  it('does not write when the pending-free flag is already cleared', () => {
+  it('does not write when the pending-free flag is already cleared', async () => {
     const council = [...settings.councilModels];
     const chairman = settings.chairmanModel;
     settings.councilModels = ['openai/gpt-4.1'];
     settings.chairmanModel = 'openai/gpt-4.1';
     try {
       expect(settings.useFreeTierDefault).toBe(false);
-      expect(applyFreeTierDefaultRoster([
+      expect(await applyFreeTierDefaultRoster([
         freeRow('test/alpha-100b:free', 'Alpha'),
       ])).toBe(false);
       expect(settings.councilModels).toEqual(['openai/gpt-4.1']);
@@ -364,6 +385,28 @@ describe('storePrunedRoster', () => {
     }
   });
 
+  it('keeps free_roster_managed when a prune save repeats the flag', () => {
+    localStorage.clear();
+    resetSettingsState();
+    settings.updateFromDict({
+      council_models: ['a/one:free', 'b/two:free'],
+      chairman_model: 'a/one:free',
+      free_roster_managed: true,
+    });
+    expect(settings.freeRosterManaged).toBe(true);
+    settings.updateFromDict({
+      council_models: ['a/one:free'],
+      chairman_model: 'a/one:free',
+      free_roster_managed: true,
+    });
+    expect(settings.freeRosterManaged).toBe(true);
+    settings.updateFromDict({
+      council_models: ['b/two:free'],
+      chairman_model: 'b/two:free',
+    });
+    expect(settings.freeRosterManaged).toBe(false);
+  });
+
   it('keeps a pending free-tier document when storing a pruned roster', () => {
     localStorage.clear();
     resetSettingsState();
@@ -379,5 +422,160 @@ describe('storePrunedRoster', () => {
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY));
     expect(stored.use_free_tier_default).toBe(true);
     expect(stored.council_models).toEqual(['~openai/gpt-sol-latest']);
+  });
+});
+
+function weeklyRow(id, rank, extra = {}) {
+  return {
+    id,
+    name: extra.name || id,
+    description: extra.description || '',
+    weeklyRank: rank,
+    pricing: { prompt: '0', completion: '0', ...(extra.pricing || {}) },
+    context_length: extra.context_length ?? 32000,
+    max_completion_tokens: extra.max_completion_tokens ?? 4096,
+    architecture: extra.architecture || {
+      input_modalities: ['text'],
+      output_modalities: ['text'],
+    },
+    ...('reasoning' in extra ? { reasoning: extra.reasoning } : {}),
+    benchmarks: extra.benchmarks === undefined ? null : extra.benchmarks,
+  };
+}
+
+describe('selectFreeCandidateIds', () => {
+  it('orders eligible models by weekly rank and keeps coder models', () => {
+    const ranked = selectFreeCandidateIds([
+      weeklyRow('vendor/coder-70b:free', 3, { name: 'Coder' }),
+      weeklyRow('vendor/zeta-1b:free', 1, { name: 'Zeta' }),
+      weeklyRow('vendor/alpha-900b:free', 2, { name: 'Alpha', description: 'beats a 2t model' }),
+      weeklyRow('vendor/safety-1b:free', 0, { name: 'Safety', weeklyRank: 0 }),
+    ], { blockedIds: [], coolingIds: [], quarantinedIds: [] });
+    expect(ranked.fallback).toBeNull();
+    expect(ranked.ids).toEqual([
+      'vendor/zeta-1b:free',
+      'vendor/alpha-900b:free',
+      'vendor/coder-70b:free',
+    ]);
+    expect(ranked.excluded.some((row) => row.reason === 'service')).toBe(true);
+  });
+
+  it('drops blocked, cooling, and quarantined ids without using size', () => {
+    const ranked = selectFreeCandidateIds([
+      weeklyRow('vendor/cooling:free', 1),
+      weeklyRow('vendor/blocked:free', 2),
+      weeklyRow('vendor/quarantine:free', 3),
+      weeklyRow('vendor/kept:free', 4),
+    ], {
+      blockedIds: ['vendor/blocked:free'],
+      coolingIds: ['vendor/cooling:free'],
+      quarantinedIds: ['vendor/quarantine:free'],
+    });
+    expect(ranked.ids).toEqual(['vendor/kept:free']);
+    expect(ranked.excluded.map((row) => row.reason).sort()).toEqual(['blocked', 'cooldown', 'quarantine']);
+  });
+
+  it('falls back to the size ranking when no weekly order exists', () => {
+    const models = [
+      freeRow('vendor/coder-70b:free', 'Coder'),
+      freeRow('test/alpha-10b:free', 'Alpha'),
+      freeRow('test/bravo-50b:free', 'Bravo'),
+    ];
+    const ranked = selectFreeCandidateIds(models, {
+      blockedIds: [],
+      coolingIds: ['test/bravo-50b:free'],
+      quarantinedIds: [],
+    });
+    expect(ranked.fallback).toBe('size');
+    expect(ranked.ids).toEqual(['test/alpha-10b:free']);
+    expect(ranked.excluded).toEqual([{ id: 'test/bravo-50b:free', reason: 'cooldown' }]);
+  });
+
+  it('applies the same eligibility rules on the size fallback', () => {
+    const ranked = selectFreeCandidateIds([
+      freeRow('test/paid-80b:free', 'Paid', '', { pricing: { prompt: '1', completion: '1' } }),
+      freeRow('test/vision-70b:free', 'Vision', '', {
+        architecture: { input_modalities: ['image'], output_modalities: ['text'] },
+      }),
+      freeRow('test/tiny-60b:free', 'Tiny', '', { context_length: 1024 }),
+      freeRow('test/kept-10b:free', 'Kept'),
+    ], { blockedIds: [], coolingIds: [], quarantinedIds: [] });
+    expect(ranked.fallback).toBe('size');
+    expect(ranked.ids).toEqual(['test/kept-10b:free']);
+    expect(ranked.excluded.map((row) => row.reason).sort()).toEqual(['context', 'not-text', 'paid-price']);
+  });
+
+  it('does not treat a provider daily quota as the account free-day cap', () => {
+    expect(accountRateLimitKind('Rate limit exceeded: free-models-per-min')).toBe('minute');
+    expect(accountRateLimitKind(
+      'Rate limit exceeded: free-models-per-day',
+      { limit_source: 'account' },
+    )).toBe('day');
+    expect(accountRateLimitKind('Provider daily limit exceeded', { limit_source: 'upstream' })).toBeNull();
+    expect(accountRateLimitKind('per-day quota', { limit_source: 'upstream' })).toBeNull();
+  });
+
+  it('does not treat a null intelligence score as zero', () => {
+    const missing = weeklyRow('vendor/none:free', 1, { benchmarks: null });
+    const zero = weeklyRow('vendor/zero:free', 2, {
+      benchmarks: { artificial_analysis: { intelligence: 0 } },
+    });
+    const scored = weeklyRow('vendor/scored:free', 3, {
+      benchmarks: { artificial_analysis: { intelligence: 40 } },
+    });
+    expect(intelligenceScore(missing)).toBeNull();
+    expect(intelligenceScore(zero)).toBe(0);
+    const chairman = chooseFreeChairman(
+      ['vendor/none:free', 'vendor/zero:free', 'vendor/scored:free'],
+      [missing, zero, scored],
+    );
+    expect(chairman.basis).toBe('intelligence');
+    expect(chairman.chairmanModel).toBe('vendor/scored:free');
+  });
+
+  it('uses reasoning-high only when that effort is listed', () => {
+    const absent = weeklyRow('vendor/absent:free', 1);
+    const empty = weeklyRow('vendor/empty:free', 2, { reasoning: null });
+    const high = weeklyRow('vendor/high:free', 3, {
+      reasoning: { supported_efforts: ['high'] },
+    });
+    expect(supportsReasoningHigh(absent)).toBe(false);
+    expect(supportsReasoningHigh(empty)).toBe(false);
+    expect(supportsReasoningHigh(high)).toBe(true);
+    expect(chooseFreeChairman(['vendor/absent:free'], [absent]).chairmanModel).toBe('vendor/absent:free');
+    expect(chooseFreeChairman(['vendor/high:free'], [high]).chairmanModel).toBe('vendor/high:free-reasoning-high');
+  });
+
+  it('does not promote the only scored model above an unscored weekly leader for the council order', () => {
+    const leader = weeklyRow('vendor/leader:free', 1, { benchmarks: null });
+    const scored = weeklyRow('vendor/scored:free', 2, {
+      benchmarks: { artificial_analysis: { intelligence: 80 } },
+    });
+    const ranked = selectFreeCandidateIds([scored, leader], {
+      blockedIds: [],
+      coolingIds: [],
+      quarantinedIds: [],
+    });
+    expect(ranked.ids).toEqual(['vendor/leader:free', 'vendor/scored:free']);
+  });
+});
+
+describe('upstream quarantine window', () => {
+  it('quarantines on the third distinct run and starts clean after expiry', () => {
+    clearUpstreamIncidents();
+    const start = 1_000_000;
+    expect(recordUpstreamIncident('a/one:free', 'run-1', start).strikes).toBe(1);
+    expect(recordUpstreamIncident('a/one:free', 'run-1', start + 10).strikes).toBe(1);
+    expect(recordUpstreamIncident('a/one:free', 'run-2', start + 20).strikes).toBe(2);
+    const third = recordUpstreamIncident('a/one:free', 'run-3', start + 30);
+    expect(third.quarantined).toBe(true);
+    expect(modelIsQuarantined('a/one:free', start + 30)).toBe(true);
+    expect(recordUpstreamIncident('a/one:free', 'run-4', start + 40).quarantined).toBe(true);
+    const after = start + 30 + UPSTREAM_QUARANTINE_MS + 1;
+    expect(modelIsQuarantined('a/one:free', after)).toBe(false);
+    expect(recordUpstreamIncident('a/one:free', 'run-5', after).strikes).toBe(1);
+    const later = after + UPSTREAM_STRIKE_WINDOW_MS + 5;
+    expect(recordUpstreamIncident('a/one:free', 'run-6', later).strikes).toBe(1);
+    clearUpstreamIncidents();
   });
 });

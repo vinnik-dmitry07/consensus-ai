@@ -46,6 +46,7 @@ const README_START = '<!-- eval-results:start -->';
 const README_END = '<!-- eval-results:end -->';
 const REPAIR_AMENDMENT = 'Transport failures were re-executed after the as-run data were inspected. Paid endpoints, where the catalogue has them, are separate deployments of the same weights. This layer is secondary and exploratory; the pre-registered as-run result is unchanged.';
 const COMPLETE_AMENDMENT = 'Format slips with one unambiguous answer are read from the repaired text. Cells with no answer were drawn again, up to the recorded attempt limit, on the same request. Stage 2, the red team, and Stage 3 were replayed unchanged. This layer is secondary and exploratory; the pre-registered as-run result and the strict repaired result are unchanged.';
+const UNAVAILABLE_RULE = 'A cell whose model is still rate-limited when the deadline passes is scored as no answer (provider unavailable, wrong) and is not drawn again. A vote that still has other ballots uses those ballots.';
 
 const NETWORK_RETRY_MS = 30_000;
 
@@ -59,11 +60,28 @@ function pauseForNetwork(budget, error) {
   return 2;
 }
 
+function replaceFile(tmp, file) {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    try {
+      renameSync(tmp, file);
+      return;
+    } catch (error) {
+      const code = error?.code;
+      if (code !== 'EPERM' && code !== 'EACCES' && code !== 'EBUSY') throw error;
+      if (attempt === 9) throw error;
+      const until = Date.now() + 40 * (attempt + 1);
+      while (Date.now() < until) {
+        // Windows sometimes holds the destination for a moment.
+      }
+    }
+  }
+}
+
 function writeJson(file, value) {
   mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.tmp`;
   writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf8');
-  renameSync(tmp, file);
+  replaceFile(tmp, file);
 }
 
 function readJson(file, fallback = null) {
@@ -844,6 +862,7 @@ function openLayerRun(runId, {
   replayFrom,
   aliasOf,
   replayTerminal = false,
+  maxCooldownMs = null,
 }) {
   const paths = runPaths(runId);
   const dir = path.join(paths.dir, dirName);
@@ -878,6 +897,7 @@ function openLayerRun(runId, {
     budget,
     onHttp: session.onHttp,
     onCooldown: session.onCooldown,
+    maxCooldownMs,
   });
   return {
     dir,
@@ -912,6 +932,9 @@ async function runLayer(runId, argv, layer) {
   const attempts = layer.attempts == null
     ? 0
     : Math.max(0, Math.trunc(flagNumber(argv, '--attempts', layer.attempts)));
+  const cooldownSeconds = Math.max(0, flagNumber(argv, '--cooldown-seconds', 0));
+  const deadlineMinutes = Math.max(0, flagNumber(argv, '--deadline-minutes', 0));
+  const maxCooldownMs = cooldownSeconds > 0 ? cooldownSeconds * 1000 : null;
   const paths = runPaths(runId);
   const manifest = readJson(paths.manifest);
   if (!manifest?.frozen) throw new Error(`Freeze the dev manifest before ${layer.name}.`);
@@ -934,6 +957,7 @@ async function runLayer(runId, argv, layer) {
     replayFrom,
     aliasOf: prepared.aliasOf,
     replayTerminal: layer.replayTerminal,
+    maxCooldownMs,
   });
   try {
     const models = await authorizedGet(OPENROUTER_MODELS_URL, key);
@@ -952,6 +976,15 @@ async function runLayer(runId, argv, layer) {
     if (run.state.creditsAtStart == null && balance != null) run.state.creditsAtStart = balance;
     if (balance != null) run.state.creditsLast = balance;
     noteKeyUsage(run.state, keyFingerprint(key), keyInfo?.usage);
+    if (deadlineMinutes > 0 && run.state.deadlineAt == null) {
+      run.state.deadlineAt = Date.now() + deadlineMinutes * 60_000;
+    }
+    const deadlineAt = deadlineMinutes > 0 ? run.state.deadlineAt : null;
+    if (deadlineAt && layer.name === 'complete') {
+      const manifestFile = path.join(run.dir, 'manifest.json');
+      const current = readJson(manifestFile, {});
+      if (current.deadlineAt !== deadlineAt) writeJson(manifestFile, { ...current, deadlineAt });
+    }
     run.state.budget = run.budget.snapshot();
     writeJson(path.join(run.dir, 'state.json'), run.state);
     const freeRemaining = keyInfo?.free_model_daily_requests?.remaining;
@@ -963,7 +996,11 @@ async function runLayer(runId, argv, layer) {
       console.log('Balance is under $10. Free ids without a paid variant will follow the key\'s free daily cap, otherwise 50/day.');
     }
     const attemptText = attempts > 0 ? `, ${attempts} draws` : '';
-    console.log(`Spend cap $${maxUsd}, ${maxPosts} posts, ${jobs} jobs${attemptText}. Local estimate so far $${run.budget.state.usd.toFixed(4)}.`);
+    const deadlineText = deadlineAt
+      ? `. Deadline in ${Math.max(0, Math.round((deadlineAt - Date.now()) / 60_000))} min`
+      : '';
+    const cooldownText = cooldownSeconds > 0 ? `, cooldown cap ${cooldownSeconds}s` : '';
+    console.log(`Spend cap $${maxUsd}, ${maxPosts} posts, ${jobs} jobs${attemptText}${cooldownText}. Local estimate so far $${run.budget.state.usd.toFixed(4)}${deadlineText}.`);
     if (run.budget.state.paused) {
       console.log(`${layer.verb} paused before the first question: ${run.budget.state.pauseReason}`);
       return 2;
@@ -977,34 +1014,45 @@ async function runLayer(runId, argv, layer) {
     const items = identify(bank.items.filter((item) => item.split === 'test'));
     const byId = new Map(items.map((item) => [item.id, item]));
     const { ready, orderLength } = prepared.ready(paths);
-    const pending = [];
+    let pending = [];
     let done = 0;
-    for (const id of ready) {
-      const file = questionFile(path.join(run.dir, 'questions'), id);
-      if (readJson(file)?.status === 'complete') done += 1;
-      else pending.push(id);
-    }
-    const initialDone = done;
     let cursor = 0;
     let stop = false;
     let cooled = false;
     let exitCode = 0;
+    let finalPass = false;
     const overCap = () => (
       run.budget.state.paused
       || run.budget.state.usd >= maxUsd
       || run.budget.state.posts >= maxPosts
     );
+    function loadPending() {
+      pending = [];
+      done = 0;
+      cursor = 0;
+      for (const id of ready) {
+        const file = questionFile(path.join(run.dir, 'questions'), id);
+        if (readJson(file)?.status === 'complete') done += 1;
+        else pending.push(id);
+      }
+    }
     function take() {
       if (stop || overCap()) return null;
       if (cursor >= pending.length) return null;
+      const id = pending[cursor];
       cursor += 1;
-      return { id: pending[cursor - 1], place: initialDone + cursor };
+      return { id, place: done + cursor };
     }
     function noteExit(code) {
       if (exitCode === 1) return;
       if (code === 1 || exitCode === 0) exitCode = code;
     }
-    const workers = Math.min(jobs, Math.max(pending.length, 1));
+    async function runPool() {
+      cooled = false;
+      stop = false;
+      const workers = Math.min(jobs, pending.length);
+      await Promise.all(Array.from({ length: workers }, (_, index) => worker(index)));
+    }
     async function worker(index) {
       while (true) {
         const next = take();
@@ -1042,15 +1090,45 @@ async function runLayer(runId, argv, layer) {
         console.log(`w${index} ${layer.name} ${done}/${ready.length} reused ${stats.reusedSlots}, live ${stats.liveSlots}, usd $${run.budget.state.usd.toFixed(4)}`);
       }
     }
-    await Promise.all(Array.from({ length: workers }, (_, index) => worker(index)));
-    if (exitCode === 1) return 1;
-    if (exitCode || overCap()) {
-      const reason = run.budget.state.pauseReason || 'spend_cap';
-      console.log(`${layer.verb} paused after ${done} questions: ${reason}. USD $${run.budget.state.usd.toFixed(4)}.`);
-      return exitCode || 2;
+    loadPending();
+    while (pending.length) {
+      await runPool();
+      if (exitCode === 1) return 1;
+      if (exitCode || overCap()) {
+        const reason = run.budget.state.pauseReason || 'spend_cap';
+        console.log(`${layer.verb} paused after ${done} questions: ${reason}. USD $${run.budget.state.usd.toFixed(4)}.`);
+        return exitCode || 2;
+      }
+      if (!cooled) break;
+      if (!deadlineAt || finalPass) break;
+      if (Date.now() >= deadlineAt) {
+        finalPass = true;
+        prepared.questionOptions = prepared.questionOptions || {};
+        prepared.questionOptions.unavailable = 'score';
+        console.log('Deadline reached: cells still rate-limited are scored as provider unavailable.');
+        const manifestFile = path.join(run.dir, 'manifest.json');
+        writeJson(manifestFile, { ...readJson(manifestFile, {}), finalizedAt: new Date().toISOString() });
+        loadPending();
+        continue;
+      }
+      const target = Math.min(
+        Math.max(run.budget.state.resumeAfter || 0, Date.now() + 30_000),
+        deadlineAt,
+      );
+      const waitMs = Math.max(0, target - Date.now());
+      const leftMin = Math.max(0, Math.round((deadlineAt - Date.now()) / 60_000));
+      console.log(`Cooldown: waiting ${Math.round(waitMs / 1000)}s, done ${done}/${ready.length}, deadline in ${leftMin} min.`);
+      if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+      if (run.budget.state.pauseReason === 'cooldown') {
+        run.budget.state.pauseReason = null;
+        run.budget.state.resumeAfter = null;
+      }
+      loadPending();
     }
-    if (cooled) {
-      console.log(`${layer.verb} paused after ${done} questions: cooldown. USD $${run.budget.state.usd.toFixed(4)}.`);
+    loadPending();
+    if (pending.length) {
+      const reason = cooled ? 'cooldown' : (run.budget.state.pauseReason || 'paused');
+      console.log(`${layer.verb} paused after ${done} questions: ${reason}. USD $${run.budget.state.usd.toFixed(4)}.`);
       return 2;
     }
     if (layer.followSource && ready.length < orderLength) {
@@ -1127,12 +1205,12 @@ function completeLayer() {
     name: 'complete',
     dirName: 'complete',
     verb: 'Complete',
-    maxUsd: 5,
+    maxUsd: 20,
     maxPosts: 600,
     attempts: 3,
     replayTerminal: true,
     followSource: false,
-    prepare({ manifest, paths, maxUsd, maxPosts, attempts }) {
+    prepare({ manifest, paths, maxUsd, maxPosts, attempts, argv }) {
       const repairManifest = readJson(path.join(paths.dir, 'repair', 'manifest.json'));
       if (!repairManifest?.mapping) throw new Error('Finish the repair layer before the answer-complete layer.');
       const expected = manifest.bankCounts?.test
@@ -1167,6 +1245,11 @@ function completeLayer() {
         maxPosts,
         startedAt: existing?.startedAt || new Date().toISOString(),
         amendment: COMPLETE_AMENDMENT,
+        cooldownSeconds: flagNumber(argv, '--cooldown-seconds', 0) || existing?.cooldownSeconds || null,
+        deadlineMinutes: flagNumber(argv, '--deadline-minutes', 0) || existing?.deadlineMinutes || null,
+        deadlineAt: existing?.deadlineAt || null,
+        unavailableRule: UNAVAILABLE_RULE,
+        finalizedAt: existing?.finalizedAt || null,
       });
       return {
         mapping: repairManifest.mapping,
@@ -1263,6 +1346,7 @@ function report(runId, argv = []) {
     resampledCells: sum.resampledCells + (row.resampledCells || 0),
     exhaustedCells: sum.exhaustedCells + (row.exhaustedCells || 0),
     resamplePosts: sum.resamplePosts + (row.resamplePosts || 0),
+    unavailableCells: sum.unavailableCells + (row.unavailableCells || 0),
   }), {
     reusedSlots: 0,
     liveSlots: 0,
@@ -1272,7 +1356,12 @@ function report(runId, argv = []) {
     resampledCells: 0,
     exhaustedCells: 0,
     resamplePosts: 0,
+    unavailableCells: 0,
   });
+  const unavailableModels = new Set();
+  for (const row of completeRows) {
+    for (const model of row.unavailableModels || []) unavailableModels.add(model);
+  }
   const completeKeyAtStart = completeState?.keyUsageAtStart ?? null;
   const completeKeyLast = completeState?.keyUsageLast ?? null;
   const completePrior = completeState?.priorKeySpend ?? 0;
@@ -1280,6 +1369,11 @@ function report(runId, argv = []) {
     attempts: completeManifest?.attempts ?? null,
     lenientRules: completeManifest?.lenientRules || null,
     amendment: completeManifest?.amendment || null,
+    cooldownSeconds: completeManifest?.cooldownSeconds ?? null,
+    deadlineMinutes: completeManifest?.deadlineMinutes ?? null,
+    deadlineAt: completeManifest?.deadlineAt ?? completeState?.deadlineAt ?? null,
+    unavailableRule: completeManifest?.unavailableRule || null,
+    unavailableModels: [...unavailableModels],
     posts: completeState?.budget?.posts ?? null,
     usdEstimate: completeState?.budget?.usd ?? null,
     usageUnknownCharged: completeState?.budget?.usageUnknownCharged ?? null,

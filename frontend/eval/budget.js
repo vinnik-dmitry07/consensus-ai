@@ -229,12 +229,6 @@ export function createSpendBudget(options = {}) {
 export function classifyLimitMessage(text) {
   const lowered = String(text || '').toLowerCase();
   if (lowered.includes('free-models-per-min')) return 'platform_minute';
-  if (
-    lowered.includes('free-models-per-day')
-    || lowered.includes('per-day')
-    || (lowered.includes('daily') && lowered.includes('limit'))
-  ) {
-    return 'platform_day';
-  }
+  if (lowered.includes('free-models-per-day')) return 'platform_day';
   return null;
 }

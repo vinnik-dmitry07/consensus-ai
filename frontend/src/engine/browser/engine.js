@@ -6,7 +6,11 @@
 import * as council from './council.js';
 import * as openrouter from './openrouter.js';
 import {
+  captureRunRoster,
   applyFreeTierDefaultRoster,
+  replaceUnavailableManagedMembers,
+} from './freeRoster.js';
+import {
   pruneRoster,
   readBlockedIds,
   RosterEmpty,
@@ -27,6 +31,7 @@ function errorText(exc) {
 }
 
 export const API_KEY_REQUIRED = 'Add an OpenRouter API key in Settings before running the council.';
+export const FREE_ROSTER_UNAVAILABLE = 'No free models are available right now. Try again, or pick a council in Settings.';
 
 function requireApiKey() {
   if (settings.hasApiKey) return;
@@ -34,12 +39,29 @@ function requireApiKey() {
 }
 
 export function modelsFromPricing(pricing) {
-  const models = Object.entries(pricing).map(([modelId, info]) => ({
-    id: modelId,
-    name: info.name || modelId,
-    pricing: info.pricing || {},
-    description: info.description || '',
-  }));
+  const models = Object.entries(pricing || {}).map(([modelId, info]) => {
+    const row = info || {};
+    const model = {
+      id: modelId,
+      name: row.name || modelId,
+      pricing: row.pricing || {},
+      description: row.description || '',
+      weeklyRank: Number.isInteger(row.weeklyRank) && row.weeklyRank > 0 ? row.weeklyRank : null,
+      context_length: row.context_length ?? null,
+      architecture: {
+        input_modalities: row.input_modalities ?? null,
+        output_modalities: row.output_modalities ?? null,
+        modality: row.modality ?? null,
+      },
+      supported_parameters: row.supported_parameters ?? null,
+      max_completion_tokens: row.max_completion_tokens ?? null,
+      benchmarks: row.benchmarks === undefined ? null : row.benchmarks,
+    };
+    if (Object.prototype.hasOwnProperty.call(row, 'reasoning')) {
+      model.reasoning = row.reasoning;
+    }
+    return model;
+  });
   models.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
   return models;
 }
@@ -53,7 +75,7 @@ function settleFreeTierDefaults() {
       const before = settings.readPersisted();
       const pricing = await openrouter.getModelsPricing();
       if (Object.keys(pricing).length) {
-        applyFreeTierDefaultRoster(modelsFromPricing(pricing), before);
+        await applyFreeTierDefaultRoster(modelsFromPricing(pricing), before);
       }
       settings.reloadFromStorage();
       return pricing;
@@ -72,15 +94,31 @@ async function ensureFreeTierDefaults({ required = false } = {}) {
   }
 }
 
-async function ensureServableRoster() {
+function requireFreeRosterIfPending() {
+  if (settings.useFreeTierDefault) {
+    throw new Error(FREE_ROSTER_UNAVAILABLE);
+  }
+}
+
+async function ensureServableRoster({ replaceManaged = false } = {}) {
   await ensureFreeTierDefaults();
   const pricing = await openrouter.getModelsPricing();
-  if (pricing && Object.keys(pricing).length) {
+  const known = pricing && Object.keys(pricing).length ? new Set(Object.keys(pricing)) : null;
+  if (known && replaceManaged && settings.freeRosterManaged) {
+    const replaced = await replaceUnavailableManagedMembers(
+      () => modelsFromPricing(pricing),
+      known,
+    );
+    if (replaced.reason) console.info(replaced.reason);
+    if (!settings.councilModels.length) {
+      throw new RosterEmpty(replaced.missing?.map((row) => row.id) || ['the selected models']);
+    }
+  } else if (known) {
     const pruned = pruneRoster({
       councilModels: settings.councilModels,
       chairmanModel: settings.chairmanModel,
       redTeamModel: settings.redTeamModel,
-    }, new Set(Object.keys(pricing)), readBlockedIds());
+    }, known, readBlockedIds());
     if (!pruned.councilModels.length) {
       throw new RosterEmpty(pruned.removed.length ? pruned.removed : ['the selected models']);
     }
@@ -97,8 +135,8 @@ function emitTo(onEvent, event) {
   if (typeof onEvent === 'function') onEvent(event.type, event);
 }
 
-async function postRankingMetadata(queryText, stage1Results, stage2Results, labelToModel = null) {
-  const ranked = await council.runPostRanking(queryText, stage1Results, stage2Results);
+async function postRankingMetadata(queryText, stage1Results, stage2Results, labelToModel = null, roster = null) {
+  const ranked = await council.runPostRanking(queryText, stage1Results, stage2Results, { roster });
   return council.buildCouncilMetadata(
     labelToModel || council.canonicalLabelToModel(stage1Results),
     ranked.responseRankings,
@@ -117,6 +155,7 @@ async function runAndSavePostRanking(
   stage1Results,
   stage2Results,
   labelToModel = null,
+  roster = null,
 ) {
   try {
     const metadata = await postRankingMetadata(
@@ -124,6 +163,7 @@ async function runAndSavePostRanking(
       stage1Results,
       stage2Results,
       labelToModel,
+      roster,
     );
     await storage.updateStreamingMessage(conversationId, msgIndex, { metadata });
     const redTeam = metadata.red_team;
@@ -139,7 +179,7 @@ async function runAndSavePostRanking(
       [],
       [],
       Array.from(
-        { length: Math.min(settings.topK, stage1Results.length) },
+        { length: Math.min(roster?.topK ?? settings.topK, stage1Results.length) },
         (_, index) => index,
       ),
       null,
@@ -178,9 +218,10 @@ async function* emitStage1(
   collected,
   existingResults = null,
   existingFailures = null,
+  roster = null,
 ) {
-  const councilModels = [...settings.councilModels];
-  const sampleLimit = stage1SampleLimit(councilModels, settings.nSamples);
+  const councilModels = [...(roster?.councilModels || settings.councilModels)];
+  const sampleLimit = stage1SampleLimit(councilModels, roster?.nSamples ?? settings.nSamples);
   const pending = council.pendingStage1Slots(
     councilModels,
     sampleLimit,
@@ -202,7 +243,7 @@ async function* emitStage1(
   let failures = null;
   for await (const [eventType, eventData] of council.stage1CollectResponsesStreaming(
     userMessage,
-    { existingResults, existingFailures },
+    { existingResults, existingFailures, roster },
   )) {
     if (eventType === 'init') {
       yield { type: 'stage1_init', data: eventData };
@@ -249,7 +290,7 @@ async function* emitStage1(
   yield complete;
 }
 
-async function* emitStage2(conversationId, msgIndex, queryText, stage1Results, collected) {
+async function* emitStage2(conversationId, msgIndex, queryText, stage1Results, collected, roster = null) {
   let results = [];
   let labelToModel = {};
   let failures = [];
@@ -262,6 +303,7 @@ async function* emitStage2(conversationId, msgIndex, queryText, stage1Results, c
   for await (const [eventType, eventData] of council.stage2CollectRankingsStreaming(
     queryText,
     stage1Results,
+    { roster },
   )) {
     if (eventType === 'init') {
       yield { type: 'stage2_init', data: eventData };
@@ -407,6 +449,7 @@ async function* runFromStage2(ctx) {
       ctx.queryText,
       ctx.stage1Results,
       collected,
+      ctx.roster,
     );
     ctx.stage2Results = collected.results;
     ctx.labelToModel = collected.labelToModel;
@@ -428,6 +471,7 @@ async function* emitRedTeamAndStage3(ctx) {
     ctx.stage1Results,
     ctx.stage2Results,
     ctx.labelToModel,
+    ctx.roster,
   );
   if (redOk) yield { type: 'redteam_complete', metadata };
   else {
@@ -447,6 +491,7 @@ async function* emitRedTeamAndStage3(ctx) {
       ctx.stage1Results,
       ctx.stage2Results,
       metadata,
+      { roster: ctx.roster },
     );
     await storage.updateStreamingMessage(ctx.conversationId, ctx.msgIndex, {
       stage3: stage3Result,
@@ -599,11 +644,13 @@ export const browserEngine = {
   async sendMessageStream(conversationId, content, images = [], files = [], onEvent) {
     await ensureFreeTierDefaults({ required: true });
     requireApiKey();
+    requireFreeRosterIfPending();
     const conversation = await storage.getConversation(conversationId);
     if (!conversation) throw new Error('Conversation not found');
 
-    await ensureServableRoster();
+    await ensureServableRoster({ replaceManaged: true });
     requireApiKey();
+    const roster = captureRunRoster();
     const isFirst = conversation.messages.length === 0;
     const prepared = prepareCouncilQuery(conversation, content, images, files);
     const msgIndex = await storage.addUserTurn(
@@ -613,16 +660,20 @@ export const browserEngine = {
       files,
       prepared.followUpTo,
     );
+    await storage.updateStreamingMessage(conversationId, msgIndex, {
+      run_roster: roster,
+      streaming: true,
+    });
     await runEvents(sendEvents({
       conversationId,
       msgIndex,
       isFirst,
       prepared,
+      roster,
     }), onEvent);
   },
 
   async retryStage(conversationId, stage, messageIndex, onEvent) {
-    await ensureFreeTierDefaults({ required: true });
     requireApiKey();
     const conversation = await storage.getConversation(conversationId);
     if (!conversation) throw new Error('Conversation not found');
@@ -636,10 +687,16 @@ export const browserEngine = {
       throw new Error('Message is not an assistant message');
     }
 
-    await ensureServableRoster();
+    const storedRoster = assistant.run_roster || null;
+    const rebuilt = requireUserQuery(conversation, messageIndex);
+    if (!storedRoster) {
+      await ensureFreeTierDefaults({ required: true });
+      requireFreeRosterIfPending();
+      await ensureServableRoster({ replaceManaged: false });
+    }
+    const roster = storedRoster || captureRunRoster();
 
     if (stage === 1) {
-      const rebuilt = requireUserQuery(conversation, messageIndex);
       await runEvents(retryStage1Events({
         conversationId,
         msgIndex: messageIndex,
@@ -647,6 +704,7 @@ export const browserEngine = {
         queryText: rebuilt.queryText,
         existingStage1: assistant.stage1 || [],
         existingFailures: assistant.stage1_failures,
+        roster,
       }), onEvent);
       return;
     }
@@ -655,12 +713,12 @@ export const browserEngine = {
       if (!assistant.stage1?.length) {
         throw new Error('Stage 1 results not available. Retry Stage 1 first.');
       }
-      const rebuilt = requireUserQuery(conversation, messageIndex);
       await runEvents(retryStage2Events({
         conversationId,
         msgIndex: messageIndex,
         queryText: rebuilt.queryText,
         stage1Results: assistant.stage1,
+        roster,
       }), onEvent);
       return;
     }
@@ -671,7 +729,6 @@ export const browserEngine = {
       if (!assistant.stage2?.length) {
         throw new Error('Stage 2 results not available. Retry Stage 2 first.');
       }
-      const rebuilt = requireUserQuery(conversation, messageIndex);
       await runEvents(retryStage3Events({
         conversationId,
         msgIndex: messageIndex,
@@ -679,6 +736,7 @@ export const browserEngine = {
         stage1Results: assistant.stage1,
         stage2Results: assistant.stage2,
         metadata: assistant.metadata || {},
+        roster,
       }), onEvent);
       return;
     }
@@ -699,13 +757,14 @@ async function runEvents(generator, onEvent) {
   for await (const event of generator) emitTo(onEvent, event);
 }
 
-async function* sendEvents({ conversationId, msgIndex, isFirst, prepared }) {
+async function* sendEvents({ conversationId, msgIndex, isFirst, prepared, roster }) {
   let titleState = null;
   const ctx = {
     conversationId,
     msgIndex,
     queryText: prepared.queryText,
     currentStage: null,
+    roster,
   };
   try {
     if (isFirst && prepared.followUpTo == null) titleState = startTitle(prepared.queryText);
@@ -713,7 +772,7 @@ async function* sendEvents({ conversationId, msgIndex, isFirst, prepared }) {
     yield { type: 'stage1_start' };
     const collected = {};
     try {
-      yield* emitStage1(conversationId, msgIndex, prepared.userMessage, collected);
+      yield* emitStage1(conversationId, msgIndex, prepared.userMessage, collected, null, null, roster);
       ctx.stage1Results = collected.results;
     } catch (exc) {
       yield await persistStage1Error(conversationId, msgIndex, exc, collected);
@@ -752,6 +811,7 @@ async function* retryStage1Events(input) {
     msgIndex: input.msgIndex,
     queryText: input.queryText,
     currentStage: 1,
+    roster: input.roster,
   };
   try {
     await storage.updateStreamingMessage(input.conversationId, input.msgIndex, {
@@ -773,6 +833,7 @@ async function* retryStage1Events(input) {
         collected,
         input.existingStage1,
         input.existingFailures,
+        input.roster,
       );
       ctx.stage1Results = collected.results;
     } catch (exc) {
@@ -795,6 +856,7 @@ async function* retryStage2Events(input) {
     queryText: input.queryText,
     stage1Results: input.stage1Results,
     currentStage: 2,
+    roster: input.roster,
   };
   try {
     await storage.updateStreamingMessage(input.conversationId, input.msgIndex, {
@@ -826,6 +888,7 @@ async function* retryStage3Events(input) {
       stage1Results: input.stage1Results,
       stage2Results: input.stage2Results,
       labelToModel: input.metadata.label_to_model,
+      roster: input.roster,
     });
     if (!stopped) yield { type: 'complete' };
   } catch (exc) {

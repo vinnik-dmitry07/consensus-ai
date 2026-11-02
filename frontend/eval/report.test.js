@@ -149,6 +149,12 @@ describe('interim summary', () => {
       }),
     ]);
     expect(status.A1).toMatchObject({ wrong: 1, exhausted: 1, no_answer: 0 });
+    const unavailable = armStatuses([
+      row('aime', {
+        A1: { correct: 0, status: 'no_answer', unavailable: true, reason: 'provider_unavailable' },
+      }),
+    ]);
+    expect(unavailable.A1).toMatchObject({ wrong: 1, unavailable: 1, no_answer: 0 });
     expect(status.A6).toMatchObject({ correct: 1, lenientCorrect: 1, lenientWrong: 0 });
     const analysis = analyze([
       row('aime', {
@@ -171,6 +177,10 @@ describe('interim summary', () => {
         resamplePosts: 4,
         resampledCells: 2,
         exhaustedCells: 1,
+        unavailableCells: 3,
+        unavailableModels: ['xingchen-agi/xing4.0-29b-a4b:free'],
+        deadlineMinutes: 120,
+        cooldownSeconds: 120,
         usdEstimate: 0.5,
         keySpend: 0.4,
         usageUnknownCharged: 0,
@@ -178,6 +188,9 @@ describe('interim summary', () => {
     });
     expect(text).toContain('Every cell answered: lenient read + re-sampled non-answers');
     expect(text).toContain('No answer after 4 samples (scored wrong)');
+    expect(text).toContain('Provider unavailable at deadline (scored wrong)');
+    expect(text).toContain('xingchen-agi/xing4.0-29b-a4b:free');
+    expect(text).toContain('waited 120 s and stopped after 120 min');
     expect(text).toContain('lenient-v1: one unambiguous answer');
     expect(text).toContain('answer-complete layer');
     expect(text).not.toContain('undefined');

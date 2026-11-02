@@ -6,16 +6,21 @@
  */
 
 import {
+  accountRateLimitKind,
   catalogueId,
+  confirmedUpstreamLimit,
   dropBlockedModel,
   isFreeModel,
   isHarnessOnlyMessage,
   isUpstreamLimited,
+  variantOf,
   UPSTREAM_LIMIT,
   MODEL_COOLDOWN_MAX_MS,
   MODEL_COOLDOWN_MS,
+  modelIsQuarantined,
   modelUnavailable,
   readBlockedIds,
+  recordUpstreamIncident,
   rememberModelCooldown,
 } from './roster.js';
 import { settings } from './settings.js';
@@ -121,9 +126,10 @@ export function canonicalCompletionRequest(model, messages, options = {}) {
     stream: true,
     stream_options: { include_usage: true },
   };
-  if (String(model).endsWith('-reasoning-high')) {
+  const variant = variantOf(model);
+  if (variant === 'reasoning-high') {
     payload.reasoning = { effort: isAnthropic ? 'xhigh' : 'high' };
-  } else if (String(model).endsWith('-reasoning')) {
+  } else if (variant === 'reasoning') {
     payload.reasoning = { effort: 'high' };
   }
   return payload;
@@ -143,7 +149,7 @@ export function clearModelsCache() {
 
 export function resolveMaxTokens(model, override = null) {
   if (override != null) return Math.max(1, Math.trunc(Number(override)));
-  if (String(model).endsWith('-reasoning-high')) return OPENROUTER_MAX_TOKENS_HIGH;
+  if (variantOf(model) === 'reasoning-high') return OPENROUTER_MAX_TOKENS_HIGH;
   return OPENROUTER_MAX_TOKENS;
 }
 
@@ -213,11 +219,13 @@ function failResult(message, status = null, detail = '', kind = null) {
 
 function skipReason(model) {
   if (readBlockedIds().has(catalogueModelId(model))) return 'blocked';
+  if (modelIsQuarantined(model)) return 'quarantine';
   return 'cooldown';
 }
 
 function skipMessage(reason) {
   if (reason === 'blocked') return 'OpenRouter will not serve this model';
+  if (reason === 'quarantine') return 'Temporarily quarantined after repeated upstream limits';
   if (reason === 'cooldown') return 'Temporarily unavailable (cooldown)';
   if (reason === 'upstream-429') return 'Temporarily rate-limited upstream';
   if (reason === 'provider-429') return 'Provider returned an error';
@@ -245,34 +253,77 @@ function enqueueFree(task) {
   return run;
 }
 
+export function providerErrorFields(err) {
+  if (err == null || err === '') {
+    return {
+      message: '',
+      raw: null,
+      provider_name: null,
+      limit_source: null,
+      is_byok: null,
+      status: null,
+    };
+  }
+  if (typeof err !== 'object') {
+    return {
+      message: String(err),
+      raw: String(err),
+      provider_name: null,
+      limit_source: null,
+      is_byok: null,
+      status: null,
+    };
+  }
+  const meta = err.metadata && typeof err.metadata === 'object' ? err.metadata : {};
+  let raw = meta.raw ?? err.raw ?? null;
+  if (raw != null && typeof raw !== 'string') {
+    try {
+      raw = JSON.stringify(raw);
+    } catch {
+      raw = String(raw);
+    }
+  }
+  const status = err.code ?? err.status ?? null;
+  return {
+    message: err.message ? String(err.message) : '',
+    raw,
+    provider_name: meta.provider_name ?? err.provider_name ?? null,
+    limit_source: meta.limit_source ?? err.limit_source ?? null,
+    is_byok: Object.prototype.hasOwnProperty.call(meta, 'is_byok')
+      ? meta.is_byok
+      : (Object.prototype.hasOwnProperty.call(err, 'is_byok') ? err.is_byok : null),
+    status: status == null || status === '' ? null : status,
+  };
+}
+
+function metadataFromFields(fields) {
+  return {
+    raw: fields.raw,
+    provider_name: fields.provider_name,
+    limit_source: fields.limit_source,
+    is_byok: fields.is_byok,
+  };
+}
+
 function httpErrorFromText(status, text) {
   let detail = '';
+  let fields = providerErrorFields(null);
   try {
     const data = JSON.parse(text);
     const err = data?.error;
     if (err && typeof err === 'object') {
-      const message = err.message ? String(err.message) : '';
-      let raw = '';
-      if (err.metadata && typeof err.metadata === 'object' && err.metadata.raw != null && err.metadata.raw !== '') {
-        if (typeof err.metadata.raw === 'string') {
-          raw = err.metadata.raw;
-        } else {
-          try {
-            raw = JSON.stringify(err.metadata.raw);
-          } catch {
-            raw = String(err.metadata.raw);
-          }
-        }
-      }
-      const parts = [message, raw].filter(Boolean);
+      fields = providerErrorFields(err);
+      const parts = [fields.message, fields.raw].filter(Boolean);
       detail = parts.length ? parts.join(' ') : JSON.stringify(err);
     } else if (err) {
       detail = String(err);
+      fields = providerErrorFields(detail);
     } else {
       detail = text || '';
     }
   } catch {
     detail = text || '';
+    fields = providerErrorFields(detail || null);
   }
 
   let message;
@@ -285,7 +336,7 @@ function httpErrorFromText(status, text) {
     if (detail) message = `${message}: ${detail}`;
   }
 
-  return { status, message, detail };
+  return { status, message, detail, metadata: metadataFromFields(fields) };
 }
 
 export async function parseHttpError(response) {
@@ -321,26 +372,65 @@ function rememberCatalogueFailure(generation) {
   modelsCooldownUntil = Date.now() + CATALOGUE_FAILURE_COOLDOWN_MS;
 }
 
-async function loadModelsPricing(generation) {
+export function catalogueEntry(model, weeklyRank = null) {
+  const entry = {
+    name: model?.name,
+    pricing: model?.pricing && typeof model.pricing === 'object' ? { ...model.pricing } : {},
+    description: model?.description || '',
+    weeklyRank: Number.isInteger(weeklyRank) && weeklyRank > 0 ? weeklyRank : null,
+    context_length: Object.prototype.hasOwnProperty.call(model || {}, 'context_length')
+      ? model.context_length
+      : null,
+    input_modalities: model?.architecture?.input_modalities ?? null,
+    output_modalities: model?.architecture?.output_modalities ?? null,
+    modality: model?.architecture?.modality ?? null,
+    supported_parameters: Array.isArray(model?.supported_parameters)
+      ? [...model.supported_parameters]
+      : null,
+    max_completion_tokens: model?.top_provider?.max_completion_tokens ?? null,
+    benchmarks: Object.prototype.hasOwnProperty.call(model || {}, 'benchmarks')
+      ? model.benchmarks
+      : null,
+  };
+  if (Object.prototype.hasOwnProperty.call(model || {}, 'reasoning')) {
+    entry.reasoning = model.reasoning;
+  }
+  return entry;
+}
+
+async function fetchCatalogue(generation) {
+  const sortedUrl = `${OPENROUTER_MODELS_URL}?sort=top-weekly`;
   try {
-    const response = await fetch(OPENROUTER_MODELS_URL, {
-      signal: AbortSignal.timeout(30000),
-    });
-    if (generation !== modelsGeneration) return modelsCache || {};
+    const response = await fetch(sortedUrl, { signal: AbortSignal.timeout(30000) });
+    if (generation !== modelsGeneration) return null;
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
+    if (generation !== modelsGeneration) return null;
+    return { data, weeklyOrder: true };
+  } catch (exc) {
+    if (generation !== modelsGeneration) return null;
+    console.error('Error fetching weekly model order:', exc);
+  }
+  const response = await fetch(OPENROUTER_MODELS_URL, { signal: AbortSignal.timeout(30000) });
+  if (generation !== modelsGeneration) return null;
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const data = await response.json();
+  if (generation !== modelsGeneration) return null;
+  return { data, weeklyOrder: false };
+}
+
+async function loadModelsPricing(generation) {
+  try {
+    const loaded = await fetchCatalogue(generation);
     if (generation !== modelsGeneration) return modelsCache || {};
+    if (!loaded) return modelsCache || {};
     const built = {};
-    for (const model of data.data || []) {
+    const rows = Array.isArray(loaded.data?.data) ? loaded.data.data : [];
+    rows.forEach((model, index) => {
       const modelId = model?.id;
-      if (modelId) {
-        built[modelId] = {
-          name: model.name,
-          pricing: model.pricing || {},
-          description: model.description || '',
-        };
-      }
-    }
+      if (!modelId || built[modelId]) return;
+      built[modelId] = catalogueEntry(model, loaded.weeklyOrder ? index + 1 : null);
+    });
     if (!Object.keys(built).length) {
       rememberCatalogueFailure(generation);
       return built;
@@ -417,7 +507,7 @@ function delay(seconds, signal) {
   });
 }
 
-function timeoutReason() {
+export function timeoutReason() {
   return new DOMException('The operation was aborted due to timeout', 'TimeoutError');
 }
 
@@ -588,9 +678,27 @@ function successFromTarget(target, content, usage) {
 }
 
 function providerFailure(err) {
-  const detail = typeof err === 'string' ? err : String(err?.message || 'Stream error');
-  const status = err && typeof err === 'object' && err.code != null ? err.code : null;
-  return failResult(detail, status, detail, 'provider');
+  const fields = providerErrorFields(err);
+  const detail = fields.message || 'Stream error';
+  const result = failResult(detail, fields.status, detail, 'provider');
+  result.error.metadata = metadataFromFields(fields);
+  return result;
+}
+
+function rateLimitStatus(error) {
+  const status = Number(error?.status ?? error?.code);
+  return status === 429;
+}
+
+function noteConfirmedUpstream(model, runId, error) {
+  if (!runId || !error) return;
+  const metadata = error.metadata || null;
+  const text = `${error.message || ''} ${error.detail || ''} ${metadata?.raw || ''}`;
+  if (accountRateLimitKind(text, metadata)) return;
+  if (!confirmedUpstreamLimit(text, metadata)) return;
+  const explicit = String(text).toLowerCase().includes(UPSTREAM_LIMIT);
+  if (!rateLimitStatus(error) && !explicit) return;
+  recordUpstreamIncident(model, runId);
 }
 
 function protocolFailure(detail) {
@@ -821,6 +929,7 @@ async function queryModelAttempts(model, messages, options) {
       extraWaitMs,
       attempt,
       maxRetries,
+      runId: options.runId || null,
     });
     if (outcome.retry) {
       extraWaitMs = outcome.extraWaitMs;
@@ -840,6 +949,7 @@ async function runModelAttempt({
   extraWaitMs,
   attempt,
   maxRetries,
+  runId = null,
 }) {
   let lifetime = null;
   try {
@@ -862,17 +972,22 @@ async function runModelAttempt({
     });
     lifetime.headersArrived();
     const loaded = await readHttpBody(response, lifetime);
-    if (loaded.stream) return loaded.stream;
+    if (loaded.stream) {
+      noteConfirmedUpstream(model, runId, loaded.stream.error);
+      return loaded.stream;
+    }
 
     if (response.status === 429) {
       const error = httpErrorFromText(response.status, loaded.text);
       const detail = `${error.message || ''} ${error.detail || ''}`;
-      const freeLimited = detail.includes('free-models-per-min');
+      const account = accountRateLimitKind(detail, error.metadata);
       const header = response.headers.get('Retry-After');
       let wait;
-      if (freeLimited) {
+      if (account === 'minute') {
         wait = parseRetryAfter(header, FREE_MINUTE_MS / 1000);
         extendFreeCooldown(wait);
+      } else if (account === 'day') {
+        return { ok: false, error, accountLimit: 'day' };
       } else if (isUpstreamLimited(detail)) {
         wait = parseRetryAfter(
           header,
@@ -880,15 +995,18 @@ async function runModelAttempt({
           MODEL_COOLDOWN_MAX_MS / 1000,
         );
         rememberModelCooldown(model, wait);
-        return skippedResult(skipMessage(limitedSkipReason(detail)));
+        noteConfirmedUpstream(model, runId, error);
+        const skipped = skippedResult(skipMessage(limitedSkipReason(detail)));
+        skipped.error.metadata = error.metadata;
+        return skipped;
       } else {
         wait = parseRetryAfter(header, 2 ** attempt);
       }
       if (attempt < maxRetries - 1) {
         console.error(`Rate limited for ${model}, retrying in ${wait}s...`);
         lifetime.stop();
-        if (free && !freeLimited) return { retry: true, extraWaitMs: wait * 1000 };
-        if (!free) await delay(wait, signal);
+        if (free) return { retry: true, extraWaitMs: wait * 1000 };
+        await delay(wait, signal);
         return { retry: true, extraWaitMs: 0 };
       }
       return { ok: false, error };
@@ -913,7 +1031,9 @@ async function runModelAttempt({
       return { ok: false, error };
     }
 
-    return jsonCompletion(loaded.text);
+    const parsed = jsonCompletion(loaded.text);
+    noteConfirmedUpstream(model, runId, parsed.error);
+    return parsed;
   } catch (exc) {
     const kind = lifetime?.kind();
     if (kind === 'first-response' || kind === 'idle' || kind === 'total' || kind === 'aborted') {

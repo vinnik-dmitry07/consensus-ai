@@ -154,6 +154,7 @@ function sortByCouncil(rows, council) {
 export async function runQuestion(task, session, frozen, baseSnap, options = {}) {
   const grader = options.grader || gradeResponse;
   const attempts = Math.max(0, Math.trunc(options.attempts || 0));
+  const scoreUnavailable = options.unavailable === 'score';
   const questionId = task.id;
   const prompt = answerPrompt(task);
   const user = messages(prompt);
@@ -560,6 +561,8 @@ export async function runQuestion(task, session, frozen, baseSnap, options = {})
       return { paused: false };
     }
 
+    const unavailableIds = new Set();
+    const unavailableModels = new Set();
     if (attempts > 0) {
       const ordered = [...cells].sort((left, right) => {
         const leftCool = coolingUntil(left.model) > Date.now() ? 1 : 0;
@@ -567,17 +570,24 @@ export async function runQuestion(task, session, frozen, baseSnap, options = {})
         return leftCool - rightCool;
       });
       let deferred = false;
+      const hold = (meta) => {
+        if (scoreUnavailable) {
+          unavailableIds.add(cellId(meta));
+          unavailableModels.add(meta.model);
+          return;
+        }
+        noteCooldown(meta.model);
+        deferred = true;
+      };
       for (const meta of ordered) {
         if (!needsDraw(meta)) continue;
         if (coolingUntil(meta.model) > Date.now()) {
-          noteCooldown(meta.model);
-          deferred = true;
+          hold(meta);
           continue;
         }
         const drawn = await drawAttempts(meta);
         if (drawn.reason === 'cooldown') {
-          noteCooldown(meta.model);
-          deferred = true;
+          hold(meta);
           continue;
         }
         if (drawn.paused) return stop('paused', drawn.reason || session.budget.state.pauseReason);
@@ -601,6 +611,16 @@ export async function runQuestion(task, session, frozen, baseSnap, options = {})
         const grade = gradeSlot(task, drawn, grader);
         if (grade?.status === 'graded') return { ...grade, resampled: attempt };
         last = grade;
+      }
+      if (unavailableIds.has(cellId(meta))) {
+        return {
+          correct: 0,
+          status: 'no_answer',
+          reason: 'provider_unavailable',
+          unavailable: true,
+          formatCompliant: false,
+          extracted: null,
+        };
       }
       if (attempts > 0 && finished >= attempts) {
         return {
@@ -633,6 +653,7 @@ export async function runQuestion(task, session, frozen, baseSnap, options = {})
       const drawn = winners.map((grade) => grade.resampled || 0).filter((value) => value > 0);
       if (drawn.length) vote.resampled = Math.max(...drawn);
       if (vote.status !== 'graded' && grades.some((grade) => grade?.exhausted)) vote.exhausted = true;
+      if (vote.status !== 'graded' && grades.some((grade) => grade?.unavailable)) vote.unavailable = true;
       return vote;
     }
     function synthesisGrade(branch, stage, previous) {
@@ -667,6 +688,8 @@ export async function runQuestion(task, session, frozen, baseSnap, options = {})
     outcome.lenientCells = tracked.filter((grade) => grade.lenient && !grade.resampled).length;
     outcome.resampledCells = tracked.filter((grade) => grade.resampled).length;
     outcome.exhaustedCells = tracked.filter((grade) => grade.exhausted).length;
+    outcome.unavailableCells = tracked.filter((grade) => grade.unavailable).length;
+    outcome.unavailableModels = [...unavailableModels];
     outcome.resamplePosts = session.slots().reduce((sum, slot) => {
       if (slot.meta?.questionId !== questionId || (slot.meta.attempt || 0) <= 0) return sum;
       return sum + (slot.httpAttempts || 0);

@@ -4,7 +4,7 @@
  * catalogueId lives here so this module does not import openrouter.js.
  */
 
-import { notifySettingsChanged, sameStringList, settings } from './settings.js';
+import { notifySettingsChanged, settings } from './settings.js';
 
 const BLOCKED_KEY = 'llm-council-blocked-models';
 const COOLDOWN_KEY = 'llm-council-model-cooldowns';
@@ -38,9 +38,228 @@ export function runAllowedBySettings(data) {
 }
 
 const SPECIALIZED_FREE = /code|coder|codestral|devstral|starcoder|safety|guard|omni|-fin(?=:|$)|-sante(?=:|$)/i;
+const SERVICE_FREE = /(?:^|[/_:.-])(?:safety|guard)(?:$|[/_:.-])/i;
+const PRICE_FIELDS = ['prompt', 'completion', 'request', 'image', 'internal_reasoning', 'web_search'];
+
+export const COUNCIL_MIN_CONTEXT = 8000;
+export const CHAIRMAN_MIN_CONTEXT = 32000;
+export const MIN_COMPLETION_TOKENS = 1024;
+export const UPSTREAM_STRIKE_WINDOW_MS = 6 * 60 * 60 * 1000;
+export const UPSTREAM_STRIKE_LIMIT = 3;
+export const UPSTREAM_QUARANTINE_MS = 60 * 60 * 1000;
+
+const INCIDENT_KEY = 'llm-council-upstream-incidents';
 
 export function isSpecializedFreeId(model) {
   return SPECIALIZED_FREE.test(String(model || ''));
+}
+
+export function isServiceFreeId(model) {
+  return SERVICE_FREE.test(String(model || ''));
+}
+
+export function priceIsZero(value) {
+  if (typeof value === 'number') return value === 0;
+  if (typeof value !== 'string' || value.trim() === '') return false;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed === 0;
+}
+
+export function priceVerdict(pricing) {
+  if (!pricing || typeof pricing !== 'object') return 'unknown';
+  for (const field of PRICE_FIELDS) {
+    const value = pricing[field];
+    if (value == null || value === '') continue;
+    if (!priceIsZero(value)) return 'paid';
+  }
+  if (priceIsZero(pricing.prompt) && priceIsZero(pricing.completion)) return 'free';
+  return 'unknown';
+}
+
+export function knownPricesAreFree(pricing) {
+  return priceVerdict(pricing) === 'free';
+}
+
+export function supportsTextChat(model) {
+  const arch = model?.architecture;
+  if (!arch || typeof arch !== 'object') return true;
+  const input = arch.input_modalities;
+  const output = arch.output_modalities;
+  if (Array.isArray(input) && !input.includes('text')) return false;
+  if (Array.isArray(output) && !output.includes('text')) return false;
+  if (!Array.isArray(input) && !Array.isArray(output) && typeof arch.modality === 'string' && arch.modality.includes('->')) {
+    const [left, right] = arch.modality.split('->');
+    if (left && right) return left.includes('text') && right.includes('text');
+  }
+  return true;
+}
+
+function numericOrNull(value) {
+  if (value == null || value === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+export function contextFitsRole(model, role) {
+  const minContext = role === 'chairman' ? CHAIRMAN_MIN_CONTEXT : COUNCIL_MIN_CONTEXT;
+  const context = numericOrNull(model?.context_length);
+  if (context != null && context < minContext) return false;
+  const cap = numericOrNull(model?.max_completion_tokens);
+  if (cap != null && cap < MIN_COMPLETION_TOKENS) return false;
+  return true;
+}
+
+export function supportsReasoningHigh(model) {
+  if (!model || !Object.prototype.hasOwnProperty.call(model, 'reasoning')) return false;
+  const reasoning = model.reasoning;
+  if (!reasoning || typeof reasoning !== 'object') return false;
+  if (!Object.prototype.hasOwnProperty.call(reasoning, 'supported_efforts')) return false;
+  return Array.isArray(reasoning.supported_efforts) && reasoning.supported_efforts.includes('high');
+}
+
+export function intelligenceScore(model) {
+  return numericOrNull(model?.benchmarks?.artificial_analysis?.intelligence);
+}
+
+export function weeklyOrderAvailable(models) {
+  return (Array.isArray(models) ? models : []).some(
+    (model) => Number.isInteger(model?.weeklyRank) && model.weeklyRank > 0,
+  );
+}
+
+function idSet(value) {
+  return value instanceof Set ? value : new Set(value || []);
+}
+
+function obstacleReason(cid, options) {
+  if (idSet(options.blockedIds).has(cid)) return 'blocked';
+  if (idSet(options.coolingIds).has(cid)) return 'cooldown';
+  if (idSet(options.quarantinedIds).has(cid)) return 'quarantine';
+  return null;
+}
+
+export function freeEligibilityReason(model) {
+  const id = model?.id;
+  if (!id || !String(id).endsWith(':free')) return 'not-free';
+  if (isServiceFreeId(id)) return 'service';
+  if (!knownPricesAreFree(model.pricing)) return 'paid-price';
+  if (!supportsTextChat(model)) return 'not-text';
+  if (!contextFitsRole(model, 'council')) return 'context';
+  return null;
+}
+
+function compareWeekly(left, right) {
+  if (left.weeklyRank !== right.weeklyRank) return left.weeklyRank - right.weeklyRank;
+  if (left.id < right.id) return -1;
+  if (left.id > right.id) return 1;
+  return 0;
+}
+
+/**
+ * Eligible free ids ordered by weekly popularity, then id.
+ * Without a weekly order, falls back to the size ranking and says so.
+ * Known blocks, cooldowns, and quarantines are left out either way.
+ */
+export function selectFreeCandidateIds(models, options = {}) {
+  const list = Array.isArray(models) ? models : [];
+  const excluded = [];
+  const excludeIds = idSet(options.excludeIds);
+  if (!weeklyOrderAvailable(list)) {
+    const byId = new Map();
+    for (const model of list) {
+      if (model?.id && !byId.has(model.id)) byId.set(model.id, model);
+    }
+    const ranked = rankTopFreeModels(list, options.blockedIds, options.poolLimit ?? 50);
+    const ids = [];
+    const seen = new Set();
+    for (const id of ranked) {
+      const cid = catalogueId(id);
+      if (!cid || seen.has(cid) || excludeIds.has(cid)) continue;
+      const model = byId.get(id) || byId.get(cid);
+      const why = model ? freeEligibilityReason(model) : 'not-free';
+      if (why) {
+        if (why !== 'not-free') excluded.push({ id, reason: why });
+        continue;
+      }
+      const reason = obstacleReason(cid, options);
+      if (reason) {
+        excluded.push({ id, reason });
+        continue;
+      }
+      seen.add(cid);
+      ids.push(id);
+    }
+    return { ids, excluded, fallback: 'size' };
+  }
+
+  const eligible = [];
+  const seen = new Set();
+  for (const model of list) {
+    const id = model?.id;
+    if (!id) continue;
+    const cid = catalogueId(id);
+    if (!cid || seen.has(cid) || excludeIds.has(cid)) {
+      if (cid && seen.has(cid)) excluded.push({ id, reason: 'duplicate' });
+      continue;
+    }
+    const why = freeEligibilityReason(model);
+    if (why) {
+      if (why !== 'not-free') excluded.push({ id, reason: why });
+      continue;
+    }
+    const block = obstacleReason(cid, options);
+    if (block) {
+      excluded.push({ id, reason: block });
+      continue;
+    }
+    seen.add(cid);
+    eligible.push(model);
+  }
+  eligible.sort(compareWeekly);
+  return {
+    ids: eligible.map((model) => model.id),
+    excluded,
+    fallback: null,
+  };
+}
+
+export function chooseFreeChairman(memberIds, models) {
+  const byId = new Map();
+  for (const model of Array.isArray(models) ? models : []) {
+    if (model?.id && !byId.has(model.id)) byId.set(model.id, model);
+  }
+  const capable = [];
+  const relaxed = [];
+  for (const id of memberIds || []) {
+    const model = byId.get(catalogueId(id)) || byId.get(id);
+    if (!model) continue;
+    relaxed.push(model);
+    if (contextFitsRole(model, 'chairman')) capable.push(model);
+  }
+  const pool = capable.length ? capable : relaxed;
+  if (!pool.length) {
+    return { chairmanModel: '', basis: 'none' };
+  }
+  const scored = pool.filter((model) => intelligenceScore(model) != null);
+  let chosen;
+  let basis;
+  if (scored.length) {
+    scored.sort((left, right) => {
+      const diff = intelligenceScore(right) - intelligenceScore(left);
+      if (diff !== 0) return diff;
+      return compareWeekly(left, right);
+    });
+    chosen = scored[0];
+    basis = 'intelligence';
+  } else {
+    chosen = pool[0];
+    basis = 'order';
+  }
+  const base = catalogueId(chosen.id);
+  return {
+    chairmanModel: supportsReasoningHigh(chosen) ? `${base}-reasoning-high` : base,
+    basis,
+  };
 }
 
 function parseSizeFromText(text) {
@@ -67,10 +286,6 @@ function freeSlugFamily(id) {
   return match ? match[0] : slug;
 }
 
-function blockedIdSet(blockedIds) {
-  return blockedIds instanceof Set ? blockedIds : new Set(blockedIds || []);
-}
-
 /**
  * Up to `limit` free catalogue ids. One model per slug family first, then
  * the next largest ids if that is short. A size tie inside a family keeps
@@ -79,7 +294,7 @@ function blockedIdSet(blockedIds) {
 export function rankTopFreeModels(models, blockedIds, limit = 10) {
   const cap = Math.trunc(Number(limit));
   if (!Number.isFinite(cap) || cap <= 0) return [];
-  const blocked = blockedIdSet(blockedIds);
+  const blocked = idSet(blockedIds);
   const eligible = [];
   const seen = new Set();
   for (const model of Array.isArray(models) ? models : []) {
@@ -140,20 +355,6 @@ export function freeTierDefaultRoster(models, blockedIds) {
   };
 }
 
-export function applyFreeTierDefaultRoster(models, before = null) {
-  const baseline = before || settings.readPersisted();
-  if (baseline.use_free_tier_default !== true) return false;
-  const roster = freeTierDefaultRoster(models, readBlockedIds());
-  if (!roster.councilModels.length) return false;
-  const latest = settings.readPersisted();
-  if (latest.use_free_tier_default !== true) return false;
-  if (!sameStringList(latest.council_models, baseline.council_models)) return false;
-  if ((latest.chairman_model || '') !== (baseline.chairman_model || '')) return false;
-  settings.writeFreeTierDefaults(latest, roster);
-  notifySettingsChanged();
-  return true;
-}
-
 export function isHarnessOnlyMessage(text) {
   return String(text || '').toLowerCase().includes(HARNESS_ONLY);
 }
@@ -205,10 +406,115 @@ export function clearModelCooldowns() {
   localStorage.removeItem(COOLDOWN_KEY);
 }
 
+function emptyIncidentStore() {
+  return { incidents: [], quarantine: {} };
+}
+
+function readIncidentStore() {
+  try {
+    const raw = localStorage.getItem(INCIDENT_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return emptyIncidentStore();
+    return {
+      incidents: Array.isArray(parsed.incidents) ? parsed.incidents : [],
+      quarantine: parsed.quarantine && typeof parsed.quarantine === 'object' && !Array.isArray(parsed.quarantine)
+        ? parsed.quarantine
+        : {},
+    };
+  } catch {
+    return emptyIncidentStore();
+  }
+}
+
+function writeIncidentStore(store) {
+  localStorage.setItem(INCIDENT_KEY, JSON.stringify(store));
+}
+
+function expireQuarantine(store, now) {
+  for (const [cid, until] of Object.entries(store.quarantine)) {
+    if (!(Number(until) > now)) delete store.quarantine[cid];
+  }
+}
+
+export function clearUpstreamIncidents() {
+  localStorage.removeItem(INCIDENT_KEY);
+}
+
+export function readQuarantinedIds(now = Date.now()) {
+  const store = readIncidentStore();
+  const before = Object.keys(store.quarantine).length;
+  expireQuarantine(store, now);
+  if (Object.keys(store.quarantine).length !== before) writeIncidentStore(store);
+  return new Set(Object.keys(store.quarantine));
+}
+
+export function modelIsQuarantined(model, now = Date.now()) {
+  const cid = catalogueId(model);
+  if (!cid) return false;
+  return readQuarantinedIds(now).has(cid);
+}
+
+export function recordUpstreamIncident(model, runId, now = Date.now()) {
+  const cid = catalogueId(model);
+  if (!cid || !runId) return { quarantined: false, strikes: 0 };
+  const store = readIncidentStore();
+  expireQuarantine(store, now);
+  if (Number(store.quarantine[cid]) > now) {
+    writeIncidentStore(store);
+    return { quarantined: true, strikes: 0 };
+  }
+  const windowStart = now - UPSTREAM_STRIKE_WINDOW_MS;
+  store.incidents = store.incidents.filter((row) => (
+    row
+    && row.cid
+    && row.runId
+    && Number(row.at) >= windowStart
+  ));
+  const duplicate = store.incidents.some((row) => row.cid === cid && row.runId === String(runId));
+  if (!duplicate) store.incidents.push({ cid, at: now, runId: String(runId) });
+  const strikes = store.incidents.filter((row) => row.cid === cid).length;
+  let quarantined = false;
+  if (strikes >= UPSTREAM_STRIKE_LIMIT) {
+    store.quarantine[cid] = now + UPSTREAM_QUARANTINE_MS;
+    store.incidents = store.incidents.filter((row) => row.cid !== cid);
+    quarantined = true;
+  }
+  writeIncidentStore(store);
+  return { quarantined, strikes: quarantined ? UPSTREAM_STRIKE_LIMIT : strikes };
+}
+
+export function confirmedUpstreamLimit(text, metadata = null) {
+  const source = String(metadata?.limit_source || '').toLowerCase();
+  if (source.includes('upstream')) return true;
+  return String(text || '').toLowerCase().includes(UPSTREAM_LIMIT);
+}
+
+export function accountRateLimitKind(text, metadata = null) {
+  const blob = `${text || ''} ${metadata?.limit_source || ''}`.toLowerCase();
+  if (blob.includes('free-models-per-min')) return 'minute';
+  if (blob.includes('free-models-per-day')) return 'day';
+  return null;
+}
+
+export function readCoolingIds(now = Date.now()) {
+  const map = readCooldownMap();
+  const ids = new Set();
+  let dirty = false;
+  for (const [cid, until] of Object.entries(map)) {
+    if (Number(until) > now) ids.add(cid);
+    else {
+      delete map[cid];
+      dirty = true;
+    }
+  }
+  if (dirty) localStorage.setItem(COOLDOWN_KEY, JSON.stringify(map));
+  return ids;
+}
+
 export function modelUnavailable(model) {
   const cid = catalogueId(model);
   if (!cid) return false;
-  return readBlockedIds().has(cid) || modelIsCooling(model);
+  return readBlockedIds().has(cid) || modelIsCooling(model) || modelIsQuarantined(model);
 }
 
 export function readBlockedIds() {
@@ -250,7 +556,7 @@ export class RosterEmpty extends Error {
   }
 }
 
-function variantOf(model) {
+export function variantOf(model) {
   const text = String(model || '');
   if (text.endsWith('-reasoning-high')) return 'reasoning-high';
   if (text.endsWith('-reasoning')) return 'reasoning';
@@ -265,7 +571,7 @@ function withVariant(baseId, variant) {
 }
 
 export function pruneRoster(roster, knownIds, blockedIds = null) {
-  const known = knownIds instanceof Set ? knownIds : new Set(knownIds || []);
+  const known = idSet(knownIds);
   const blocked = blockedIds instanceof Set
     ? blockedIds
     : new Set(blockedIds || readBlockedIds());

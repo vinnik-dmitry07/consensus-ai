@@ -1,14 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { API_KEY_REQUIRED, browserEngine, modelsFromPricing, pipeline } from './engine.js';
+import { API_KEY_REQUIRED, FREE_ROSTER_UNAVAILABLE, browserEngine, modelsFromPricing, pipeline } from './engine.js';
 import * as council from './council.js';
 import * as openrouter from './openrouter.js';
 import { resetFreeQueueForTests } from './openrouter.js';
 import { composeFollowUpQuery } from './query.js';
 import {
-  freeTierDefaultRoster,
+  chooseFreeChairman,
+  rankTopFreeModels,
   readBlockedIds,
-  RosterEmpty,
+  rememberModelCooldown,
   runAllowedBySettings,
   selectedCatalogueIds,
 } from './roster.js';
@@ -693,17 +694,50 @@ describe('free roster without a personal key', () => {
   });
 });
 
+function freeCatalogueRow(name, extra = {}) {
+  return {
+    name,
+    description: extra.description || '',
+    pricing: { prompt: '0', completion: '0' },
+    context_length: 64000,
+    max_completion_tokens: 4096,
+    input_modalities: ['text'],
+    output_modalities: ['text'],
+    ...extra,
+  };
+}
+
 function freeCataloguePricing() {
   return {
-    'test/alpha-100b:free': { name: 'Alpha', description: '' },
-    'test/bravo-90b:free': { name: 'Bravo', description: '' },
-    'test/charlie-80b:free': { name: 'Charlie', description: '' },
-    'test/delta-70b:free': { name: 'Delta', description: '' },
+    'test/alpha-100b:free': freeCatalogueRow('Alpha'),
+    'test/bravo-90b:free': freeCatalogueRow('Bravo'),
+    'test/charlie-80b:free': freeCatalogueRow('Charlie'),
+    'test/delta-70b:free': freeCatalogueRow('Delta'),
   };
 }
 
 function expectedFreeRoster(pricing = freeCataloguePricing()) {
-  return freeTierDefaultRoster(modelsFromPricing(pricing), readBlockedIds());
+  const models = modelsFromPricing(pricing);
+  const councilModels = rankTopFreeModels(models, readBlockedIds());
+  return {
+    councilModels,
+    chairmanModel: chooseFreeChairman(councilModels, models).chairmanModel,
+    nSamples: 1,
+  };
+}
+
+function healthyEndpointResponse() {
+  return new Response(JSON.stringify({
+    data: {
+      endpoints: [{
+        provider_name: 'Test',
+        status: 0,
+        pricing: { prompt: '0', completion: '0' },
+        context_length: 64000,
+        max_completion_tokens: 4096,
+      }],
+    },
+  }), { status: 200, headers: { 'Content-Type': 'application/json' } });
 }
 
 function writeStoredSettings(data) {
@@ -729,10 +763,27 @@ describe('free tier default roster', () => {
     localStorage.clear();
     resetSettingsState();
     vi.spyOn(openrouter, 'getModelsPricing').mockResolvedValue(freeCataloguePricing());
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      if (String(url).includes('/endpoints')) return healthyEndpointResponse();
+      const ids = new Set(['openai/gpt-4.1', ...Object.keys(freeCataloguePricing())]);
+      for (const model of [...DEFAULT_COUNCIL_MODELS, DEFAULT_CHAIRMAN_MODEL]) {
+        ids.add(String(model));
+        ids.add(String(model).replace(/-reasoning(?:-high)?$/, ''));
+      }
+      return new Response(JSON.stringify({
+        data: [...ids].map((id) => ({
+          id,
+          name: id,
+          pricing: { prompt: '0', completion: '0' },
+          description: '',
+        })),
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }));
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it('applies Top 10 Free on unset storage and still requires a personal key', async () => {
@@ -744,7 +795,7 @@ describe('free tier default roster', () => {
     const data = await browserEngine.getPricing();
     expect(data.council_models).toEqual(expected.councilModels);
     expect(data.chairman_model).toBe(expected.chairmanModel);
-    expect(data.chairman_model.endsWith('-reasoning-high')).toBe(true);
+    expect(data.chairman_model.endsWith('-reasoning-high')).toBe(false);
     expect(data.n_samples).toBe(1);
     const savedAfter = await browserEngine.getSettings();
     expect(savedAfter.has_api_key).toBe(false);
@@ -906,7 +957,7 @@ describe('free tier default roster', () => {
     expect(Object.keys(data.pricing).sort()).toEqual([...expected.councilModels].sort());
   });
 
-  it('prunes a pending factory roster without finishing it when nothing ranks free', async () => {
+  it('does not send the paid factory when no free roster can be applied', async () => {
     settings.apiKey = 'sk-test';
     const kept = DEFAULT_COUNCIL_MODELS[0];
     openrouter.getModelsPricing.mockResolvedValue({
@@ -923,18 +974,15 @@ describe('free tier default roster', () => {
       };
     });
     const created = await browserEngine.createConversation();
-    await browserEngine.sendMessageStream(created.id, 'q', [], [], () => {});
+    await expect(
+      browserEngine.sendMessageStream(created.id, 'q', [], [], () => {}),
+    ).rejects.toThrow(FREE_ROSTER_UNAVAILABLE);
+    expect(queried).toEqual([]);
     expect(settings.useFreeTierDefault).toBe(true);
-    expect(settings.councilModels).toEqual([
-      '~openai/gpt-sol-latest',
-      '~openai/gpt-sol-latest-reasoning',
-    ]);
-    expect(settings.chairmanModel).toBe('~openai/gpt-sol-latest-reasoning-high');
-    expect(queried.length).toBeGreaterThan(0);
-    expect(queried.every((model) => String(model).startsWith(kept))).toBe(true);
+    expect(settings.councilModels).toEqual(DEFAULT_COUNCIL_MODELS);
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY));
     expect(stored.use_free_tier_default).toBe(true);
-    expect(stored.council_models).toEqual(settings.councilModels);
+    expect(stored.council_models).toEqual(DEFAULT_COUNCIL_MODELS);
 
     openrouter.getModelsPricing.mockResolvedValue(freeCataloguePricing());
     const later = await browserEngine.getPricing();
@@ -953,7 +1001,7 @@ describe('free tier default roster', () => {
     const created = await browserEngine.createConversation();
     await expect(
       browserEngine.sendMessageStream(created.id, 'hello', [], [], () => {}),
-    ).rejects.toThrow(RosterEmpty);
+    ).rejects.toThrow(FREE_ROSTER_UNAVAILABLE);
     expect(settings.useFreeTierDefault).toBe(true);
     expect(settings.councilModels).toEqual(DEFAULT_COUNCIL_MODELS);
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY));
@@ -1004,6 +1052,118 @@ describe('free tier default roster', () => {
     expect(settings.useFreeTierDefault).toBe(false);
     expect(settings.apiKey).toBe('sk-new-key');
     expect(settings.councilModels).toEqual(['openai/gpt-4.1']);
+  });
+
+  it('adds reasoning-high only when the catalogue lists that effort', async () => {
+    const pricing = freeCataloguePricing();
+    pricing['test/alpha-100b:free'] = {
+      ...pricing['test/alpha-100b:free'],
+      reasoning: { supported_efforts: ['high'] },
+    };
+    openrouter.getModelsPricing.mockResolvedValue(pricing);
+    const data = await browserEngine.getPricing();
+    expect(data.chairman_model).toBe('test/alpha-100b:free-reasoning-high');
+  });
+});
+
+describe('immutable run roster', () => {
+  beforeEach(() => {
+    settings.apiKey = 'sk-test';
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('keeps later stages on the roster captured before a settings change', async () => {
+    settings.councilModels = ['a/one:free', 'b/two:free'];
+    settings.chairmanModel = 'a/one:free';
+    settings.nSamples = 1;
+    settings.topK = 1;
+    vi.spyOn(openrouter, 'getModelsPricing').mockResolvedValue({
+      'a/one:free': { name: 'A' },
+      'b/two:free': { name: 'B' },
+      'c/three:free': { name: 'C' },
+    });
+    const queried = [];
+    vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model) => {
+      queried.push(model);
+      if (queried.length === 1) {
+        settings.councilModels = ['c/three:free'];
+        settings.chairmanModel = 'c/three:free';
+      }
+      return {
+        ok: true,
+        content: 'Correctness: 8/10\nFINAL RANKING:\n1. Response 1\nVERDICT: UPHELD\nCONFIDENCE: 8\n',
+        usage: {},
+      };
+    });
+    const created = await browserEngine.createConversation();
+    await browserEngine.sendMessageStream(created.id, 'q', [], [], () => {});
+    expect(queried).toContain('a/one:free');
+    expect(queried).toContain('b/two:free');
+    expect(queried).not.toContain('c/three:free');
+  });
+
+  it('replaces a cooling managed member before a new run and retries the captured roster', async () => {
+    const row = (name, weeklyRank) => ({
+      name,
+      weeklyRank,
+      pricing: { prompt: '0', completion: '0' },
+      context_length: 64000,
+      max_completion_tokens: 4096,
+      input_modalities: ['text'],
+      output_modalities: ['text'],
+    });
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      council_models: ['a/cool:free', 'b/keep:free'],
+      chairman_model: 'b/keep:free',
+      red_team_model: 'b/keep:free',
+      n_samples: 1,
+      top_k: 1,
+      self_exclusion: true,
+      api_key: 'sk-test',
+      use_free_tier_default: false,
+      free_roster_managed: true,
+    }));
+    resetSettingsState();
+    rememberModelCooldown('a/cool:free', 600);
+    vi.spyOn(openrouter, 'getModelsPricing').mockResolvedValue({
+      'a/cool:free': row('Cool', 1),
+      'b/keep:free': row('Keep', 2),
+      'c/spare:free': row('Spare', 3),
+      'd/other:free': row('Other', 4),
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => healthyEndpointResponse()));
+    const queried = [];
+    vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model) => {
+      queried.push(model);
+      return {
+        ok: true,
+        content: 'Correctness: 8/10\nFINAL RANKING:\n1. Response 1\nVERDICT: UPHELD\nCONFIDENCE: 8\n',
+        usage: {},
+      };
+    });
+    const created = await browserEngine.createConversation();
+    await browserEngine.sendMessageStream(created.id, 'q', [], [], () => {});
+    expect(settings.councilModels).toEqual(['c/spare:free', 'b/keep:free']);
+    expect(settings.redTeamModel).toBe('b/keep:free');
+    expect(queried).not.toContain('a/cool:free');
+    expect(queried).toContain('c/spare:free');
+    queried.length = 0;
+    settings.councilModels = ['d/other:free'];
+    settings.chairmanModel = 'd/other:free';
+    await browserEngine.retryStage(created.id, 1, 1, () => {});
+    expect(queried).toContain('c/spare:free');
+    expect(queried).toContain('b/keep:free');
+    expect(queried).not.toContain('d/other:free');
+    expect(queried).not.toContain('a/cool:free');
+    queried.length = 0;
+    settings.councilModels = [];
+    settings.chairmanModel = '';
+    await browserEngine.retryStage(created.id, 1, 1, () => {});
+    expect(queried).toContain('c/spare:free');
+    expect(queried).toContain('b/keep:free');
   });
 });
 

@@ -24,6 +24,16 @@ function sampleConversation() {
         role: 'assistant',
         stage1: [{ model: 'openai/gpt', response: 'answer' }],
         stage3: { model: 'anthropic/claude', response: 'final' },
+        run_roster: {
+          runId: 'run-1',
+          councilModels: ['openai/gpt', 'anthropic/claude'],
+          chairmanModel: 'anthropic/claude',
+          redTeamModel: null,
+          nSamples: 1,
+          topK: 3,
+          selfExclusion: true,
+          token: 'secret-token',
+        },
         loading: { stage3: false },
         streaming: false,
       },
@@ -50,6 +60,15 @@ describe('share snapshot', () => {
     expect(user.files).toBeUndefined();
     expect(snapshot.conversation.messages[1].stage3.response).toBe('final');
     expect(snapshot.conversation.messages[1].loading).toBeUndefined();
+    expect(snapshot.conversation.messages[1].run_roster).toEqual({
+      runId: 'run-1',
+      councilModels: ['openai/gpt', 'anthropic/claude'],
+      chairmanModel: 'anthropic/claude',
+      nSamples: 1,
+      topK: 3,
+      selfExclusion: true,
+    });
+    expect(snapshot.conversation.messages[1].run_roster.token).toBeUndefined();
   });
 
   it('keeps attachments by default and assigns a new id on import', () => {

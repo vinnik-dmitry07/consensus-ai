@@ -41,6 +41,7 @@ function freshState() {
     self_exclusion: DEFAULT_SELF_EXCLUSION,
     api_key: null,
     use_free_tier_default: true,
+    free_roster_managed: false,
   };
 }
 
@@ -72,6 +73,7 @@ function load() {
     const parsed = JSON.parse(raw);
     const next = freshState();
     next.use_free_tier_default = false;
+    next.free_roster_managed = false;
     if (Array.isArray(parsed.council_models)) {
       next.council_models = parsed.council_models.map((model) => String(model));
     }
@@ -90,6 +92,7 @@ function load() {
       next.api_key = parsed.api_key.trim();
     }
     if (parsed.use_free_tier_default === true) next.use_free_tier_default = true;
+    if (parsed.free_roster_managed === true) next.free_roster_managed = true;
     return next;
   } catch {
     return freshState();
@@ -143,6 +146,7 @@ export const settings = {
     const data = current();
     data.council_models = [...value];
     data.use_free_tier_default = false;
+    data.free_roster_managed = false;
     persist();
   },
 
@@ -163,6 +167,7 @@ export const settings = {
     const data = current();
     data.chairman_model = value;
     data.use_free_tier_default = false;
+    data.free_roster_managed = false;
     persist();
   },
 
@@ -221,6 +226,10 @@ export const settings = {
     return current().use_free_tier_default === true;
   },
 
+  get freeRosterManaged() {
+    return current().free_roster_managed === true;
+  },
+
   get maskedApiKey() {
     return maskedKey(current().api_key);
   },
@@ -260,6 +269,7 @@ export const settings = {
       chairman_model: roster.chairmanModel,
       n_samples: clampInt(roster.nSamples, 1, 10),
       use_free_tier_default: false,
+      free_roster_managed: true,
     });
     persist();
   },
@@ -275,6 +285,7 @@ export const settings = {
       self_exclusion: data.self_exclusion,
       has_api_key: Boolean(data.api_key),
       masked_api_key: maskedKey(data.api_key),
+      free_roster_managed: data.free_roster_managed === true,
     };
   },
 
@@ -302,6 +313,11 @@ export const settings = {
     }
     const councilChanged = !sameStringList(currentData.council_models, beforeCouncil);
     const chairmanChanged = currentData.chairman_model !== beforeChairman;
+    if ('free_roster_managed' in data) {
+      currentData.free_roster_managed = data.free_roster_managed === true;
+    } else if (councilChanged || chairmanChanged) {
+      currentData.free_roster_managed = false;
+    }
     if (councilChanged || chairmanChanged) currentData.use_free_tier_default = false;
     persist();
   },

@@ -221,6 +221,7 @@ export function armStatuses(rows) {
       resampledCorrect: 0,
       resampledWrong: 0,
       exhausted: 0,
+      unavailable: 0,
     };
     for (const row of rows) {
       const grade = row.arms?.[arm];
@@ -229,7 +230,10 @@ export function armStatuses(rows) {
         continue;
       }
       if (grade.fallback) counts.fallback += 1;
-      if (grade.exhausted) {
+      if (grade.unavailable) {
+        counts.unavailable += 1;
+        counts.wrong += 1;
+      } else if (grade.exhausted) {
         counts.exhausted += 1;
         counts.wrong += 1;
       } else if (grade.status === 'graded') {
@@ -503,6 +507,9 @@ export function renderReport(analysis, context = {}) {
     lines.push(`Перечитано и, где ответа не было, дорисовано ${context.completed.scored} из ${context.completed.expected ?? 'n/a'} вопросов. Однозначный ответ в тексте засчитан без нового вызова. Ячейка без ответа рисовалась заново до ${completion.attempts ?? 'n/a'} раз; после ${samples} образцов без ответа она считается неверной. Stage 2, red team и Stage 3 повторены без изменений. Это не заменяет as-run и строгий repaired.`);
     lines.push(`Слоты, прочитанные заново без запроса: ${completion.reusedSlots ?? 0}. Новые розыгрыши: ${completion.resamplePosts ?? 0} POST. Расход по счётчику ключа $${completion.keySpend == null ? 'n/a' : Number(completion.keySpend).toFixed(4)}, локальная оценка для лимита $${completion.usdEstimate == null ? 'n/a' : Number(completion.usdEstimate).toFixed(4)}.`);
     lines.push(`A6 pooled: ${pct(context.completed.pooled.A6)}. A1 pooled: ${pct(context.completed.pooled.A1)}.`);
+    if (completion.unavailableCells) {
+      lines.push(`Ячеек без ответа из-за лимита провайдера на дедлайне: ${completion.unavailableCells}. Они зачтены как неверные. Голос A4 по этим вопросам собран из остальных ответов совета.`);
+    }
     lines.push('');
   }
   lines.push('Этот отчёт не меняет Stage 2 и интерфейс. Решение об изменении продукта принимается отдельно.');
@@ -756,9 +763,19 @@ function completeSection(analysis, context) {
   const nominal = context.nominal || {};
   const samples = (completion.attempts || 0) + 1;
   const lines = ['', '#### Every cell answered: lenient read + re-sampled non-answers (secondary, exploratory)', ''];
+  if (analysis.expected != null && analysis.scored < analysis.expected) {
+    lines.push(`Scored ${analysis.scored} of ${analysis.expected} questions. ${analysis.pending} are paused and ${analysis.notStarted ?? 0} have not started, so the percentages below are not the full bank.`);
+  }
   lines.push(completion.amendment || 'This layer does not replace the pre-registered as-run result or the strict repaired result.');
-  lines.push(`Reading: ${completion.lenientRules || 'lenient rules were not recorded.'} A cell with no such answer is drawn again up to ${completion.attempts ?? 'n/a'} times on the same request. Stage 2, the red team, and Stage 3 are replayed unchanged, so a new Stage 1 draw is used only to grade the cells that read it.`);
+  const windowText = completion.deadlineMinutes
+    ? ` Retries of a rate-limited model waited ${completion.cooldownSeconds ?? 'the default'} s and stopped after ${completion.deadlineMinutes} min; a cell still limited then is provider unavailable and scores wrong.`
+    : '';
+  lines.push(`Reading: ${completion.lenientRules || 'lenient rules were not recorded.'} A cell with no such answer is drawn again up to ${completion.attempts ?? 'n/a'} times on the same request. Stage 2, the red team, and Stage 3 are replayed unchanged, so a new Stage 1 draw is used only to grade the cells that read it.${windowText}`);
   lines.push(`Slots replayed from the repaired journal: ${completion.reusedSlots ?? 0}. Fresh draws: ${completion.resamplePosts ?? 0} posts across ${completion.resampledCells ?? 0} cells that then answered and ${completion.exhaustedCells ?? 0} cells that still did not.`);
+  if (completion.unavailableCells) {
+    const models = (completion.unavailableModels || []).join(', ') || 'the rate-limited model';
+    lines.push(`${completion.unavailableCells} cells were still rate-limited at the deadline and are scored as no answer (${models}). The A4 vote on those questions used the remaining council answers, as in the repaired layer.`);
+  }
   const usd = completion.usdEstimate == null ? 'n/a' : `$${Number(completion.usdEstimate).toFixed(4)}`;
   const spent = completion.keySpend == null ? 'n/a' : `$${Number(completion.keySpend).toFixed(4)}`;
   lines.push(`Spend on the paid key (OpenRouter key usage counter): ${spent}. Local estimate used for the cap: ${usd}; calls with unknown usage are charged there at max_tokens × completion price (${completion.usageUnknownCharged ?? 0} calls).`);
@@ -791,7 +808,7 @@ function completeSection(analysis, context) {
   lines.push('#### Where the new answers came from');
   lines.push('');
   lines.push(...tableEn(
-    ['Arm', 'Correct', 'Wrong', 'Lenient, correct', 'Lenient, wrong', 'Re-sampled, correct', 'Re-sampled, wrong', `No answer after ${samples} samples (scored wrong)`],
+    ['Arm', 'Correct', 'Wrong', 'Lenient, correct', 'Lenient, wrong', 'Re-sampled, correct', 'Re-sampled, wrong', `No answer after ${samples} samples (scored wrong)`, 'Provider unavailable at deadline (scored wrong)'],
     ARMS.map((arm) => {
       const counts = analysis.armStatus?.[arm] || {};
       return [
@@ -803,6 +820,7 @@ function completeSection(analysis, context) {
         counts.resampledCorrect ?? 0,
         counts.resampledWrong ?? 0,
         counts.exhausted ?? 0,
+        counts.unavailable ?? 0,
       ];
     }),
   ));

@@ -14,6 +14,7 @@ const LOCAL_KEYS = [
   STORAGE_KEY,
   'llm-council-blocked-models',
   'llm-council-model-cooldowns',
+  'llm-council-upstream-incidents',
 ];
 const TERMINAL = new Set(['completed', 'failed', 'skipped']);
 const NETWORK_BACKOFF_MS = 30_000;
@@ -159,7 +160,20 @@ export function createSession({
     const data = Object.fromEntries(cooldowns);
     const tmp = `${cooldownPath}.tmp`;
     writeFileSync(tmp, JSON.stringify(data), 'utf8');
-    renameSync(tmp, cooldownPath);
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      try {
+        renameSync(tmp, cooldownPath);
+        return;
+      } catch (error) {
+        const code = error?.code;
+        if (code !== 'EPERM' && code !== 'EACCES' && code !== 'EBUSY') throw error;
+        if (attempt === 9) throw error;
+        const until = Date.now() + 40 * (attempt + 1);
+        while (Date.now() < until) {
+          // Windows sometimes holds the destination for a moment.
+        }
+      }
+    }
   }
 
   function flight() {

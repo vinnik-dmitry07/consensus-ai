@@ -256,6 +256,7 @@ export async function updateStreamingMessage(conversationId, messageIndex, field
   const stage1Skipped = 'stage1_skipped' in fields ? fields.stage1_skipped : null;
   const stage2Failures = 'stage2_failures' in fields ? fields.stage2_failures : null;
   const stage2Skipped = 'stage2_skipped' in fields ? fields.stage2_skipped : null;
+  const runRoster = 'run_roster' in fields ? fields.run_roster : UNSET;
 
   await mutate(conversationId, (conversation) => {
     const message = conversation.messages[messageIndex];
@@ -270,6 +271,7 @@ export async function updateStreamingMessage(conversationId, messageIndex, field
     if (stage2 !== UNSET) message.stage2 = stage2;
     if (stage3 !== UNSET) message.stage3 = stage3;
     if (metadata !== UNSET) message.metadata = metadata;
+    if (runRoster !== UNSET) message.run_roster = runRoster;
     if (error != null) message.error = error;
     else if ('error' in message) delete message.error;
 

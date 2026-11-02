@@ -19,6 +19,7 @@ const ASSISTANT_FIELDS = [
   'stage2_failures',
   'stage2_skipped',
   'error',
+  'run_roster',
 ];
 
 const ARRAY_FIELDS = new Set([
@@ -115,6 +116,33 @@ function sanitizeFiles(value) {
   return files.length ? files : undefined;
 }
 
+function sanitizeRunRoster(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const models = Array.isArray(value.councilModels)
+    ? value.councilModels
+      .filter((id) => typeof id === 'string' && id.trim())
+      .map((id) => clip(id.trim(), 200))
+      .slice(0, 20)
+    : [];
+  if (!models.length) return undefined;
+  const next = { councilModels: models };
+  if (typeof value.runId === 'string' && value.runId.trim()) {
+    next.runId = clip(value.runId.trim(), 80);
+  }
+  if (typeof value.chairmanModel === 'string' && value.chairmanModel.trim()) {
+    next.chairmanModel = clip(value.chairmanModel.trim(), 200);
+  }
+  if (typeof value.redTeamModel === 'string' && value.redTeamModel.trim()) {
+    next.redTeamModel = clip(value.redTeamModel.trim(), 200);
+  }
+  for (const key of ['nSamples', 'topK']) {
+    const n = Number(value[key]);
+    if (Number.isInteger(n) && n >= 1 && n <= 10) next[key] = n;
+  }
+  if (typeof value.selfExclusion === 'boolean') next.selfExclusion = value.selfExclusion;
+  return next;
+}
+
 function sanitizeLabelMap(value, kind) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const next = {};
@@ -134,6 +162,7 @@ function sanitizeLabelMap(value, kind) {
 function sanitize(value, key, depth, budget) {
   if (key === 'images') return sanitizeImages(value);
   if (key === 'files') return sanitizeFiles(value);
+  if (key === 'run_roster') return sanitizeRunRoster(value);
   if (key === 'label_to_index') return sanitizeLabelMap(value, 'index');
   if (key === 'label_to_model') return sanitizeLabelMap(value, 'model');
   if (!takeNode(budget)) return undefined;

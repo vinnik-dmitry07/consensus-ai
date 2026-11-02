@@ -423,12 +423,31 @@ async function* asCompleted(factories) {
   }
 }
 
+function resolveRoster(options = {}) {
+  const roster = options.roster;
+  if (roster && Array.isArray(roster.councilModels)) return roster;
+  return {
+    runId: options.runId || null,
+    councilModels: settings.councilModels,
+    chairmanModel: settings.chairmanModel,
+    redTeamModel: settings.redTeamModel,
+    nSamples: settings.nSamples,
+    topK: settings.topK,
+    selfExclusion: settings.selfExclusion,
+  };
+}
+
+function queryOptions(roster) {
+  return roster?.runId ? { runId: roster.runId } : {};
+}
+
 export async function* stage1CollectResponsesStreaming(userQuery, options = {}) {
   const existingResults = options.existingResults ?? null;
   const existingFailures = options.existingFailures ?? null;
+  const roster = resolveRoster(options);
   const messages = [{ role: 'user', content: userQuery }];
-  const councilModels = [...settings.councilModels];
-  const n = stage1SampleLimit(councilModels, options.n ?? settings.nSamples);
+  const councilModels = [...roster.councilModels];
+  const n = stage1SampleLimit(councilModels, options.n ?? roster.nSamples);
   const totalSlots = councilModels.length * n;
   const allResults = usableStage1Results(councilModels, n, existingResults);
   const pendingModels = pendingStage1Slots(councilModels, n, allResults);
@@ -449,7 +468,7 @@ export async function* stage1CollectResponsesStreaming(userQuery, options = {}) 
 
   if (pendingModels.length) {
     const tasks = pendingModels.map((model) => async () => {
-      const response = await openrouter.queryModelResult(model, messages);
+      const response = await openrouter.queryModelResult(model, messages, queryOptions(roster));
       return { model, response };
     });
     for await (const { model, response } of asCompleted(tasks)) {
@@ -474,17 +493,22 @@ export async function* stage1CollectResponsesStreaming(userQuery, options = {}) 
   yield ['all_complete', { results: allResults, failures }];
 }
 
-export async function* stage2CollectRankingsStreaming(userQuery, stage1Results) {
+export async function* stage2CollectRankingsStreaming(userQuery, stage1Results, options = {}) {
+  const roster = resolveRoster(options);
   const labelToModel = canonicalLabelToModel(stage1Results);
-  const models = [...settings.councilModels];
+  const models = [...roster.councilModels];
   yield ['init', { total_models: models.length, completed: 0 }];
 
   const stage2Results = [];
   const failures = [];
   const tasks = models.map((model) => async () => {
-    const view = await buildJudgeView(model, stage1Results, userQuery);
+    const view = await buildJudgeView(model, stage1Results, userQuery, roster.selfExclusion);
     const prompt = buildStage2Prompt(userQuery, view.candidates);
-    const response = await openrouter.queryModelResult(model, [{ role: 'user', content: prompt }]);
+    const response = await openrouter.queryModelResult(
+      model,
+      [{ role: 'user', content: prompt }],
+      queryOptions(roster),
+    );
     return { model, response, view };
   });
 
@@ -626,8 +650,8 @@ export function parseRedTeamVerdict(text) {
   return { verdict, confidence };
 }
 
-function pickRedTeamModel(leaderModel, responseRankings) {
-  const requested = settings.redTeamModel || settings.chairmanModel;
+function pickRedTeamModel(leaderModel, responseRankings, roster) {
+  const requested = roster.redTeamModel || roster.chairmanModel;
   const leaderFamily = openrouter.modelFamily(leaderModel);
   if (openrouter.modelFamily(requested) !== leaderFamily) return { model: requested, sameFamily: false };
   for (const row of responseRankings) {
@@ -644,12 +668,14 @@ export async function redTeamReview(
   leaderIndex,
   responseRankings,
   stage1Results,
+  options = {},
 ) {
   if (!stage1Results.length || leaderIndex < 0 || leaderIndex >= stage1Results.length) {
     return null;
   }
   const leaderModel = stage1Results[leaderIndex].model;
-  const { model, sameFamily } = pickRedTeamModel(leaderModel, responseRankings);
+  const roster = resolveRoster(options);
+  const { model, sameFamily } = pickRedTeamModel(leaderModel, responseRankings, roster);
   const prompt = `You are an adversarial reviewer. Independently verify the following answer and try to refute it. Do not assume it is correct. Look for factual errors, logical flaws, missing caveats, and confident-but-wrong claims.
 
 Question: ${queryText}
@@ -667,7 +693,11 @@ Meaning:
 - CONTESTED = you found a plausible error or a serious unresolved issue, but it is not decisive
 - UPHELD = you could not find a concrete refutation
 `;
-  const result = await openrouter.queryModelResult(model, [{ role: 'user', content: prompt }]);
+  const result = await openrouter.queryModelResult(
+    model,
+    [{ role: 'user', content: prompt }],
+    queryOptions(roster),
+  );
   if (result.skipped) return null;
   if (!result.ok) {
     return {
@@ -824,12 +854,13 @@ export function buildCouncilMetadata(
   };
 }
 
-export async function runPostRanking(queryText, stage1Results, stage2Results) {
+export async function runPostRanking(queryText, stage1Results, stage2Results, options = {}) {
+  const roster = resolveRoster(options);
   const { responseRankings, aggregateRankings, rankingFallback } = calculateAggregateRankings(
     stage1Results,
     stage2Results,
   );
-  const topN = Math.max(1, Math.min(settings.topK, responseRankings.length || 1));
+  const topN = Math.max(1, Math.min(roster.topK, responseRankings.length || 1));
   const topKIndices = responseRankings.slice(0, topN).map((row) => row.index);
 
   let redTeam = null;
@@ -842,6 +873,7 @@ export async function runPostRanking(queryText, stage1Results, stage2Results) {
         leaderIndex,
         responseRankings,
         stage1Results,
+        { roster },
       );
     } catch {
       redTeam = null;
@@ -873,21 +905,21 @@ function formatCandidateBlock(ordinal, row, responseText) {
   );
 }
 
-function synthesisCandidates() {
+function synthesisCandidates(roster) {
   const ordered = [];
-  if (settings.chairmanModel) ordered.push(settings.chairmanModel);
-  ordered.push(...(settings.councilModels || []));
+  if (roster.chairmanModel) ordered.push(roster.chairmanModel);
+  ordered.push(...(roster.councilModels || []));
   return ordered;
 }
 
-async function querySynthesis(messages) {
+async function querySynthesis(messages, roster) {
   const tried = new Set();
-  for (const model of synthesisCandidates()) {
+  for (const model of synthesisCandidates(roster)) {
     if (!model || !String(model).trim()) continue;
     const cid = catalogueId(model);
     if (!cid || tried.has(cid) || modelUnavailable(model)) continue;
     tried.add(cid);
-    const result = await openrouter.queryModelResult(model, messages);
+    const result = await openrouter.queryModelResult(model, messages, queryOptions(roster));
     if (result.ok) return { model, result };
     if (result.skipped) continue;
     const detail = result.error?.message || 'failed to generate response';
@@ -901,8 +933,10 @@ export async function stage3SynthesizeFinal(
   stage1Results,
   stage2Results = null,
   metadata = null,
+  options = {},
 ) {
   void stage2Results;
+  const roster = resolveRoster(options);
   const meta = metadata || {};
   const consensus = meta.consensus || {};
   const redTeam = meta.red_team;
@@ -911,7 +945,7 @@ export async function stage3SynthesizeFinal(
   const byIndex = new Map(responseRankings.map((row) => [row.index, row]));
 
   if (!topKIndices.length && stage1Results.length) {
-    const count = Math.min(settings.topK, stage1Results.length);
+    const count = Math.min(roster.topK, stage1Results.length);
     topKIndices = Array.from({ length: count }, (_, index) => index);
   }
 
@@ -978,7 +1012,7 @@ Your task:
 
 Provide a clear, well-reasoned final answer:`;
 
-  const synthesized = await querySynthesis([{ role: 'user', content: chairmanPrompt }]);
+  const synthesized = await querySynthesis([{ role: 'user', content: chairmanPrompt }], roster);
   const { model: chairman, result } = synthesized;
 
   let leaderIndex = consensus.leader_index;

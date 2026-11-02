@@ -3,12 +3,17 @@ import { api } from '../api';
 import { getApiBase, getEngineMode, setApiBase, setEngineMode } from '../engine/index.js';
 import { catalogueModelId } from '../engine/browser/openrouter.js';
 import {
-  freeTierDefaultRoster,
+  draftUnchanged,
+  formatFreeRosterNote,
+  selectHealthyFreeRoster,
+} from '../engine/browser/freeRoster.js';
+import {
   isAllFreeCouncil,
   pruneRoster,
   readBlockedIds,
   removedModelsMessage,
   stage1SampleLimit,
+  variantOf,
 } from '../engine/browser/roster.js';
 import {
   DEFAULT_CHAIRMAN_MODEL,
@@ -60,11 +65,31 @@ export default function Settings({
   const failedMigration = useRef(null);
   const formDirty = useRef(false);
   const loadGeneration = useRef(0);
+  const freeSelectTicket = useRef(0);
+  const freeSelectAbort = useRef(null);
+  const freeManagedDraft = useRef(false);
+  const rosterTouched = useRef(false);
+  const [freeRosterChecking, setFreeRosterChecking] = useState(false);
+  const [freeRosterNote, setFreeRosterNote] = useState('');
+  const councilDraft = useRef(councilModels);
+  const chairmanDraft = useRef(chairmanModel);
+  councilDraft.current = councilModels;
+  chairmanDraft.current = chairmanModel;
   const hasGithubToken = Boolean(savedGithubToken);
   const maskedGithubToken = maskToken(savedGithubToken);
 
   const markDirty = () => {
     formDirty.current = true;
+  };
+
+  const noteManualRosterEdit = () => {
+    markDirty();
+    freeManagedDraft.current = false;
+    rosterTouched.current = true;
+    freeSelectTicket.current += 1;
+    freeSelectAbort.current?.abort();
+    setFreeRosterChecking(false);
+    setFreeRosterNote('');
   };
 
   // Load settings and available models
@@ -146,6 +171,7 @@ export default function Settings({
           chairman_model: chairman,
           red_team_model: redTeam || null,
           n_samples: samples,
+          free_roster_managed: settingsData.free_roster_managed === true,
         });
         if (generation !== loadGeneration.current || formDirty.current) return;
         samples = saved.n_samples;
@@ -213,6 +239,10 @@ export default function Settings({
     const generation = loadGeneration.current + 1;
     loadGeneration.current = generation;
     formDirty.current = false;
+    rosterTouched.current = false;
+    freeManagedDraft.current = false;
+    freeSelectTicket.current += 1;
+    freeSelectAbort.current?.abort();
     refreshGithubToken();
     setLoading(true);
     setError(null);
@@ -258,22 +288,49 @@ export default function Settings({
     );
   }, [availableModels, searchQuery]);
 
-  const selectTopFreeModels = () => {
-    markDirty();
-    const roster = freeTierDefaultRoster(availableModels, readBlockedIds());
-    if (!roster.councilModels.length) {
-      setError('No free models are available to rank.');
-      return;
-    }
-    setCouncilModels(roster.councilModels);
-    setNSamples(roster.nSamples);
-    setChairmanModel(roster.chairmanModel);
+  const selectTopFreeModels = async () => {
+    const generation = loadGeneration.current;
+    const ticket = freeSelectTicket.current + 1;
+    freeSelectTicket.current = ticket;
+    const snapshot = { councilModels: [...councilModels], chairmanModel };
+    freeSelectAbort.current?.abort();
+    const controller = new AbortController();
+    freeSelectAbort.current = controller;
+    setFreeRosterChecking(true);
     setError(null);
+    try {
+      const roster = await selectHealthyFreeRoster(availableModels, {
+        signal: controller.signal,
+      });
+      if (generation !== loadGeneration.current || ticket !== freeSelectTicket.current) return;
+      if (!draftUnchanged(snapshot, {
+        councilModels: councilDraft.current,
+        chairmanModel: chairmanDraft.current,
+      })) return;
+      if (!roster.councilModels.length || !roster.chairmanModel) {
+        setError('No free models are available to rank.');
+        setFreeRosterNote(formatFreeRosterNote(roster));
+        return;
+      }
+      setCouncilModels(roster.councilModels);
+      setNSamples(roster.nSamples);
+      setChairmanModel(roster.chairmanModel);
+      setFreeRosterNote(formatFreeRosterNote(roster));
+      freeManagedDraft.current = true;
+      rosterTouched.current = true;
+      markDirty();
+    } catch (err) {
+      if (generation !== loadGeneration.current || ticket !== freeSelectTicket.current) return;
+      if (err?.name === 'AbortError') return;
+      setError(err instanceof Error ? err.message : 'Could not check free models.');
+    } finally {
+      if (ticket === freeSelectTicket.current) setFreeRosterChecking(false);
+    }
   };
 
   // Select top 8 paid models
   const selectTopPaidModels = () => {
-    markDirty();
+    noteManualRosterEdit();
     setCouncilModels([...DEFAULT_COUNCIL_MODELS]);
     setNSamples(DEFAULT_N_SAMPLES);
     setChairmanModel(DEFAULT_CHAIRMAN_MODEL);
@@ -326,7 +383,7 @@ export default function Settings({
 
   // Toggle a specific variant independently
   const toggleModel = (modelId, variant = 'base') => {
-    markDirty();
+    noteManualRosterEdit();
     const fullModelId = variant === 'base' ? modelId : `${modelId}-${variant}`;
     
     if (councilModels.includes(fullModelId)) {
@@ -340,18 +397,14 @@ export default function Settings({
 
   // Set chairman model variant
   const setChairmanVariant = (modelId, variant) => {
-    markDirty();
+    noteManualRosterEdit();
     const baseId = catalogueModelId(modelId);
     const fullModelId = variant === 'base' ? baseId : `${baseId}-${variant}`;
     setChairmanModel(fullModelId);
   };
 
   // Get chairman variant
-  const getChairmanVariant = () => {
-    if (chairmanModel.endsWith('-reasoning-high')) return 'reasoning-high';
-    if (chairmanModel.endsWith('-reasoning')) return 'reasoning';
-    return 'base';
-  };
+  const getChairmanVariant = () => variantOf(chairmanModel);
 
   const getChairmanBaseId = () => {
     return catalogueModelId(chairmanModel);
@@ -377,6 +430,9 @@ export default function Settings({
         self_exclusion: selfExclusion,
         red_team_model: redTeamModel,
       } : {};
+      if (sameEngine && rosterTouched.current) {
+        updateData.free_roster_managed = freeManagedDraft.current;
+      }
       // Only include API key if user entered a new one
       if (apiKey.trim()) {
         updateData.api_key = apiKey.trim();
@@ -477,6 +533,9 @@ export default function Settings({
     setError(null);
     try {
       const resetSettings = await api.resetSettings();
+      freeManagedDraft.current = false;
+      rosterTouched.current = false;
+      setFreeRosterNote('');
       setNSamples(resetSettings.n_samples);
       setCouncilModels(resetSettings.council_models);
       setChairmanModel(resetSettings.chairman_model);
@@ -749,12 +808,13 @@ export default function Settings({
                 
                 {/* Quick Actions */}
                 <div className="quick-actions">
-                  <button 
+                  <button
                     className="quick-action-btn"
                     onClick={selectTopFreeModels}
-                    title="Select up to 10 largest free models, preferring one per family"
+                    disabled={freeRosterChecking || modelsLoading}
+                    title="Select up to 10 free models by weekly popularity, after skipping blocked, cooling, and quarantined routes"
                   >
-                    🆓 Top 10 Free
+                    {freeRosterChecking ? 'Checking free models…' : '🆓 Top 10 Free'}
                   </button>
                   <button 
                     className="quick-action-btn"
@@ -764,6 +824,9 @@ export default function Settings({
                     💎 Top 8 Paid
                   </button>
                 </div>
+                {freeRosterNote && (
+                  <p className="settings-description">{freeRosterNote}</p>
+                )}
 
                 {/* Selected Models - Pinned at Top */}
                 {councilModels.length > 0 && (
@@ -772,7 +835,7 @@ export default function Settings({
                       <span className="selected-models-title">Selected Models</span>
                       <button 
                         className="clear-all-btn"
-                        onClick={() => { markDirty(); setCouncilModels([]); }}
+                        onClick={() => { noteManualRosterEdit(); setCouncilModels([]); }}
                         title="Clear all selections"
                       >
                         Clear All
@@ -782,9 +845,7 @@ export default function Settings({
                       {sortedCouncilModels.map((modelId) => {
                         // Parse variant from model ID
                         const baseId = catalogueModelId(modelId);
-                        let variant = 'base';
-                        if (modelId.endsWith('-reasoning-high')) variant = 'reasoning-high';
-                        else if (modelId.endsWith('-reasoning')) variant = 'reasoning';
+                        const variant = variantOf(modelId);
                         
                         const modelInfo = availableModels.find(m => m.id === baseId);
                         const displayName = modelInfo?.name || baseId.split('/').pop();
@@ -799,7 +860,7 @@ export default function Settings({
                                 <button
                                   className={`chip-mode-btn ${variant === 'base' ? 'active' : ''}`}
                                   onClick={() => {
-                                    markDirty();
+                                    noteManualRosterEdit();
                                     setCouncilModels(prev => 
                                       prev.map(m => m === modelId ? baseId : m)
                                     );
@@ -811,7 +872,7 @@ export default function Settings({
                                 <button
                                   className={`chip-mode-btn ${variant === 'reasoning' ? 'active' : ''}`}
                                   onClick={() => {
-                                    markDirty();
+                                    noteManualRosterEdit();
                                     setCouncilModels(prev => 
                                       prev.map(m => m === modelId ? `${baseId}-reasoning` : m)
                                     );
@@ -823,7 +884,7 @@ export default function Settings({
                                 <button
                                   className={`chip-mode-btn ${variant === 'reasoning-high' ? 'active' : ''}`}
                                   onClick={() => {
-                                    markDirty();
+                                    noteManualRosterEdit();
                                     setCouncilModels(prev => 
                                       prev.map(m => m === modelId ? `${baseId}-reasoning-high` : m)
                                     );
@@ -835,7 +896,7 @@ export default function Settings({
                               </div>
                               <button
                                 className="chip-remove"
-                                onClick={() => { markDirty(); setCouncilModels(prev => prev.filter(m => m !== modelId)); }}
+                                onClick={() => { noteManualRosterEdit(); setCouncilModels(prev => prev.filter(m => m !== modelId)); }}
                                 title="Remove from council"
                               >
                                 ×

@@ -111,9 +111,36 @@ describe('settings', () => {
     settings.chairmanModel = 'openai/gpt-4.1';
     settings.nSamples = 3;
     vi.spyOn(openrouter, 'getModelsPricing').mockResolvedValue({
-      'test/alpha-100b:free': { name: 'Alpha', description: '' },
-      'test/bravo-90b:free': { name: 'Bravo', description: '' },
+      'test/alpha-100b:free': {
+        name: 'Alpha',
+        description: '',
+        pricing: { prompt: '0', completion: '0' },
+        context_length: 64000,
+        max_completion_tokens: 4096,
+        input_modalities: ['text'],
+        output_modalities: ['text'],
+      },
+      'test/bravo-90b:free': {
+        name: 'Bravo',
+        description: '',
+        pricing: { prompt: '0', completion: '0' },
+        context_length: 64000,
+        max_completion_tokens: 4096,
+        input_modalities: ['text'],
+        output_modalities: ['text'],
+      },
     });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      data: {
+        endpoints: [{
+          provider_name: 'Test',
+          status: 0,
+          pricing: { prompt: '0', completion: '0' },
+          context_length: 64000,
+          max_completion_tokens: 4096,
+        }],
+      },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })));
     const reset = await browserEngine.resetSettings();
     expect(reset.n_samples).toBe(1);
     expect(settings.nSamples).toBe(1);
