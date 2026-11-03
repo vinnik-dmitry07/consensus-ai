@@ -126,11 +126,18 @@ export function canonicalCompletionRequest(model, messages, options = {}) {
     stream: true,
     stream_options: { include_usage: true },
   };
-  const variant = variantOf(model);
-  if (variant === 'reasoning-high') {
-    payload.reasoning = { effort: isAnthropic ? 'xhigh' : 'high' };
-  } else if (variant === 'reasoning') {
-    payload.reasoning = { effort: 'high' };
+  if (options.provider) payload.provider = options.provider;
+  if (options.temperature != null) payload.temperature = options.temperature;
+  if (options.topP != null) payload.top_p = options.topP;
+  if (options.reasoning) {
+    payload.reasoning = options.reasoning;
+  } else {
+    const variant = variantOf(model);
+    if (variant === 'reasoning-high') {
+      payload.reasoning = { effort: isAnthropic ? 'xhigh' : 'high' };
+    } else if (variant === 'reasoning') {
+      payload.reasoning = { effort: 'high' };
+    }
   }
   return payload;
 }
@@ -930,6 +937,7 @@ async function queryModelAttempts(model, messages, options) {
       attempt,
       maxRetries,
       runId: options.runId || null,
+      retainRoster: options.retainRoster === true,
     });
     if (outcome.retry) {
       extraWaitMs = outcome.extraWaitMs;
@@ -950,6 +958,7 @@ async function runModelAttempt({
   attempt,
   maxRetries,
   runId = null,
+  retainRoster = false,
 }) {
   let lifetime = null;
   try {
@@ -1020,6 +1029,7 @@ async function runModelAttempt({
         console.error(`Model ${model} not found (404)`);
       } else if (
         response.status === 403
+        && !retainRoster
         && isHarnessOnlyMessage(`${error.message || ''} ${error.detail || ''}`)
       ) {
         dropBlockedModel(model);
@@ -1035,6 +1045,7 @@ async function runModelAttempt({
     noteConfirmedUpstream(model, runId, parsed.error);
     return parsed;
   } catch (exc) {
+    if (exc?.name === 'EvalInvariantError') throw exc;
     const kind = lifetime?.kind();
     if (kind === 'first-response' || kind === 'idle' || kind === 'total' || kind === 'aborted') {
       return failResult(kind, null, '', kind);

@@ -33,4 +33,16 @@ npm --prefix frontend run eval -- report
 
 `repair` повторно выполняет только слоты, которые в основном прогоне не дали ответа (сеть, таймаут, upstream 429, ошибка провайдера, обрезанный поток). Успешные free-ответы переиспользуются без нового запроса. Где в каталоге есть платный id, вызов идёт на него ключом `or_key`; иначе повторяется тот же `:free` id. Результат пишется в `frontend/eval/.runs/<id>/repair/` и не меняет as-run. Повтор той же команды продолжает с места остановки. `--max-usd` по умолчанию 15, `--max-posts` по умолчанию 1500, `--jobs` по умолчанию 4: столько вопросов идут сразу, а free-вызовы остаются в одной последовательной очереди. Код 2 — пауза по лимиту, сети или потому что основной test ещё не дошёл до конца.
 
+`a8` — отдельная кампания «платный консилиум против Self-MoA» в `frontend/eval/.runs/a8-open-v1/`. Она не пишет в `main`, `a8-strong-v1`, repair, complete и не обновляет раздел результатов README. Фаза обязательна. Модельные POST только с `--live`. Бюджет $60 и 4000 POST общий для probe, dev, smoke, pilot и test; повтор команды не поднимает лимит. Primary-пара — A8 против S8. Отчёт оффлайн: `--phase report`.
+
+```text
+npm --prefix frontend run eval -- a8 --phase preflight --run a8-open-v1 --live
+npm --prefix frontend run eval -- a8 --phase probe --run a8-open-v1 --live
+npm --prefix frontend run eval -- a8 --phase dev --run a8-open-v1 --live
+npm --prefix frontend run eval -- a8 --phase smoke --run a8-open-v1 --live
+npm --prefix frontend run eval -- a8 --phase pilot --run a8-open-v1 --live
+npm --prefix frontend run eval -- a8 --phase test --run a8-open-v1 --live
+npm --prefix frontend run eval -- a8 --phase report --run a8-open-v1
+```
+
 `complete` запускается после repair на все 120 вопросов. Однозначный ответ, записанный не в строгом формате (жирный `ANSWER`, скобки, `\boxed{}`, строка `ANSWER` не последняя, последняя строка «the answer is X»), читается из уже полученного текста и не запрашивается снова. Ячейка, в которой ответа нет, рисуется заново тем же запросом и тем же endpoint, до `--attempts` раз (по умолчанию 3). Stage 2, red team и Stage 3 повторяются из журнала repair без новых вызовов: новый розыгрыш Stage 1 меняет только оценку ячеек, которые его читают. Результат пишется в `frontend/eval/.runs/<id>/complete/` и не меняет as-run и repair. `--max-usd` по умолчанию 20, `--max-posts` по умолчанию 600, `--jobs` по умолчанию 4. `--cooldown-seconds` ограничивает паузу после upstream 429 (без флага остаётся обычные 10 минут). `--deadline-minutes` держит процесс живым и повторяет охлаждённые ячейки до абсолютного срока, записанного в state; после срока ячейка, которую провайдер всё ещё не отдаёт, считается неверной с пометкой provider unavailable, а голос A4 собирается из остальных ответов. Код 2 — пауза по лимиту или сети.

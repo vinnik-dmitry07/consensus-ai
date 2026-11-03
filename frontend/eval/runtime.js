@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync, existsSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 
 import { canonicalCompletionRequest, setQueryHook } from '../src/engine/browser/openrouter.js';
@@ -7,6 +7,7 @@ import { STORAGE_KEY, resetSettingsState } from '../src/engine/browser/settings.
 import { ENGINE_RETRY_LIMIT } from './protocol.js';
 import { attemptStore, isNetworkMessage } from './transport.js';
 import { BudgetPaused } from './budget.js';
+import { EvalInvariantError, isEvalInvariant } from './invariant.js';
 import { activeQuestion } from './questionScope.js';
 import { sha256, stableStringify } from './util.js';
 
@@ -90,9 +91,15 @@ export function createSession({
   replayFrom = null,
   aliasOf = null,
   replayTerminal = false,
+  prepareOptions = null,
+  retryLimit = null,
+  maxInFlight = null,
+  retainRoster = false,
+  retryAfterCooldown = false,
 }) {
   mkdirSync(runDir, { recursive: true });
-  mkdirSync(path.join(runDir, 'bodies'), { recursive: true });
+  const bodyDir = path.join(runDir, 'bodies');
+  mkdirSync(bodyDir, { recursive: true });
   const journalPath = path.join(runDir, 'events.jsonl');
   const cooldownPath = path.join(runDir, 'cooldowns.json');
   const slots = new Map();
@@ -101,7 +108,16 @@ export function createSession({
   let context = null;
   const ownFlight = { active: 0, idle: [] };
   let bodySeq = 0;
+  if (existsSync(bodyDir)) {
+    for (const name of readdirSync(bodyDir)) {
+      const prefix = Number.parseInt(name, 10);
+      if (Number.isFinite(prefix)) bodySeq = Math.max(bodySeq, prefix);
+    }
+  }
   let ordinal = 0;
+  let httpActive = 0;
+  const httpWaiters = [];
+  let fatal = null;
 
   if (existsSync(cooldownPath)) {
     const saved = JSON.parse(readFileSync(cooldownPath, 'utf8'));
@@ -109,10 +125,7 @@ export function createSession({
   }
   for (const event of readJsonl(journalPath)) applyEvent(event);
   for (const [key, slot] of slots) {
-    if (slot.state === 'running') {
-      slot.state = 'unknown';
-      slots.set(key, slot);
-    }
+    if (slot.state === 'running') slot.state = 'unknown';
   }
 
   function applyEvent(event) {
@@ -157,22 +170,15 @@ export function createSession({
   }
 
   function persistCooldowns() {
-    const data = Object.fromEntries(cooldowns);
+    const data = JSON.stringify(Object.fromEntries(cooldowns));
     const tmp = `${cooldownPath}.tmp`;
-    writeFileSync(tmp, JSON.stringify(data), 'utf8');
-    for (let attempt = 0; attempt < 10; attempt += 1) {
-      try {
-        renameSync(tmp, cooldownPath);
-        return;
-      } catch (error) {
-        const code = error?.code;
-        if (code !== 'EPERM' && code !== 'EACCES' && code !== 'EBUSY') throw error;
-        if (attempt === 9) throw error;
-        const until = Date.now() + 40 * (attempt + 1);
-        while (Date.now() < until) {
-          // Windows sometimes holds the destination for a moment.
-        }
-      }
+    writeFileSync(tmp, data, 'utf8');
+    try {
+      renameSync(tmp, cooldownPath);
+    } catch (error) {
+      const code = error?.code;
+      if (code !== 'EPERM' && code !== 'EACCES' && code !== 'EBUSY') throw error;
+      writeFileSync(cooldownPath, data, 'utf8');
     }
   }
 
@@ -222,9 +228,11 @@ export function createSession({
   function onHttp(event) {
     if (event.phase === 'finished' && event.text) {
       bodySeq += 1;
-      const file = path.join(runDir, 'bodies', `${bodySeq}.txt`);
-      writeFileSync(file, event.text, 'utf8');
-      event = { ...event, bodyFile: path.basename(file), text: undefined };
+      const name = `${String(bodySeq).padStart(6, '0')}.txt`;
+      const file = path.join(bodyDir, name);
+      if (existsSync(file)) throw new EvalInvariantError(`Refusing to overwrite ${name}`);
+      writeFileSync(file, event.text, { encoding: 'utf8', flag: 'wx' });
+      event = { ...event, bodyFile: name, text: undefined };
     }
     append({ kind: 'http', ...event, headers: event.headers || undefined });
     applyEvent({ kind: 'http', ...event });
@@ -252,13 +260,35 @@ export function createSession({
     return { sourceKey, source };
   }
 
+  async function acquireHttp() {
+    if (!maxInFlight || httpActive < maxInFlight) {
+      httpActive += 1;
+      return;
+    }
+    await new Promise((resolve) => httpWaiters.push(resolve));
+    httpActive += 1;
+  }
+
+  function releaseHttp() {
+    httpActive = Math.max(0, httpActive - 1);
+    const next = httpWaiters.shift();
+    if (next) next();
+  }
+
   async function hook({ model, messages, options, execute }) {
     const flightSlot = enter();
     let key = null;
+    let heldHttp = false;
     try {
+      if (fatal || budget.state?.fatal) {
+        throw new EvalInvariantError(fatal || budget.state.fatal);
+      }
       const slotContext = currentContext();
       if (!slotContext) throw new Error('Logical call context is not set');
-      const request = canonicalCompletionRequest(model, messages, options);
+      const effective = prepareOptions
+        ? prepareOptions(model, slotContext.stage, options || {})
+        : (options || {});
+      const request = canonicalCompletionRequest(model, messages, effective);
       const requestHash = sha256(stableStringify(request));
       const slotMeta = {
         questionId: slotContext.questionId,
@@ -271,8 +301,10 @@ export function createSession({
       if ((slotContext.attempt || 0) > 0) slotMeta.attempt = slotContext.attempt;
       key = slotKey(slotMeta);
       const existing = slots.get(key);
+      const cooling = cooldowns.get(catalogueId(model)) || 0;
+      const cooled = retryAfterCooldown && existing?.state === 'skipped' && cooling <= Date.now();
       const retrySkip = existing?.state === 'skipped' && (slotMeta.attempt || 0) > 0;
-      if (existing && TERMINAL.has(existing.state) && !retrySkip) return existing.result;
+      if (existing && TERMINAL.has(existing.state) && !retrySkip && !cooled) return existing.result;
       const reused = reusedSource(model, messages, options, slotMeta);
       if (reused) {
         writeSlot(key, {
@@ -293,7 +325,6 @@ export function createSession({
       if (budget.state.paused) {
         throw new BudgetPaused(budget.state.pauseReason, budget.state.resumeAfter);
       }
-      const cooling = cooldowns.get(catalogueId(model)) || 0;
       if (cooling > Date.now()) {
         const skipped = {
           ok: false,
@@ -310,7 +341,8 @@ export function createSession({
         });
         return skipped;
       }
-      const remaining = ENGINE_RETRY_LIMIT - (existing?.httpAttempts || 0);
+      const attemptBudget = retryLimit ?? ENGINE_RETRY_LIMIT;
+      const remaining = attemptBudget - (existing?.httpAttempts || 0);
       if (remaining <= 0) {
         const exhausted = existing?.result || {
           ok: false,
@@ -339,17 +371,37 @@ export function createSession({
       const started = Date.now();
       let result;
       try {
-        result = await attemptStore.run({ key }, () => execute({ maxRetries: remaining }));
+        await acquireHttp();
+        heldHttp = true;
+        result = await attemptStore.run(
+          { key, expected: request, httpSeq: existing?.httpAttempts || 0 },
+          () => execute({ ...effective, maxRetries: remaining, retainRoster }),
+        );
       } catch (error) {
+        if (isEvalInvariant(error)) {
+          fatal = error.message;
+          budget.lockFatal?.(error.message);
+          writeSlot(key, {
+            ...slots.get(key),
+            state: 'fatal',
+            result: null,
+            fatal: error.message,
+          });
+          throw error;
+        }
         if (error instanceof BudgetPaused || budget.state.paused) {
           writeSlot(key, { ...slots.get(key), state: 'pending', result: null });
           throw error;
         }
         writeSlot(key, { ...slots.get(key), state: 'unknown', result: null });
         throw error;
+      } finally {
+        if (heldHttp) releaseHttp();
       }
       const current = slots.get(key) || {};
-      if (isNetworkMessage(result?.error?.message) || isNetworkMessage(result?.error?.kind)) {
+      const transportDrop = (isNetworkMessage(result?.error?.message) || isNetworkMessage(result?.error?.kind))
+        && result?.error?.status == null;
+      if (transportDrop) {
         writeSlot(key, {
           ...current,
           key,
@@ -421,5 +473,8 @@ export function createSession({
       return [...slots.values()];
     },
     cooldowns,
+    get fatal() {
+      return fatal;
+    },
   };
 }

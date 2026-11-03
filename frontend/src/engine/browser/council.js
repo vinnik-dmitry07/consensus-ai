@@ -860,7 +860,7 @@ export async function runPostRanking(queryText, stage1Results, stage2Results, op
     stage1Results,
     stage2Results,
   );
-  const topN = Math.max(1, Math.min(roster.topK, responseRankings.length || 1));
+  const topN = Math.max(1, Math.min(roster.topK, responseRankings.length));
   const topKIndices = responseRankings.slice(0, topN).map((row) => row.index);
 
   let redTeam = null;
@@ -914,7 +914,10 @@ function synthesisCandidates(roster) {
 
 async function querySynthesis(messages, roster) {
   const tried = new Set();
-  for (const model of synthesisCandidates(roster)) {
+  const candidates = roster.strictChairman
+    ? [roster.chairmanModel]
+    : synthesisCandidates(roster);
+  for (const model of candidates) {
     if (!model || !String(model).trim()) continue;
     const cid = catalogueId(model);
     if (!cid || tried.has(cid) || modelUnavailable(model)) continue;
@@ -936,7 +939,8 @@ export async function stage3SynthesizeFinal(
   options = {},
 ) {
   void stage2Results;
-  const roster = resolveRoster(options);
+  const roster = { ...resolveRoster(options) };
+  if (options.strictChairman === true) roster.strictChairman = true;
   const meta = metadata || {};
   const consensus = meta.consensus || {};
   const redTeam = meta.red_team;

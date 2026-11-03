@@ -529,6 +529,27 @@ describe('skipped models in later stages', () => {
       { model: 'openai/gpt-4.1', response: 'a' },
     ])).rejects.toThrow(MODELS_UNAVAILABLE);
   });
+
+  it('does not replace the chairman when strictChairman is set', async () => {
+    settings.chairmanModel = 'google/gemma-4-31b-it:free';
+    settings.councilModels = ['google/gemma-4-31b-it:free', 'openai/gpt-4.1'];
+    const called = [];
+    vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model) => {
+      called.push(model);
+      return { ok: false, skipped: true, error: { message: 'Skipped' } };
+    });
+    await expect(stage3SynthesizeFinal('q', [
+      { model: 'openai/gpt-4.1', response: 'a' },
+    ], null, null, {
+      roster: {
+        councilModels: ['google/gemma-4-31b-it:free', 'openai/gpt-4.1'],
+        chairmanModel: 'google/gemma-4-31b-it:free',
+        topK: 3,
+      },
+      strictChairman: true,
+    })).rejects.toThrow(MODELS_UNAVAILABLE);
+    expect(called).toEqual(['google/gemma-4-31b-it:free']);
+  });
 });
 
 function completionResponse(content) {

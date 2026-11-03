@@ -22,10 +22,13 @@ import { createBudget, createSpendBudget } from './budget.js';
 import { buildBank, taskPublicId } from './datasets.js';
 import { answerPrompt, failureKind, gradeResponse, gradeResponseLenient, LENIENT_RULES } from './grade.js';
 import {
+  COUNCIL_SIZE,
   INCIDENT,
   PUBLISHED_KEY_SHA256,
   SCHEDULE_SEED,
+  SELF_EXCLUSION,
   TEST_COUNTS,
+  TOP_K,
   TOTAL_POST_CAP,
   protocolHash,
 } from './protocol.js';
@@ -199,8 +202,8 @@ function applyFrozen(frozen, apiKey) {
   settings.chairmanModel = frozen.chairmanModel;
   settings.redTeamModel = null;
   settings.nSamples = 1;
-  settings.topK = 3;
-  settings.selfExclusion = true;
+  settings.topK = TOP_K;
+  settings.selfExclusion = SELF_EXCLUSION;
 }
 
 function openRun(runId, apiKey) {
@@ -386,7 +389,7 @@ function forgetStopped(dir, name) {
 }
 
 function provisionalFrozen(pool) {
-  const council = pool.slice(0, Math.min(5, pool.length)).map((model) => model.id);
+  const council = pool.slice(0, COUNCIL_SIZE).map((model) => model.id);
   return {
     councilModels: council,
     chairmanModel: council[0],
@@ -423,7 +426,7 @@ async function runSplit(run, name, items, frozen) {
     }
     const task = byId.get(id);
     console.log(`${name} ${completed + 1}/${ordered.length} ${task?.block || 'item'}`);
-    const result = await runQuestion(byId.get(id), run.session, frozen, baseSnap);
+    const result = await runQuestion(task, run.session, frozen, baseSnap);
     writeJson(file, result);
     run.state.budget = run.budget.snapshot();
     writeJson(run.paths.state, run.state);
@@ -1445,6 +1448,10 @@ export async function main(argv) {
   if (command === 'test') return testSplit(runId);
   if (command === 'repair') return repair(runId, argv);
   if (command === 'complete') return complete(runId, argv);
+  if (command === 'a8') {
+    const { runA8Command } = await import('./a8.js');
+    return runA8Command(argv);
+  }
   if (command === 'report') return report(runId, argv);
   if (command === 'hash') {
     console.log(protocolHash());

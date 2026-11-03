@@ -1,0 +1,40 @@
+{
+  "campaignId": "a8-open-v1",
+  "exploratory": true,
+  "primaryPair": ["A8", "S8"],
+  "maxUsd": 60,
+  "maxPosts": 4000,
+  "maxAttempts": 2,
+  "maxInFlight": 3,
+  "councilSize": 3,
+  "shortlistLimit": 5,
+  "reserveLimit": 2,
+  "selfSamples": 5,
+  "stageCaps": {
+    "stage1": 8192,
+    "sample": 8192,
+    "stage2": 4096,
+    "stage3": 8192
+  },
+  "minContext": 65536,
+  "minCompletion": 8192,
+  "temperature": 0.7,
+  "topP": 1,
+  "generationSeed": null,
+  "scheduleSeed": "a8-open-v1-schedule",
+  "qualitySource": "openrouter /models?sort=top-weekly among paid ids with hugging_face_id",
+  "redTeam": null,
+  "nSamples": 1,
+  "topK": 3,
+  "selfExclusion": true,
+  "grader": "gradeResponse",
+  "secondaryGrader": "gradeResponseLenient",
+  "bank": {
+    "protocolHash": "326c6e10e56e5c79ef74a3afdc8a3d805683d955ead2c421b2d507b4d39ff555",
+    "digest": "a90dd5159b6a5b4f7e38b70cee27bee77cfe43fcf3a16f62a8fb14c757c9a839",
+    "counts": { "smoke": 2, "dev": 24, "test": 120 },
+    "overlap": 0
+  },
+  "models": [],
+  "apiKey": null
+}

@@ -12,7 +12,7 @@ import { queryModelResult } from '../src/engine/browser/openrouter.js';
 import { catalogueId } from '../src/engine/browser/roster.js';
 import { settings } from '../src/engine/browser/settings.js';
 import { answerPrompt, failureKind, gradeResponse, plurality } from './grade.js';
-import { SELF_MOA_LEAD, SCHEDULE_SEED, PLURALITY_SEED } from './protocol.js';
+import { PLURALITY_SEED, SCHEDULE_SEED, SELF_EXCLUSION, SELF_MOA_LEAD, TOP_K } from './protocol.js';
 import { BudgetPaused } from './budget.js';
 import { compareHash } from './util.js';
 
@@ -58,7 +58,7 @@ function rosterDrift(frozen) {
   if (council.some((model, index) => model !== frozen.councilModels[index])) return true;
   if (settings.chairmanModel !== frozen.chairmanModel) return true;
   if (settings.redTeamModel) return true;
-  if (settings.nSamples !== 1 || settings.topK !== 3 || settings.selfExclusion !== true) return true;
+  if (settings.nSamples !== 1 || settings.topK !== TOP_K || settings.selfExclusion !== SELF_EXCLUSION) return true;
   return false;
 }
 
@@ -115,7 +115,7 @@ function pickTied(task, tied) {
   return [...tied].sort((left, right) => compareHash(`${PLURALITY_SEED}\n${task.id}`, left, right))[0];
 }
 
-function selfMoaPrompt(taskPrompt, samples) {
+export function selfMoaPrompt(taskPrompt, samples) {
   const blocks = samples.map((item) => `Sample slot ${item.sample}:\n${item.text}`).join('\n\n');
   return `${SELF_MOA_LEAD}\n\n${taskPrompt}\n\n${blocks}`;
 }
@@ -138,7 +138,7 @@ async function collectStage(session, generator) {
 
 function rankingsFrom(stage1Results, stage2Results) {
   const ranked = calculateAggregateRankings(stage1Results, stage2Results);
-  const topN = Math.max(1, Math.min(settings.topK, ranked.responseRankings.length || 1));
+  const topN = Math.max(1, Math.min(settings.topK, ranked.responseRankings.length));
   return {
     ...ranked,
     topKIndices: ranked.responseRankings.slice(0, topN).map((row) => row.index),
