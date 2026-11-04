@@ -198,3 +198,24 @@ describe('campaign reservation budget', () => {
     expect(events.some((event) => event.kind === 'pause' && event.reason === 'in_flight_budget')).toBe(false);
   });
 });
+
+describe('campaign transient pauses', () => {
+  it('lifts a network or in-flight pause and keeps credit, cap and fatal stops', () => {
+    const budget = createCampaignBudget({ maxUsd: 1, maxPosts: 5, prices: {} });
+    budget.pause('network', Date.now() + 1000);
+    expect(budget.isTransientPause()).toBe(true);
+    expect(budget.resumeTransient()).toBe(true);
+    expect(budget.state.paused).toBe(false);
+    budget.pause('in_flight_budget', null);
+    expect(budget.resumeTransient()).toBe(true);
+    for (const reason of ['insufficient_funds', 'auth', 'key_budget', 'payment_unknown', 'budget_blocked']) {
+      budget.pause(reason, null);
+      expect(budget.resumeTransient()).toBe(false);
+      expect(budget.state.paused).toBe(true);
+      budget.state.paused = false;
+      budget.state.pauseReason = null;
+    }
+    budget.lockFatal('broken');
+    expect(budget.resumeTransient()).toBe(false);
+  });
+});

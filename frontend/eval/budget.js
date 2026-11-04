@@ -406,7 +406,24 @@ export function createCampaignBudget(options = {}) {
       state.resumeAfter = resumeAfter;
       if (DURABLE_PAUSE.has(reason)) remember({ kind: 'pause', reason, resumeAfter });
     },
+    isTransientPause() {
+      return state.paused && !state.fatal && isTransientReason(state.pauseReason);
+    },
+    // Lifts a pause that waiting can cure (a dropped connection, the key's
+    // in-flight budget). Credit, auth, spend-cap and fatal stops stay.
+    resumeTransient() {
+      if (!this.isTransientPause()) return false;
+      state.paused = false;
+      state.pauseReason = null;
+      state.resumeAfter = null;
+      notify();
+      return true;
+    },
   };
+}
+
+export function isTransientReason(reason) {
+  return Boolean(reason) && !DURABLE_PAUSE.has(reason) && reason !== 'budget_blocked' && reason !== 'fatal';
 }
 
 export function classifyCreditResponse(status, text) {

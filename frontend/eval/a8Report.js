@@ -124,10 +124,29 @@ export function renderA8Report(input) {
     );
   }
   if (input.note) lines.push('', input.note);
+  if (input.armRules) {
+    const rules = input.armRules;
+    lines.push(
+      '',
+      `Arm rules: A8 ${rules.a8RequiresFullCouncil ? 'needs all three Stage 1 answers' : 'synthesizes from any Stage 1 answers'}; `
+      + `S8 ${rules.s8RequiresAllSamples ? 'needs all five samples with text' : 'synthesizes from any samples with text'}. `
+      + 'A missing input after the allowed attempts is a method failure, scored incorrect.',
+    );
+  }
   if (input.spend) {
     lines.push(
       '',
-      `Campaign settled $${Number(input.spend.settledUsd || 0).toFixed(4)}. Unresolved reserve $${Number(input.spend.unresolvedUsd || 0).toFixed(4)}. POSTs ${input.spend.posts ?? 0}.`,
+      `This run settled $${Number(input.spend.settledUsd || 0).toFixed(4)}. Unresolved reserve $${Number(input.spend.unresolvedUsd || 0).toFixed(4)}. POSTs ${input.spend.posts ?? 0}.`,
+    );
+  }
+  for (const prior of input.priorSpend || []) {
+    lines.push(
+      `Reused run ${prior.run}: settled $${Number(prior.settledUsd || 0).toFixed(4)}, unresolved $${Number(prior.unresolvedUsd || 0).toFixed(4)}, POSTs ${prior.posts ?? 0}. Counted once, against the same cap.`,
+    );
+  }
+  if (input.reuse) {
+    lines.push(
+      `Calls taken from earlier runs by exact request: ${input.reuse.reusedSlots}. Fresh POSTs in this run: ${input.reuse.freshPosts}.`,
     );
   }
   lines.push('');

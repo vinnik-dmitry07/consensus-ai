@@ -52,6 +52,27 @@ export function createOverlayStorage() {
   };
 }
 
+// Runs fn as one branch of the current question: it shares the question's
+// localStorage overlay and settings, but has its own logical-call context and
+// its own drain counter, so parallel branches cannot overwrite each other's
+// slot metadata or wait on each other's calls.
+export function runBranch(context, fn) {
+  const parent = activeQuestion();
+  const child = parent
+    ? Object.create(parent, {
+      settingsState: {
+        get() { return parent.settingsState; },
+        set(value) { parent.settingsState = value; },
+        enumerable: true,
+      },
+    })
+    : { local: null, settingsState: null, worker: null };
+  child.context = context;
+  child.active = 0;
+  child.idle = [];
+  return questionStore.run(child, fn);
+}
+
 export function runIsolated(snapshot, worker, fn) {
   const local = new Map();
   if (snapshot && typeof snapshot === 'object') {

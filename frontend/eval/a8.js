@@ -7,15 +7,19 @@ import { catalogueEntry, OPENROUTER_KEY_URL, OPENROUTER_MODELS_URL, queryModelRe
 import { settings } from '../src/engine/browser/settings.js';
 import { taskPublicId } from './datasets.js';
 import { answerPrompt, gradeResponse, failureKind } from './grade.js';
-import { createCampaignBudget } from './budget.js';
-import { createSession, snapshotLocal } from './runtime.js';
+import { BudgetPaused, createCampaignBudget } from './budget.js';
+import { createSession, readSlotJournal, snapshotLocal } from './runtime.js';
 import { runIsolated } from './questionScope.js';
 import { installTransport } from './transport.js';
 import { runComparison } from './a8Variants.js';
 import { renderA8Report } from './a8Report.js';
 import {
+  CALLS_PER_QUESTION,
   CAMPAIGN_ID,
   COUNCIL_SIZE,
+  DEFAULT_JOBS,
+  DEFAULT_MAX_RESUMES,
+  DEFAULT_MODEL_IN_FLIGHT,
   DEV_PER_BLOCK,
   MAX_ATTEMPTS,
   MAX_IN_FLIGHT,
@@ -198,7 +202,87 @@ function openBudget(campaignPaths, prices, campaign) {
     onEvent: (event) => appendFileSync(campaignPaths.budget, `${JSON.stringify(event)}\n`, 'utf8'),
   });
   budget.applyJournal(readJsonl(campaignPaths.budget));
+  // A replaying campaign continues the runs it reuses: their spend and posts
+  // count against the same cap.
+  const carried = campaign.carriedSpend;
+  if (carried) {
+    budget.state.settledUsd += Number(carried.settledUsd || 0);
+    budget.state.unresolvedUsd += Number(carried.unresolvedUsd || 0);
+    budget.state.posts += Number(carried.posts || 0);
+  }
   return budget;
+}
+
+function journalSpend(file, campaign = {}) {
+  const replayed = createCampaignBudget({
+    maxUsd: campaign.maxUsd || MAX_USD,
+    maxPosts: campaign.maxPosts || MAX_POSTS,
+    prices: {},
+  });
+  replayed.applyJournal(readJsonl(file));
+  return {
+    settledUsd: replayed.state.settledUsd,
+    unresolvedUsd: replayed.state.unresolvedUsd,
+    posts: replayed.state.posts,
+  };
+}
+
+const REFUSED_SOURCES = new Set(['main', 'a8-strong-v1']);
+
+function assertReplaySource(id, runId) {
+  if (!id || REFUSED_SOURCES.has(id) || id.includes('repair') || id.includes('complete') || id === runId) {
+    throw new Error(`Refusing replay source ${id || '(empty)'}.`);
+  }
+  if (!existsSync(pathsFor(id).campaign)) throw new Error(`Replay source ${id} has no campaign.json.`);
+}
+
+function journalsOf(runId) {
+  const paths = pathsFor(runId);
+  const files = [path.join(paths.probe, 'events.jsonl'), path.join(paths.dev, 'events.jsonl')];
+  if (existsSync(paths.comparison)) {
+    for (const name of readdirSync(paths.comparison).sort()) {
+      files.push(path.join(paths.comparison, name, 'events.jsonl'));
+    }
+  }
+  return files.filter((file) => existsSync(file));
+}
+
+// Slots another run may lend this one. A slot is lent only under its exact key,
+// which carries the hash of the full request, so a different prompt, route,
+// cap, or order never matches. Answered slots are reused whatever they say.
+// A slot that used every allowed attempt is reused as a failure. Any other
+// slot is called again here, and the attempts it already spent count.
+export function loadReplaySources(runIds, { maxAttempts = MAX_ATTEMPTS, journals = journalsOf } = {}) {
+  const reuse = new Map();
+  const prior = new Map();
+  for (const id of runIds) {
+    for (const file of journals(id)) {
+      for (const [key, slot] of readSlotJournal(file)) {
+        if (String(slot.meta?.model || '').endsWith(':free')) continue;
+        if (reuse.has(key)) continue;
+        const attempts = slot.httpAttempts || 0;
+        const answered = slot.state === 'completed' && slot.result?.ok === true;
+        const exhausted = slot.state === 'failed' && attempts >= maxAttempts;
+        if (answered || exhausted) {
+          reuse.set(key, { ...slot, sourceRun: id });
+          prior.delete(key);
+        } else if (attempts > 0) {
+          prior.set(key, Math.max(prior.get(key) || 0, attempts));
+        }
+      }
+    }
+  }
+  return { reuse, prior };
+}
+
+function replaySources(campaign) {
+  if (!campaign?.replayFrom?.length) return null;
+  const replay = loadReplaySources(campaign.replayFrom);
+  console.log(
+    `replay sources ${campaign.replayFrom.join(', ')}: ${replay.reuse.size} reusable slots, `
+    + `${replay.prior.size} slots with spent attempts`,
+  );
+  return replay;
 }
 
 function priceMap(preflight) {
@@ -228,12 +312,17 @@ function sameSource(stored, label) {
   }
 }
 
-function sessionBudget(extra) {
+function sessionBudget(replay = null) {
   return {
     retainRoster: true,
     retryAfterCooldown: true,
     retryLimit: MAX_ATTEMPTS,
-    ...extra,
+    ...(replay ? {
+      replayFrom: replay.reuse,
+      priorAttempts: replay.prior,
+      aliasOf: (model) => model,
+      replayTerminal: true,
+    } : {}),
   };
 }
 
@@ -247,6 +336,104 @@ function assertCompatible(campaignPaths, phase) {
   const preflight = readJson(campaignPaths.preflight);
   if (!preflight?.routes?.length) throw new Error('Preflight has no paid routes.');
   return { campaign, bank, preflight };
+}
+
+function positiveFlag(argv, name, fallback) {
+  const raw = flagValue(argv, name);
+  if (raw == null) return fallback;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 1) throw new Error(`${name} needs a positive number`);
+  return Math.trunc(value);
+}
+
+export function runFlags(argv) {
+  const jobs = positiveFlag(argv, '--jobs', DEFAULT_JOBS);
+  return {
+    jobs,
+    inFlight: positiveFlag(argv, '--in-flight', jobs * CALLS_PER_QUESTION),
+    modelInFlight: positiveFlag(argv, '--model-in-flight', DEFAULT_MODEL_IN_FLIGHT),
+    maxResumes: positiveFlag(argv, '--max-resumes', DEFAULT_MAX_RESUMES),
+  };
+}
+
+// Fields whose change would alter a request or a score. A replay source must
+// agree on all of them, or its slots are not this method's slots.
+const REPLAY_PROFILE_FIELDS = [
+  'maxAttempts', 'councilSize', 'selfSamples', 'stageCaps', 'temperature', 'topP',
+  'nSamples', 'topK', 'selfExclusion', 'scheduleSeed', 'redTeam', 'generationSeed',
+];
+
+function checkBankCounts(items) {
+  const counts = {
+    smoke: items.filter((item) => item.split === 'smoke').length,
+    dev: items.filter((item) => item.split === 'dev').length,
+    test: items.filter((item) => item.split === 'test').length,
+  };
+  if (counts.smoke !== SMOKE_COUNT || counts.dev !== DEV_PER_BLOCK * 3 || counts.test !== TEST_QUESTIONS) {
+    throw new Error(`Unexpected bank counts ${JSON.stringify(counts)}`);
+  }
+}
+
+// Starts a campaign that reuses earlier runs. It takes the first source's
+// route snapshot as is: a fresh catalogue read could pick another endpoint,
+// and a changed provider changes every request hash. No network calls.
+async function inheritPreflight(campaignPaths, runId, fromIds) {
+  for (const id of fromIds) assertReplaySource(id, runId);
+  const existing = readJson(campaignPaths.campaign);
+  if (existing) {
+    if ((existing.replayFrom || []).join(',') !== fromIds.join(',')) {
+      throw new Error('This campaign already exists with other replay sources.');
+    }
+    sameSource(existing.sourceHash, 'Campaign');
+    console.log(`preflight already inherited from ${existing.inheritedPreflightFrom}`);
+    return 0;
+  }
+  const { items, digest, bank } = loadBank();
+  checkBankCounts(items);
+  const profile = profileDocument();
+  const runs = [];
+  for (const id of fromIds) {
+    const source = pathsFor(id);
+    const sourceCampaign = readJson(source.campaign);
+    if (sourceCampaign.bankDigest !== digest) throw new Error(`Replay source ${id} used another bank.`);
+    for (const field of REPLAY_PROFILE_FIELDS) {
+      if (stableStringify(sourceCampaign[field] ?? null) !== stableStringify(profile[field] ?? null)) {
+        throw new Error(`Replay source ${id} differs on ${field}.`);
+      }
+    }
+    runs.push({ run: id, ...journalSpend(source.budget, sourceCampaign) });
+  }
+  const sourcePreflight = readJson(pathsFor(fromIds[0]).preflight);
+  if (!sourcePreflight?.routes?.length) throw new Error(`Replay source ${fromIds[0]} has no route snapshot.`);
+  writeJson(campaignPaths.preflight, {
+    ...sourcePreflight,
+    inheritedFrom: fromIds[0],
+    inheritedAt: new Date().toISOString(),
+  });
+  const carriedSpend = runs.reduce((sum, row) => ({
+    settledUsd: sum.settledUsd + row.settledUsd,
+    unresolvedUsd: sum.unresolvedUsd + row.unresolvedUsd,
+    posts: sum.posts + row.posts,
+    runs: sum.runs,
+  }), { settledUsd: 0, unresolvedUsd: 0, posts: 0, runs });
+  writeJson(campaignPaths.campaign, {
+    id: runId,
+    ...profile,
+    primaryPair: PRIMARY_PAIR,
+    bankProtocolHash: bank.protocolHash,
+    bankDigest: digest,
+    sourceHash: sourceHash(),
+    createdAt: new Date().toISOString(),
+    replayFrom: fromIds,
+    inheritedPreflightFrom: fromIds[0],
+    carriedSpend,
+  });
+  console.log(
+    `preflight inherited ${sourcePreflight.routes.length} routes from ${fromIds[0]}; `
+    + `carried spend $${carriedSpend.settledUsd.toFixed(4)} settled, $${carriedSpend.unresolvedUsd.toFixed(4)} unresolved, `
+    + `${carriedSpend.posts} posts`,
+  );
+  return 0;
 }
 
 async function preflight(campaignPaths, live) {
@@ -392,6 +579,107 @@ function prepareFor(policy) {
   };
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const RESUME_FLOOR_MS = 5_000;
+const IN_FLIGHT_WAIT_MS = 60_000;
+const MAX_RESUME_WAIT_MS = 30 * 60_000;
+
+// How long to wait before another pass can make progress, or null when only
+// a person can fix the stop (credit, auth, spend cap, fatal).
+function resumeWait(budget, session) {
+  const now = Date.now();
+  if (budget.state.fatal) return null;
+  if (budget.state.paused) {
+    if (!budget.isTransientPause()) return null;
+    const until = budget.state.resumeAfter ?? (now + IN_FLIGHT_WAIT_MS);
+    return Math.max(RESUME_FLOOR_MS, until - now);
+  }
+  const cooling = [...session.cooldowns.values()].filter((until) => until > now);
+  if (!cooling.length) return RESUME_FLOOR_MS;
+  return Math.max(RESUME_FLOOR_MS, Math.min(...cooling) - now + 1_000);
+}
+
+export function reuseStats(slots, questionId = null) {
+  let reused = 0;
+  let fresh = 0;
+  for (const slot of slots) {
+    if (questionId && slot.meta?.questionId !== questionId) continue;
+    if (slot.reusedFrom) reused += 1;
+    else fresh += slot.httpAttempts || 0;
+  }
+  return { reusedSlots: reused, freshPosts: fresh };
+}
+
+// Runs questions through a pool of workers. A question left pending by a
+// cooldown does not stop the others. A budget pause stops new work; when the
+// pause is one that waiting cures, the pool sleeps and takes another pass in
+// the same process instead of exiting.
+async function runPasses({ label, order, isDone, runOne, budget, session, run }) {
+  let resumes = 0;
+  for (;;) {
+    const pending = order.filter((id) => !isDone(id));
+    if (!pending.length) return 0;
+    let finished = order.length - pending.length;
+    let cursor = 0;
+    let stopCode = 0;
+    console.log(
+      `${label} pass ${resumes + 1}: ${run.jobs} questions at once, ${finished} complete, ${pending.length} left, `
+      + `http cap ${run.inFlight}, per model ${run.modelInFlight}`,
+    );
+    async function worker(index) {
+      while (!stopCode) {
+        if (budget.state.paused || budget.state.fatal) return;
+        const at = cursor;
+        cursor += 1;
+        if (at >= pending.length) return;
+        const id = pending[at];
+        let result;
+        try {
+          result = await runOne(id, index);
+        } catch (error) {
+          if (isEvalInvariant(error)) {
+            console.log(`w${index} ${label} fatal: ${error.message}`);
+            stopCode = 1;
+            return;
+          }
+          throw error;
+        }
+        if (result?.status === 'complete') {
+          finished += 1;
+          const reuse = reuseStats(session.slots());
+          console.log(
+            `w${index} ${label} ${finished}/${order.length} done ${id} `
+            + `settled $${budget.state.settledUsd.toFixed(4)} reserved $${budget.state.unresolvedUsd.toFixed(4)} `
+            + `reused ${reuse.reusedSlots} fresh posts ${reuse.freshPosts}`,
+          );
+          continue;
+        }
+        console.log(`w${index} ${label} pending ${id}: ${result?.reason || 'unknown'}`);
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(run.jobs, pending.length) }, (_, index) => worker(index)));
+    if (stopCode) return stopCode;
+    if (!order.some((id) => !isDone(id))) return 0;
+    const wait = resumeWait(budget, session);
+    if (wait == null) {
+      console.log(`${label} paused: ${budget.state.pauseReason || 'stopped'}`);
+      return 2;
+    }
+    if (resumes >= run.maxResumes || wait > MAX_RESUME_WAIT_MS) {
+      console.log(`${label} paused after ${resumes} resumes; next wait ${Math.ceil(wait / 1000)}s`);
+      return 2;
+    }
+    const why = budget.state.paused ? budget.state.pauseReason : 'cooldown';
+    console.log(`${label} waiting ${Math.ceil(wait / 1000)}s (${why}) before pass ${resumes + 2}`);
+    await sleep(wait);
+    budget.resumeTransient();
+    resumes += 1;
+  }
+}
+
 async function runProbe(campaignPaths) {
   const { campaign, bank } = assertCompatible(campaignPaths, 'probe');
   const preflightDoc = readJson(campaignPaths.preflight);
@@ -413,26 +701,38 @@ async function runProbe(campaignPaths) {
   const active = [...(preflightDoc.candidates || [])];
   const reserves = [...(preflightDoc.reserves || [])];
   const routes = preflightDoc.routes.filter((route) => active.includes(route.id) || reserves.includes(route.id));
+  // The probe checks that each route answers today, so it never replays.
   const session = createSession({
     runDir: campaignPaths.probe,
     budget,
     prepareOptions: prepareFor(policyFrom({ routes })),
-    maxInFlight: 1,
+    maxInFlight: active.length,
     ...sessionBudget(),
   });
   session.install();
   const restore = installPaid(session, budget, routes);
   const smoke = bank.items.filter((item) => item.split === 'smoke');
   const results = readJson(path.join(campaignPaths.probe, 'rows.json'), []);
+  const baseSnap = snapshotLocal();
   try {
     let replacements = saved?.replacements || 0;
     for (let index = 0; index < smoke.length; index += 1) {
       const task = smoke[index];
-      console.log(`probe ${index + 1}/${smoke.length} ${task.block}`);
-      for (const model of [...active]) {
+      console.log(`probe ${index + 1}/${smoke.length} ${task.block}: ${active.length} routes at once`);
+      const models = [...active];
+      const answered = await runIsolated(baseSnap, 0, async () => {
         session.setContext({ questionId: task.id, branch: 'probe', stage: 'stage1', sample: 1 });
-        const result = await queryModelResult(model, [{ role: 'user', content: answerPrompt(task) }]);
+        const settled = await Promise.allSettled(models.map((model) => (
+          queryModelResult(model, [{ role: 'user', content: answerPrompt(task) }])
+        )));
         await session.drain();
+        return settled;
+      });
+      const invariant = answered.find((item) => item.status === 'rejected' && isEvalInvariant(item.reason));
+      if (invariant) throw invariant.reason;
+      for (let at = 0; at < models.length; at += 1) {
+        const model = models[at];
+        const result = answered[at].status === 'fulfilled' ? answered[at].value : null;
         if (result?.skipped) {
           writeJson(path.join(campaignPaths.probe, 'rows.json'), results);
           console.log('probe paused: cooldown');
@@ -447,16 +747,17 @@ async function runProbe(campaignPaths) {
           correct: grade.correct,
           status: grade.status,
         });
-        if (slot?.httpStatus === 401 || budget.state.paused) {
+        console.log(`probe ${model} http ${slot?.httpStatus ?? 'n/a'} ${grade.status}`);
+        if (slot?.httpStatus === 401) {
           writeJson(path.join(campaignPaths.probe, 'rows.json'), results);
-          console.log(`probe paused: ${budget.state.pauseReason || 'auth'}`);
+          console.log('probe paused: auth');
           return 2;
         }
         const bad = slot?.httpStatus === 400 || slot?.httpStatus === 404;
         if (bad && replacements < RESERVE_LIMIT && reserves.length) {
           const replacement = reserves.shift();
-          const at = active.indexOf(model);
-          if (at >= 0) active.splice(at, 1, replacement);
+          const place = active.indexOf(model);
+          if (place >= 0) active.splice(place, 1, replacement);
           replacements += 1;
           console.log(`probe replaced ${model} with ${replacement}`);
         }
@@ -484,7 +785,19 @@ async function runProbe(campaignPaths) {
   }
 }
 
-async function runDev(campaignPaths) {
+function pendingFrom(settled, budget) {
+  const invariant = settled.find((item) => item.status === 'rejected' && isEvalInvariant(item.reason));
+  if (invariant) throw invariant.reason;
+  const rejected = settled.find((item) => item.status === 'rejected');
+  if (rejected && !(rejected.reason instanceof BudgetPaused) && !budget.state.paused) throw rejected.reason;
+  const values = settled.map((item) => (item.status === 'fulfilled' ? item.value : null));
+  if (rejected) return { reason: budget.state.pauseReason || rejected.reason?.reason || 'paused', values };
+  if (values.some((value) => value?.skipped)) return { reason: 'cooldown', values };
+  if (budget.state.paused && values.some((value) => !value?.ok)) return { reason: budget.state.pauseReason, values };
+  return { reason: null, values };
+}
+
+async function runDev(campaignPaths, run) {
   const { campaign, bank, preflight: preflightDoc } = assertCompatible(campaignPaths, 'dev');
   const probe = readJson(path.join(campaignPaths.probe, 'results.json'));
   if (!probe?.done) throw new Error('Finish the probe before dev.');
@@ -499,54 +812,67 @@ async function runDev(campaignPaths) {
   if (!assertSnapshot(devSource, 'Dev')) {
     writeJson(devSource, { sourceHash: sourceHash(), recordedAt: new Date().toISOString() });
   }
+  const replay = replaySources(campaign);
   const session = createSession({
     runDir: devDir,
     budget,
     prepareOptions: prepareFor(policyFrom({ routes })),
-    maxInFlight: MAX_IN_FLIGHT,
-    ...sessionBudget(),
+    maxInFlight: run.inFlight,
+    maxInFlightPerModel: run.modelInFlight,
+    ...sessionBudget(replay),
   });
   session.install();
   const restore = installPaid(session, budget, routes);
   const devItems = bank.items.filter((item) => item.split === 'dev');
+  const byId = new Map(devItems.map((item) => [item.id, item]));
+  const baseSnap = snapshotLocal();
   try {
-    let done = 0;
-    for (const task of devItems) {
-      const file = questionFile(devDir, task.id);
-      if (readJson(file)?.status === 'complete') {
-        done += 1;
-        continue;
-      }
-      console.log(`dev ${done + 1}/${devItems.length} ${task.block} settled $${budget.state.settledUsd.toFixed(4)} reserved $${budget.state.unresolvedUsd.toFixed(4)}`);
-      const answers = [];
-      for (const model of models) {
-        session.setContext({ questionId: task.id, branch: 'dev', stage: 'stage1', sample: 1 });
-        const result = await queryModelResult(model, [{ role: 'user', content: answerPrompt(task) }]);
-        await session.drain();
-        if (result?.skipped) {
-          writeJson(file, { id: task.id, status: 'pending', reason: 'cooldown' });
-          console.log('dev paused: cooldown');
-          return 2;
-        }
-        if (budget.state.paused && !result?.ok) {
-          writeJson(file, { id: task.id, status: 'pending', reason: budget.state.pauseReason });
-          console.log(`dev paused: ${budget.state.pauseReason}`);
-          return 2;
-        }
-        const grade = result?.ok ? gradeResponse(task, result.content || '') : gradeResponse(task, '', failureKind(result));
-        const slot = session.slots().find((item) => item.meta?.questionId === task.id && item.meta?.model === model && item.meta?.branch === 'dev');
-        answers.push({
-          id: model,
-          correct: grade.correct,
-          status: grade.status,
-          success: result?.ok === true,
-          cost: slot?.usage?.cost ?? null,
-          latencyMs: slot?.occupiedMs ?? null,
+    const code = await runPasses({
+      label: 'dev',
+      order: devItems.map((item) => item.id),
+      isDone: (id) => readJson(questionFile(devDir, id))?.status === 'complete',
+      budget,
+      session,
+      run,
+      runOne: async (id, index) => {
+        const task = byId.get(id);
+        const file = questionFile(devDir, id);
+        const settled = await runIsolated(baseSnap, index, async () => {
+          session.setContext({ questionId: task.id, branch: 'dev', stage: 'stage1', sample: 1 });
+          const all = await Promise.allSettled(models.map((model) => (
+            queryModelResult(model, [{ role: 'user', content: answerPrompt(task) }])
+          )));
+          await session.drain();
+          return all;
         });
-      }
-      writeJson(file, { id: task.id, block: task.block, status: 'complete', answers });
-      done += 1;
-    }
+        const { reason, values } = pendingFrom(settled, budget);
+        if (reason) {
+          const row = { id: task.id, status: 'pending', reason };
+          writeJson(file, row);
+          return row;
+        }
+        const answers = models.map((model, at) => {
+          const result = values[at];
+          const grade = result?.ok ? gradeResponse(task, result.content || '') : gradeResponse(task, '', failureKind(result));
+          const slot = session.slots().find((item) => (
+            item.meta?.questionId === task.id && item.meta?.model === model && item.meta?.branch === 'dev'
+          ));
+          return {
+            id: model,
+            correct: grade.correct,
+            status: grade.status,
+            success: result?.ok === true,
+            cost: slot?.usage?.cost ?? null,
+            latencyMs: slot?.occupiedMs ?? null,
+            reused: Boolean(slot?.reusedFrom),
+          };
+        });
+        const row = { id: task.id, block: task.block, status: 'complete', answers };
+        writeJson(file, row);
+        return row;
+      },
+    });
+    if (code) return code;
     const tally = new Map(models.map((id) => [id, {
       id,
       configId: id,
@@ -599,6 +925,7 @@ async function runDev(campaignPaths) {
       routes: selectedRoutes,
       table: choice.ranked,
       selectedAt: new Date().toISOString(),
+      runner: runnerNote(run),
     });
     console.log('dev table');
     for (const row of choice.ranked) {
@@ -615,8 +942,16 @@ async function runDev(campaignPaths) {
   }
 }
 
-async function runPipeline(campaignPaths, phase, jobs = 4) {
-  const workers = Math.max(1, Math.trunc(jobs));
+function runnerNote(run) {
+  return {
+    jobs: run.jobs,
+    httpInFlight: run.inFlight,
+    perModelInFlight: run.modelInFlight,
+    note: 'Pacing only. Requests, caps, and retry limits are unchanged.',
+  };
+}
+
+async function runPipeline(campaignPaths, phase, run) {
   const { campaign, bank, preflight: preflightDoc } = assertCompatible(campaignPaths, phase);
   const selection = readJson(campaignPaths.selection);
   if (!selection?.council || selection.council.length !== COUNCIL_SIZE) throw new Error('Selection is not frozen.');
@@ -647,83 +982,63 @@ async function runPipeline(campaignPaths, phase, jobs = 4) {
   const orderFile = path.join(dir, 'order.json');
   const order = readJson(orderFile) || items.map((item) => item.id);
   if (!existsSync(orderFile)) writeJson(orderFile, order);
+  writeJson(path.join(dir, 'runner.json'), { ...runnerNote(run), startedAt: new Date().toISOString() });
   const byId = new Map(items.map((item) => [item.id, item]));
   const key = loadPaidKey();
   settings.apiKey = key;
   const baseSnap = snapshotLocal();
   const budget = openBudget(campaignPaths, priceMap({ routes }), campaign);
+  const replay = replaySources(campaign);
   const session = createSession({
     runDir: dir,
     budget,
     prepareOptions: prepareFor(policyFrom({ routes })),
-    maxInFlight: workers * MAX_IN_FLIGHT,
-    ...sessionBudget(),
+    maxInFlight: run.inFlight,
+    maxInFlightPerModel: run.modelInFlight,
+    ...sessionBudget(replay),
   });
   session.install();
   const restore = installPaid(session, budget, routes);
   try {
-    const pending = [];
-    let done = 0;
-    for (const id of order) {
-      if (readJson(questionFile(dir, id))?.status === 'complete') done += 1;
-      else pending.push(id);
-    }
-    console.log(`${phase} ${workers} questions at once, ${done} already complete, ${pending.length} left`);
-    let cursor = 0;
-    let stopCode = 0;
-    async function worker(index) {
-      while (!stopCode) {
-        if (budget.state.paused || budget.state.fatal) {
-          stopCode = stopCode || 2;
-          return;
-        }
-        const slot = cursor;
-        cursor += 1;
-        if (slot >= pending.length) return;
-        const id = pending[slot];
+    const code = await runPasses({
+      label: phase,
+      order,
+      isDone: (id) => readJson(questionFile(dir, id))?.status === 'complete',
+      budget,
+      session,
+      run,
+      runOne: async (id, index) => {
         const task = byId.get(id);
-        const place = done + slot + 1;
-        console.log(
-          `w${index} ${phase} ${place}/${order.length} ${task?.block || 'item'} `
-          + `settled $${budget.state.settledUsd.toFixed(4)} reserved $${budget.state.unresolvedUsd.toFixed(4)}`,
-        );
         try {
           const result = await runIsolated(baseSnap, index, () => (
             runComparison(task, session, frozen, { scheduleSeed: SCHEDULE_SEED })
           ));
-          writeJson(questionFile(dir, id), result);
           const fresh = session.slots().filter((item) => item.meta?.questionId === id);
           if (fresh.some((item) => String(item.meta?.model || '').endsWith(':free'))) {
-            throw new Error('A free model id reached the journal.');
+            throw new EvalInvariantError('A free model id reached the journal.');
           }
-          if (result.status !== 'complete') {
-            console.log(`w${index} ${phase} ${result.status}: ${result.reason}`);
-            stopCode = result.status === 'pending' ? 2 : 1;
-            return;
-          }
-          done += 1;
+          result.reuse = reuseStats(fresh);
+          writeJson(questionFile(dir, id), result);
+          return result;
         } catch (error) {
-          if (isEvalInvariant(error)) {
-            writeJson(questionFile(dir, id), { id, status: 'fatal', reason: error.message });
-            console.log(`w${index} ${phase} fatal: ${error.message}`);
-            stopCode = 1;
-            return;
-          }
+          if (isEvalInvariant(error)) writeJson(questionFile(dir, id), { id, status: 'fatal', reason: error.message });
           throw error;
         }
-      }
-    }
-    await Promise.all(Array.from({ length: Math.min(workers, pending.length) }, (_, index) => worker(index)));
-    if (stopCode) return stopCode;
+      },
+    });
+    if (code) return code;
     if (phase === 'pilot') {
-      const spent = budget.state.settledUsd;
+      const rows = order.map((id) => readJson(questionFile(dir, id))).filter(Boolean);
+      const fresh = rows.reduce((sum, row) => sum + (row.reuse?.freshPosts || 0), 0);
+      const spent = budget.state.settledUsd - Number(campaign.carriedSpend?.settledUsd || 0);
       const per = order.length ? spent / order.length : null;
       writeJson(path.join(dir, 'forecast.json'), {
         settledUsd: spent,
         unresolvedUsd: budget.state.unresolvedUsd,
         perQuestion: per,
         forecastTestUsd: per == null ? null : per * TEST_QUESTIONS,
-        note: 'Forecast uses settled campaign spend so far divided by pilot questions. It includes earlier phases and is not a pure marginal cost.',
+        pilotFreshPosts: fresh,
+        note: 'Forecast divides this run\'s own settled spend so far (probe, dev, smoke, pilot; not the carried spend of replay sources) by pilot questions. Replayed calls cost nothing, so it depends on how much each phase could reuse.',
       });
       console.log(`pilot forecast for ${TEST_QUESTIONS} questions at the current average: $${per == null ? 'n/a' : (per * TEST_QUESTIONS).toFixed(2)}`);
     }
@@ -767,17 +1082,15 @@ async function report(campaignPaths) {
   }
   const campaign = readJson(campaignPaths.campaign, {});
   const budgetEvents = readJsonl(campaignPaths.budget);
-  const replay = createCampaignBudget({
-    maxUsd: campaign.maxUsd || MAX_USD,
-    maxPosts: campaign.maxPosts || MAX_POSTS,
-    prices: {},
-  });
-  replay.applyJournal(budgetEvents);
-  const spend = {
-    settledUsd: replay.state.settledUsd,
-    unresolvedUsd: replay.state.unresolvedUsd,
-    posts: replay.state.posts,
-  };
+  const spend = journalSpend(campaignPaths.budget, campaign);
+  const priorSpend = campaign.carriedSpend?.runs || [];
+  let reuseSlots = [];
+  for (const file of journalsOf(path.basename(campaignPaths.dir))) {
+    reuseSlots = reuseSlots.concat([...readSlotJournal(file).values()]);
+  }
+  // A slot's httpAttempts also counts attempts its source run spent, so the
+  // fresh count comes from this run's own budget journal: one reserve per POST.
+  const reuse = { reusedSlots: reuseStats(reuseSlots).reusedSlots, freshPosts: spend.posts };
   const pause = [...budgetEvents].reverse().find((event) => event.kind === 'pause');
   const planned = TEST_QUESTIONS;
   const scored = rows.filter((row) => row.status === 'complete').length;
@@ -787,6 +1100,9 @@ async function report(campaignPaths) {
     planned,
     complete,
     spend,
+    priorSpend,
+    reuse,
+    armRules: campaign.armRules || null,
     history: historicalNote(),
     note: pause
       ? `Stop: ${pause.reason}. Questions left for that reason stay pending and are not scored incorrect.`
@@ -800,6 +1116,9 @@ async function report(campaignPaths) {
     planned,
     scored,
     spend,
+    priorSpend,
+    reuse,
+    replayFrom: campaign.replayFrom || [],
   });
   console.log(text);
   console.log(`Wrote ${path.join(campaignPaths.reports, 'report.md')}`);
@@ -831,18 +1150,27 @@ export async function runA8Command(argv) {
   } else if (maxPosts != null && Number(maxPosts) !== MAX_POSTS) {
     throw new Error(`This profile locks maxPosts at ${MAX_POSTS}.`);
   }
+  const fromFlag = flagValue(argv, '--from');
+  const from = fromFlag ? fromFlag.split(',').map((id) => id.trim()).filter(Boolean) : null;
+  if (from && phase !== 'preflight') {
+    const pinned = existing?.replayFrom || [];
+    if (from.join(',') !== pinned.join(',')) {
+      throw new Error(`This campaign replays from [${pinned.join(', ')}]. --from is fixed at preflight.`);
+    }
+  }
   const release = acquireLock(campaignPaths.dir);
   try {
-    if (phase === 'preflight') return await preflight(campaignPaths, live);
+    if (phase === 'preflight') {
+      if (from) return await inheritPreflight(campaignPaths, runId, from);
+      return await preflight(campaignPaths, live);
+    }
     if (phase === 'report') return await report(campaignPaths);
     if (!live) throw new Error(`${phase} posts only with --live`);
     if (phase === 'probe') return await runProbe(campaignPaths);
-    if (phase === 'dev') return await runDev(campaignPaths);
+    const run = runFlags(argv);
+    if (phase === 'dev') return await runDev(campaignPaths, run);
     if (phase === 'smoke' || phase === 'pilot' || phase === 'test') {
-      const jobs = flagValue(argv, '--jobs');
-      const parsed = jobs == null ? 4 : Number(jobs);
-      if (!Number.isFinite(parsed) || parsed < 1) throw new Error('--jobs needs a positive number');
-      return await runPipeline(campaignPaths, phase, parsed);
+      return await runPipeline(campaignPaths, phase, run);
     }
     throw new Error(`Unknown a8 phase ${phase}`);
   } finally {

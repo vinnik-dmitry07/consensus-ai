@@ -20,6 +20,30 @@ const LOCAL_KEYS = [
 const TERMINAL = new Set(['completed', 'failed', 'skipped']);
 const NETWORK_BACKOFF_MS = 30_000;
 
+// A counting gate that hands a released place straight to the next waiter, so
+// a caller arriving between release and wake-up cannot push it over the limit.
+export function createGate(limit) {
+  let active = 0;
+  const waiters = [];
+  return {
+    async acquire() {
+      if (!limit || active < limit) {
+        active += 1;
+        return;
+      }
+      await new Promise((resolve) => waiters.push(resolve));
+    },
+    release() {
+      const next = waiters.shift();
+      if (next) next();
+      else active = Math.max(0, active - 1);
+    },
+    get active() {
+      return active;
+    },
+  };
+}
+
 export function slotKey(slot) {
   const parts = [slot.questionId, slot.branch, slot.stage, slot.sample, slot.model, slot.requestHash];
   if ((slot.attempt || 0) > 0) parts.push(`a${slot.attempt}`);
@@ -54,6 +78,22 @@ export function networkOutageCount(file) {
     if (list.length && list.every((slot) => isNetworkMessage(slot.result?.error?.message))) count += 1;
   }
   return count;
+}
+
+// Slot map plus the number of HTTP attempts each slot reserved. A slot cut off
+// mid-call never wrote its final count, so the reserve events decide.
+export function readSlotJournal(file) {
+  const slots = readSlotMap(file);
+  const reserved = new Map();
+  for (const event of readJsonl(file)) {
+    if (event.kind === 'http' && event.phase === 'reserved' && event.key) {
+      reserved.set(event.key, (reserved.get(event.key) || 0) + 1);
+    }
+  }
+  for (const [key, slot] of slots) {
+    slot.httpAttempts = Math.max(slot.httpAttempts || 0, reserved.get(key) || 0);
+  }
+  return slots;
 }
 
 function readJsonl(file) {
@@ -94,6 +134,8 @@ export function createSession({
   prepareOptions = null,
   retryLimit = null,
   maxInFlight = null,
+  maxInFlightPerModel = null,
+  priorAttempts = null,
   retainRoster = false,
   retryAfterCooldown = false,
 }) {
@@ -115,8 +157,8 @@ export function createSession({
     }
   }
   let ordinal = 0;
-  let httpActive = 0;
-  const httpWaiters = [];
+  const httpGate = createGate(maxInFlight);
+  const modelGates = new Map();
   let fatal = null;
 
   if (existsSync(cooldownPath)) {
@@ -124,7 +166,7 @@ export function createSession({
     for (const [id, until] of Object.entries(saved)) cooldowns.set(id, until);
   }
   for (const event of readJsonl(journalPath)) applyEvent(event);
-  for (const [key, slot] of slots) {
+  for (const slot of slots.values()) {
     if (slot.state === 'running') slot.state = 'unknown';
   }
 
@@ -250,35 +292,35 @@ export function createSession({
     if (!replayFrom || !aliasOf) return null;
     if ((slotMeta.attempt || 0) > 0) return null;
     const sourceModel = aliasOf(model);
-    const sourceRequest = canonicalCompletionRequest(sourceModel, messages, options);
+    // The source journal keyed each slot on the request it actually sent, so
+    // the lookup has to apply the same per-stage shaping before hashing.
+    const sourceOptions = prepareOptions
+      ? prepareOptions(sourceModel, slotMeta.stage, options || {})
+      : options;
+    const sourceRequest = canonicalCompletionRequest(sourceModel, messages, sourceOptions);
     const sourceHash = sha256(stableStringify(sourceRequest));
     const sourceKey = slotKey({ ...slotMeta, model: sourceModel, requestHash: sourceHash });
     const source = replayFrom.get(sourceKey);
     if (!source) return null;
+    if (source.request && stableStringify(source.request) !== stableStringify(sourceRequest)) {
+      throw new EvalInvariantError(`Replay source ${sourceKey} stores a different request under the same hash`);
+    }
     const answered = source.state === 'completed' && source.result?.ok;
     if (!answered && !(replayTerminal && TERMINAL.has(source.state))) return null;
     return { sourceKey, source };
   }
 
-  async function acquireHttp() {
-    if (!maxInFlight || httpActive < maxInFlight) {
-      httpActive += 1;
-      return;
-    }
-    await new Promise((resolve) => httpWaiters.push(resolve));
-    httpActive += 1;
-  }
-
-  function releaseHttp() {
-    httpActive = Math.max(0, httpActive - 1);
-    const next = httpWaiters.shift();
-    if (next) next();
+  function modelGate(model) {
+    const id = catalogueId(model);
+    if (!modelGates.has(id)) modelGates.set(id, createGate(maxInFlightPerModel));
+    return modelGates.get(id);
   }
 
   async function hook({ model, messages, options, execute }) {
     const flightSlot = enter();
     let key = null;
     let heldHttp = false;
+    let heldModel = null;
     try {
       if (fatal || budget.state?.fatal) {
         throw new EvalInvariantError(fatal || budget.state.fatal);
@@ -316,6 +358,9 @@ export function createSession({
           finishReason: reused.source.finishReason || null,
           incompleteHttp: reused.source.incompleteHttp === true,
           reusedFrom: reused.sourceKey,
+          usage: reused.source.usage ?? reused.source.result?.usage ?? null,
+          occupiedMs: reused.source.occupiedMs ?? null,
+          sourceOrdinal: reused.source.completedOrdinal ?? null,
           httpAttempts: 0,
         });
         emit(`${slotMeta.branch} ${slotMeta.stage} ${slotMeta.model} sample ${slotMeta.sample}${attemptLabel(slotMeta)} reused`);
@@ -342,7 +387,10 @@ export function createSession({
         return skipped;
       }
       const attemptBudget = retryLimit ?? ENGINE_RETRY_LIMIT;
-      const remaining = attemptBudget - (existing?.httpAttempts || 0);
+      // Attempts already spent on this exact request in a replay source count
+      // against the same per-call limit.
+      const spent = Math.max(existing?.httpAttempts || 0, priorAttempts?.get(key) || 0);
+      const remaining = attemptBudget - spent;
       if (remaining <= 0) {
         const exhausted = existing?.result || {
           ok: false,
@@ -366,15 +414,17 @@ export function createSession({
         request,
         state: 'running',
         result: null,
-        httpAttempts: existing?.httpAttempts || 0,
+        httpAttempts: spent,
       });
       const started = Date.now();
       let result;
       try {
-        await acquireHttp();
+        heldModel = modelGate(model);
+        await heldModel.acquire();
+        await httpGate.acquire();
         heldHttp = true;
         result = await attemptStore.run(
-          { key, expected: request, httpSeq: existing?.httpAttempts || 0 },
+          { key, expected: request, httpSeq: spent },
           () => execute({ ...effective, maxRetries: remaining, retainRoster }),
         );
       } catch (error) {
@@ -396,7 +446,8 @@ export function createSession({
         writeSlot(key, { ...slots.get(key), state: 'unknown', result: null });
         throw error;
       } finally {
-        if (heldHttp) releaseHttp();
+        if (heldHttp) httpGate.release();
+        if (heldModel) heldModel.release();
       }
       const current = slots.get(key) || {};
       const transportDrop = (isNetworkMessage(result?.error?.message) || isNetworkMessage(result?.error?.kind))

@@ -26,6 +26,21 @@ export const TOP_P = 1;
 export const QUALITY_SOURCE = 'openrouter /models?sort=top-weekly among paid ids with hugging_face_id';
 export const SCHEDULE_SEED = 'a8-open-v1-schedule';
 
+// Written into every campaign so a reader can tell which rule scored a
+// missing input. v1 synthesized S8 from whatever samples had text.
+export const ARM_RULES = {
+  a8RequiresFullCouncil: true,
+  s8RequiresAllSamples: true,
+  emptyTextIsMethodFailure: true,
+};
+export const STAGE1_ORDER = 'Stage 2 and the chairman see answers in call-completion order; replayed answers keep their source order and come first.';
+
+// Runner pacing. These change wall-clock time, not the requests.
+export const DEFAULT_JOBS = 6;
+export const CALLS_PER_QUESTION = 7;
+export const DEFAULT_MODEL_IN_FLIGHT = 6;
+export const DEFAULT_MAX_RESUMES = 30;
+
 export const STAGE_CAPS = {
   stage1: STAGE1_MAX_TOKENS,
   sample: STAGE1_MAX_TOKENS,
@@ -61,5 +76,7 @@ export function profileDocument() {
     nSamples: N_SAMPLES,
     topK: TOP_K,
     selfExclusion: SELF_EXCLUSION,
+    armRules: ARM_RULES,
+    stage1Order: STAGE1_ORDER,
   };
 }
