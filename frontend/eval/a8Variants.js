@@ -10,9 +10,10 @@ import {
 import { queryModelResult } from '../src/engine/browser/openrouter.js';
 import { answerPrompt, failureKind, gradeResponse, plurality } from './grade.js';
 import { N_SAMPLES, SCHEDULE_SEED, SELF_EXCLUSION, SELF_SAMPLES, TOP_K } from './a8Profile.js';
-import { sha256 } from './util.js';
+import { compareHash, sha256 } from './util.js';
 import { BudgetPaused } from './budget.js';
 import { isEvalInvariant } from './invariant.js';
+import { PLURALITY_SEED } from './protocol.js';
 import { runBranch } from './questionScope.js';
 import { selfMoaPrompt } from './variants.js';
 
@@ -75,6 +76,22 @@ function terminal(reason) {
     reason,
     formatCompliant: false,
     extracted: null,
+    text: '',
+  };
+}
+
+// P8: plurality over the three council answers, no extra call. An answer with
+// no parseable final line abstains. A tie breaks by a seeded hash, as A4 did
+// in main, so the pick does not depend on model order.
+function voteArm(task, grades) {
+  const pick = (tied) => [...tied].sort((left, right) => (
+    compareHash(`${PLURALITY_SEED}\n${task.id}`, left, right)
+  ))[0];
+  const vote = plurality(grades, pick);
+  return {
+    ...vote,
+    correct: vote.status === 'graded' && vote.extracted === task.goldCanon ? 1 : 0,
+    formatCompliant: false,
     text: '',
   };
 }
@@ -220,7 +237,10 @@ export async function runComparison(task, session, frozen, options = {}) {
       const ranked = stage2Results.length
         ? calculateAggregateRankings(stage1Results, stage2Results)
         : { responseRankings: [], aggregateRankings: [], rankingFallback: false };
-      const finish = (arm) => ({ arm, ranked });
+      // How many judges reached their FINAL RANKING line. The others were cut
+      // at the Stage 2 cap and their ranking came from the fallback regex.
+      const judgesComplete = stage2Results.filter((row) => /FINAL RANKING/i.test(row.ranking || '')).length;
+      const finish = (arm) => ({ arm, ranked, judgesComplete });
       if (!councilReady || !stage2Results.length) {
         return finish(terminal(councilReady ? 'no_stage2' : 'incomplete_council'));
       }
@@ -287,6 +307,8 @@ export async function runComparison(task, session, frozen, options = {}) {
       const row = stage1Results.find((item) => item.model === model);
       return row ? gradeResponse(task, row.response || '') : gradeResponse(task, '', 'provider_error');
     });
+    // P8 reads the same three answers A8 reads, under the same completeness rule.
+    arms.P8 = councilReady ? voteArm(task, councilGrades) : terminal('incomplete_council');
     const replicateGrades = samples.map((item) => gradeCall(task, item.result));
     const leader = ranked.responseRankings[0];
     const leaderGrade = leader
@@ -297,6 +319,7 @@ export async function runComparison(task, session, frozen, options = {}) {
     outcome.diagnostics = {
       councilVote: plurality(councilGrades, (tied) => [...tied].sort()[0]),
       replicateVote: plurality(replicateGrades, (tied) => [...tied].sort()[0]),
+      judgesComplete: a8.judgesComplete ?? 0,
       leader: leaderGrade,
       oracle: councilGrades.some((grade) => grade.correct === 1) ? 1 : 0,
       rescue: leaderGrade.correct === 0 && arms.A8?.correct === 1 ? 1 : 0,

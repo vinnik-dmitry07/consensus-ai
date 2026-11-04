@@ -32,8 +32,24 @@ export const ARM_RULES = {
   a8RequiresFullCouncil: true,
   s8RequiresAllSamples: true,
   emptyTextIsMethodFailure: true,
+  // P8 is a plurality vote over the same three Stage 1 answers A8 reads. It
+  // makes no call. An answer without a parseable final line abstains.
+  p8RequiresFullCouncil: true,
+  p8TieBreak: 'seeded hash over the tied answers (PLURALITY_SEED), as A4 in main',
 };
 export const STAGE1_ORDER = 'Stage 2 and the chairman see answers in call-completion order; replayed answers keep their source order and come first.';
+
+// Secondary pairs are reported with a Holm correction over this family. They
+// never replace the primary pair.
+export const SECONDARY_PAIRS = [['P8', 'S8'], ['P8', 'A8']];
+
+// The stream deadline has to let a full-cap answer finish. The slowest paid
+// route seen so far (StepFun on Featherless) fell to about 8 tokens a second,
+// so the deadline grows with the largest cap instead of staying at the
+// engine's 600 s, which a 16384-token answer would not meet.
+export const MIN_TOKENS_PER_SECOND = 8;
+export const HEADER_GRACE_SECONDS = 120;
+export const ENGINE_STREAM_SECONDS = 600;
 
 // Runner pacing. These change wall-clock time, not the requests.
 export const DEFAULT_JOBS = 6;
@@ -48,11 +64,31 @@ export const STAGE_CAPS = {
   stage3: FINAL_MAX_TOKENS,
 };
 
-export function profileDocument() {
+// Caps are fixed at preflight and written into campaign.json. Later phases
+// read them from there, so the constants above describe v1 and this function
+// describes any campaign.
+export function capsFrom(overrides = {}) {
+  const caps = { ...STAGE_CAPS };
+  for (const [stage, value] of Object.entries(overrides)) {
+    if (value == null) continue;
+    if (!(stage in caps)) throw new Error(`Unknown stage cap ${stage}`);
+    if (!Number.isInteger(value) || value < 1) throw new Error(`Cap for ${stage} must be a positive integer`);
+    caps[stage] = value;
+  }
+  return caps;
+}
+
+export function streamTimeoutFor(caps) {
+  const largest = Math.max(...Object.values(caps));
+  return Math.max(ENGINE_STREAM_SECONDS, Math.ceil(largest / MIN_TOKENS_PER_SECOND) + HEADER_GRACE_SECONDS);
+}
+
+export function profileDocument(caps = STAGE_CAPS) {
   return {
     campaignId: CAMPAIGN_ID,
     exploratory: true,
     primaryPair: PRIMARY_PAIR,
+    secondaryPairs: SECONDARY_PAIRS,
     maxUsd: MAX_USD,
     maxPosts: MAX_POSTS,
     maxAttempts: MAX_ATTEMPTS,
@@ -61,7 +97,8 @@ export function profileDocument() {
     shortlistLimit: SHORTLIST_LIMIT,
     reserveLimit: RESERVE_LIMIT,
     selfSamples: SELF_SAMPLES,
-    stageCaps: STAGE_CAPS,
+    stageCaps: caps,
+    streamTimeoutSeconds: streamTimeoutFor(caps),
     minContext: MIN_CONTEXT,
     minCompletion: MIN_COMPLETION,
     devPerBlock: DEV_PER_BLOCK,

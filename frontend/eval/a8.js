@@ -34,6 +34,7 @@ import {
   SHORTLIST_LIMIT,
   SMOKE_COUNT,
   STAGE_CAPS,
+  capsFrom,
 } from './a8Profile.js';
 import {
   chooseEndpoint,
@@ -291,10 +292,16 @@ function priceMap(preflight) {
   return map;
 }
 
-function policyFrom(preflight) {
+// Caps and the stream deadline come from the campaign, so a run keeps the
+// values its preflight fixed even after the profile defaults change.
+export function policyFrom(preflight, campaign = null) {
   const routes = {};
   for (const route of preflight.routes || []) routes[route.id] = route;
-  return { caps: STAGE_CAPS, routes };
+  return {
+    caps: campaign?.stageCaps || STAGE_CAPS,
+    timeout: campaign?.streamTimeoutSeconds ?? null,
+    routes,
+  };
 }
 
 function assertSnapshot(file, label) {
@@ -356,12 +363,31 @@ export function runFlags(argv) {
   };
 }
 
-// Fields whose change would alter a request or a score. A replay source must
-// agree on all of them, or its slots are not this method's slots.
+// Fields whose change would alter a score without changing the request. A
+// replay source must agree on all of them, or its slots are not this method's
+// slots.
 const REPLAY_PROFILE_FIELDS = [
-  'maxAttempts', 'councilSize', 'selfSamples', 'stageCaps', 'temperature', 'topP',
+  'maxAttempts', 'councilSize', 'selfSamples', 'temperature', 'topP',
   'nSamples', 'topK', 'selfExclusion', 'scheduleSeed', 'redTeam', 'generationSeed',
 ];
+// Fields a source may differ on. A cap is part of the request, so the request
+// hash already keeps a slot made under another cap from being reused. The
+// difference is recorded in campaign.json for the reader.
+const REPLAY_REPORTED_FIELDS = ['stageCaps', 'streamTimeoutSeconds'];
+
+export function compareReplayProfile(id, sourceCampaign, profile) {
+  for (const field of REPLAY_PROFILE_FIELDS) {
+    if (stableStringify(sourceCampaign[field] ?? null) !== stableStringify(profile[field] ?? null)) {
+      throw new Error(`Replay source ${id} differs on ${field}.`);
+    }
+  }
+  const differences = {};
+  for (const field of REPLAY_REPORTED_FIELDS) {
+    const theirs = sourceCampaign[field] ?? null;
+    if (stableStringify(theirs) !== stableStringify(profile[field] ?? null)) differences[field] = theirs;
+  }
+  return differences;
+}
 
 function checkBankCounts(items) {
   const counts = {
@@ -377,7 +403,7 @@ function checkBankCounts(items) {
 // Starts a campaign that reuses earlier runs. It takes the first source's
 // route snapshot as is: a fresh catalogue read could pick another endpoint,
 // and a changed provider changes every request hash. No network calls.
-async function inheritPreflight(campaignPaths, runId, fromIds) {
+async function inheritPreflight(campaignPaths, runId, fromIds, caps = STAGE_CAPS) {
   for (const id of fromIds) assertReplaySource(id, runId);
   const existing = readJson(campaignPaths.campaign);
   if (existing) {
@@ -390,21 +416,27 @@ async function inheritPreflight(campaignPaths, runId, fromIds) {
   }
   const { items, digest, bank } = loadBank();
   checkBankCounts(items);
-  const profile = profileDocument();
+  const profile = profileDocument(caps);
   const runs = [];
+  const sourceDifferences = {};
   for (const id of fromIds) {
     const source = pathsFor(id);
     const sourceCampaign = readJson(source.campaign);
     if (sourceCampaign.bankDigest !== digest) throw new Error(`Replay source ${id} used another bank.`);
-    for (const field of REPLAY_PROFILE_FIELDS) {
-      if (stableStringify(sourceCampaign[field] ?? null) !== stableStringify(profile[field] ?? null)) {
-        throw new Error(`Replay source ${id} differs on ${field}.`);
-      }
-    }
+    const differences = compareReplayProfile(id, sourceCampaign, profile);
+    if (Object.keys(differences).length) sourceDifferences[id] = differences;
     runs.push({ run: id, ...journalSpend(source.budget, sourceCampaign) });
   }
   const sourcePreflight = readJson(pathsFor(fromIds[0]).preflight);
   if (!sourcePreflight?.routes?.length) throw new Error(`Replay source ${fromIds[0]} has no route snapshot.`);
+  // The inherited routes were admitted against the source's caps. Each one
+  // must be able to emit the largest cap of this campaign.
+  const largestCap = Math.max(...Object.values(profile.stageCaps));
+  for (const route of sourcePreflight.routes) {
+    if (route.maxCompletion != null && route.maxCompletion < largestCap) {
+      throw new Error(`Route ${route.id} (${route.tag}) allows ${route.maxCompletion} completion tokens, below the ${largestCap} cap.`);
+    }
+  }
   writeJson(campaignPaths.preflight, {
     ...sourcePreflight,
     inheritedFrom: fromIds[0],
@@ -427,16 +459,24 @@ async function inheritPreflight(campaignPaths, runId, fromIds) {
     replayFrom: fromIds,
     inheritedPreflightFrom: fromIds[0],
     carriedSpend,
+    sourceDifferences,
   });
   console.log(
     `preflight inherited ${sourcePreflight.routes.length} routes from ${fromIds[0]}; `
     + `carried spend $${carriedSpend.settledUsd.toFixed(4)} settled, $${carriedSpend.unresolvedUsd.toFixed(4)} unresolved, `
     + `${carriedSpend.posts} posts`,
   );
+  console.log(
+    `preflight caps stage1 ${profile.stageCaps.stage1} stage2 ${profile.stageCaps.stage2} final ${profile.stageCaps.stage3}; `
+    + `stream deadline ${profile.streamTimeoutSeconds}s`,
+  );
+  for (const [id, differences] of Object.entries(sourceDifferences)) {
+    console.log(`preflight source ${id} differs on ${Object.keys(differences).join(', ')}; only slots with an identical request are reused`);
+  }
   return 0;
 }
 
-async function preflight(campaignPaths, live) {
+async function preflight(campaignPaths, live, caps = STAGE_CAPS) {
   if (!live) {
     const saved = readJson(campaignPaths.preflight);
     if (!saved) throw new Error('Dry-run preflight needs a saved snapshot.');
@@ -495,14 +535,24 @@ async function preflight(campaignPaths, live) {
       },
     });
   }
+  // chooseEndpoint admits a route that can emit MIN_COMPLETION tokens. A
+  // campaign with a larger cap needs the route to reach that cap too.
+  const largestCap = Math.max(...Object.values(caps));
+  for (let index = routes.length - 1; index >= 0; index -= 1) {
+    const route = routes[index];
+    if (route.maxCompletion != null && route.maxCompletion < largestCap) {
+      rejected.push({ id: route.id, reason: 'completion-cap', maxCompletion: route.maxCompletion, cap: largestCap });
+      routes.splice(index, 1);
+    }
+  }
   if (routes.length < COUNCIL_SIZE) throw new Error(`Only ${routes.length} paid routes qualified.`);
-  const synthesisTokens = (SELF_SAMPLES * STAGE_CAPS.stage1) + 4000;
+  const synthesisTokens = (SELF_SAMPLES * caps.stage1) + 4000;
   for (const route of routes.slice(0, SHORTLIST_LIMIT)) {
     const fits = route.context == null || synthesisTokens <= route.context;
     const quote = quoteReservation({
       pricing: route.pricing,
       promptTokens: Math.min(synthesisTokens, route.context || synthesisTokens),
-      maxTokens: STAGE_CAPS.stage3,
+      maxTokens: caps.stage3,
     });
     console.log(
       `preflight synthesis ${route.id} fits=${fits} `
@@ -538,7 +588,7 @@ async function preflight(campaignPaths, live) {
   writeJson(campaignPaths.preflight, preflightDoc);
   const campaign = existing || {
     id: CAMPAIGN_ID,
-    ...profileDocument(),
+    ...profileDocument(caps),
     primaryPair: PRIMARY_PAIR,
     bankProtocolHash: bank.protocolHash,
     bankDigest: digest,
@@ -565,7 +615,7 @@ function installPaid(session, budget, routes) {
   });
 }
 
-function prepareFor(policy) {
+export function prepareFor(policy) {
   return (model, stage, options) => {
     const cap = policy.caps?.[stage];
     const route = policy.routes?.[model];
@@ -575,6 +625,9 @@ function prepareFor(policy) {
     if (route.temperature != null) next.temperature = route.temperature;
     if (route.topP != null) next.topP = route.topP;
     if (route.reasoning) next.reasoning = route.reasoning;
+    // The deadline is a client setting, not a request field, so it does not
+    // enter the request hash and a replayed slot still matches.
+    if (policy.timeout) next.timeout = policy.timeout;
     return next;
   };
 }
@@ -705,7 +758,7 @@ async function runProbe(campaignPaths) {
   const session = createSession({
     runDir: campaignPaths.probe,
     budget,
-    prepareOptions: prepareFor(policyFrom({ routes })),
+    prepareOptions: prepareFor(policyFrom({ routes }, campaign)),
     maxInFlight: active.length,
     ...sessionBudget(),
   });
@@ -816,7 +869,7 @@ async function runDev(campaignPaths, run) {
   const session = createSession({
     runDir: devDir,
     budget,
-    prepareOptions: prepareFor(policyFrom({ routes })),
+    prepareOptions: prepareFor(policyFrom({ routes }, campaign)),
     maxInFlight: run.inFlight,
     maxInFlightPerModel: run.modelInFlight,
     ...sessionBudget(replay),
@@ -992,7 +1045,7 @@ async function runPipeline(campaignPaths, phase, run) {
   const session = createSession({
     runDir: dir,
     budget,
-    prepareOptions: prepareFor(policyFrom({ routes })),
+    prepareOptions: prepareFor(policyFrom({ routes }, campaign)),
     maxInFlight: run.inFlight,
     maxInFlightPerModel: run.modelInFlight,
     ...sessionBudget(replay),
@@ -1103,6 +1156,9 @@ async function report(campaignPaths) {
     priorSpend,
     reuse,
     armRules: campaign.armRules || null,
+    stageCaps: campaign.stageCaps || null,
+    streamTimeoutSeconds: campaign.streamTimeoutSeconds ?? null,
+    secondaryPairs: campaign.secondaryPairs || null,
     history: historicalNote(),
     note: pause
       ? `Stop: ${pause.reason}. Questions left for that reason stay pending and are not scored incorrect.`
@@ -1119,6 +1175,9 @@ async function report(campaignPaths) {
     priorSpend,
     reuse,
     replayFrom: campaign.replayFrom || [],
+    stageCaps: campaign.stageCaps || null,
+    streamTimeoutSeconds: campaign.streamTimeoutSeconds ?? null,
+    sourceDifferences: campaign.sourceDifferences || {},
   });
   console.log(text);
   console.log(`Wrote ${path.join(campaignPaths.reports, 'report.md')}`);
@@ -1139,10 +1198,21 @@ export async function runA8Command(argv) {
   const maxPosts = flagValue(argv, '--max-posts');
   const campaignPaths = pathsFor(runId);
   mkdirSync(campaignPaths.dir, { recursive: true });
+  // Caps are chosen once, at preflight, and then read from campaign.json.
+  const capFlags = {
+    stage2: positiveFlag(argv, '--stage2-cap', null),
+    stage3: positiveFlag(argv, '--final-cap', null),
+  };
+  const caps = capsFrom(capFlags);
   const existing = readJson(campaignPaths.campaign);
   if (existing) {
     if (maxUsd != null && Number(maxUsd) !== existing.maxUsd) throw new Error('Refusing to change maxUsd on an existing campaign.');
     if (maxPosts != null && Number(maxPosts) !== existing.maxPosts) throw new Error('Refusing to change maxPosts on an existing campaign.');
+    for (const [stage, value] of Object.entries(capFlags)) {
+      if (value != null && existing.stageCaps?.[stage] !== value) {
+        throw new Error(`This campaign caps ${stage} at ${existing.stageCaps?.[stage]}. Caps are fixed at preflight.`);
+      }
+    }
   } else if (phase !== 'preflight') {
     throw new Error('Run preflight before this phase.');
   } else if (maxUsd != null && Number(maxUsd) !== MAX_USD) {
@@ -1161,8 +1231,8 @@ export async function runA8Command(argv) {
   const release = acquireLock(campaignPaths.dir);
   try {
     if (phase === 'preflight') {
-      if (from) return await inheritPreflight(campaignPaths, runId, from);
-      return await preflight(campaignPaths, live);
+      if (from) return await inheritPreflight(campaignPaths, runId, from, caps);
+      return await preflight(campaignPaths, live, caps);
     }
     if (phase === 'report') return await report(campaignPaths);
     if (!live) throw new Error(`${phase} posts only with --live`);

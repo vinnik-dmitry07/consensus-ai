@@ -61,4 +61,18 @@ npm --prefix frontend run eval -- a8 --phase test --run a8-open-v3 --live
 npm --prefix frontend run eval -- a8 --phase report --run a8-open-v3
 ```
 
+`a8-open-v4` проверяет, что именно потерял конвейер в v3. Там 155 из 360 ответов судей упёрлись в лимит 4096 токенов, 81 не дошёл до строки `FINAL RANKING`, а синтез A8 обрезался на 8192 токенах в 22 вопросах против 13 у S8; все обрезанные ответы получили ноль. В v4 лимиты Stage 2 и обоих синтезов задаются на preflight флагами `--stage2-cap` и `--final-cap` и закрепляются в `campaign.json`; лимит Stage 1 и генераций B не меняется, поэтому эти слоты берутся из v1–v3 по hash запроса, а Stage 2 и синтезы вызываются заново. Дедлайн потока растёт вместе с самым большим лимитом (`streamTimeoutSeconds`, из расчёта 8 токенов в секунду плюс 120 с на заголовки), иначе движок обрывал бы длинный ответ по своим 600 с. Дедлайн не входит в тело запроса и в hash. Preflight отказывает, если какой-то маршрут не может выдать новый лимит. Источник с другими лимитами допускается: разница записывается в `campaign.json` (`sourceDifferences`), а защита от чужого слота остаётся за hash.
+
+Новая рука P8 — большинство по трём ответам Stage 1 совета, без дополнительных вызовов; ответ без разбираемой последней строки воздерживается, ничья решается seeded hash, как A4 в `main`. Правило неполного состава у P8 то же, что у A8. Primary-пара прежняя: A8 против S8. Пары P8 против S8 и P8 против A8 вторичные, с одной поправкой Холма на семью; они не заменяют основной вывод. В v3 такое большинство дало бы 103 из 120, столько же, сколько S8.
+
+```text
+npm --prefix frontend run eval -- a8 --phase preflight --run a8-open-v4 --from a8-open-v1,a8-open-v2,a8-open-v3 --stage2-cap 16384 --final-cap 16384
+npm --prefix frontend run eval -- a8 --phase probe --run a8-open-v4 --live
+npm --prefix frontend run eval -- a8 --phase dev --run a8-open-v4 --live
+npm --prefix frontend run eval -- a8 --phase smoke --run a8-open-v4 --live
+npm --prefix frontend run eval -- a8 --phase pilot --run a8-open-v4 --live
+npm --prefix frontend run eval -- a8 --phase test --run a8-open-v4 --live
+npm --prefix frontend run eval -- a8 --phase report --run a8-open-v4
+```
+
 `complete` запускается после repair на все 120 вопросов. Однозначный ответ, записанный не в строгом формате (жирный `ANSWER`, скобки, `\boxed{}`, строка `ANSWER` не последняя, последняя строка «the answer is X»), читается из уже полученного текста и не запрашивается снова. Ячейка, в которой ответа нет, рисуется заново тем же запросом и тем же endpoint, до `--attempts` раз (по умолчанию 3). Stage 2, red team и Stage 3 повторяются из журнала repair без новых вызовов: новый розыгрыш Stage 1 меняет только оценку ячеек, которые его читают. Результат пишется в `frontend/eval/.runs/<id>/complete/` и не меняет as-run и repair. `--max-usd` по умолчанию 20, `--max-posts` по умолчанию 600, `--jobs` по умолчанию 4. `--cooldown-seconds` ограничивает паузу после upstream 429 (без флага остаётся обычные 10 минут). `--deadline-minutes` держит процесс живым и повторяет охлаждённые ячейки до абсолютного срока, записанного в state; после срока ячейка, которую провайдер всё ещё не отдаёт, считается неверной с пометкой provider unavailable, а голос A4 собирается из остальных ответов. Код 2 — пауза по лимиту или сети.
