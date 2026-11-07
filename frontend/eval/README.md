@@ -110,6 +110,8 @@ npm --prefix frontend run eval -- a8 --phase report --run a8-open-v4
 
 v5 — отдельная кампания со своим бюджетом. Она берёт у v4 только снимок маршрутов (`--routes-from a8-open-v4`): ни один слот не переиспользуется, расход v1–v4 не переносится. Потолок задаётся на preflight (`--max-usd 100 --max-posts 6000`) и потом не меняется.
 
+Кампания `a8-open-v5` остановилась на probe: OpenRouter отклонил отозванный ключ (HTTP 401 на всех маршрутах, $0, 5 POST), а постоянную паузу `auth` тогда нечем было снять. Она сохранена как прерванная запись. Измерение идёт под `a8-open-v5b` с тем же протоколом и банком, на коммите со снятием пауз.
+
 **Вопрос.** Как различается точность двух замороженных конвейеров, A8 v5 и S8 v5, на выбранной смеси новых задач при заданных лимитах, маршрутах и правилах повторов и разбора. Это сравнение полных систем. Эффект совета, разнообразия моделей, лимитов или детектора отдельно не измеряется, а один общий `max_tokens` не делает денежные и вычислительные бюджеты равными. Условия приёмки:
 
 - **R1.** Все новые вопросы получили терминальные исходы обеих рук, и прежние вопросы не тратили бюджет раньше этого.
@@ -126,7 +128,7 @@ v5 — отдельная кампания со своим бюджетом. О�
 
 Probe подтверждает, что маршрут принимает запрос с `max_tokens` 32768: завершённый поток с `usage`, а не только HTTP 200. Что модель способна дописать до 32768, он не проверяет. В v5 probe не заменяет маршрут сам. Пока лимит не подтверждён на всех маршрутах, probe не считается законченным и dev не стартует. Повторный запуск probe опрашивает только неподтверждённые маршруты, новой попыткой того же запроса. Если маршрут отвечает 400 или 404, лимит этой кампании ему не подходит; лимиты фиксируются на preflight, поэтому нужна новая кампания с явными флагами лимитов.
 
-**Попытки и POST.** На слот приходится не больше двух попыток, дошедших до провайдера, вместе с повторами после цикла, сети и 429; счётчик сохраняется после resume. Отказ 402 «кредит на запросы в полёте» бесплатен и случается до провайдера. Транспорт повторяет такой POST один раз за запуск слота; это не попытка модели, но POST входит в предел кампании, а отчёт его показывает. Второй такой отказ в том же запуске ставит кампанию на паузу. С учётом resume на слот приходится не больше четырёх физических POST. Нулевую стоимость получают только классифицированные отказы до провайдера; неизвестный 402 не освобождается.
+**Попытки и POST.** На слот приходится не больше двух попыток, дошедших до провайдера, вместе с повторами после цикла, сети и 429; счётчик сохраняется после resume. Отказ 402 «кредит на запросы в полёте» бесплатен и случается до провайдера. Транспорт повторяет такой POST один раз за запуск слота; это не попытка модели, но POST входит в предел кампании, а отчёт его показывает. Второй такой отказ в том же запуске ставит кампанию на паузу. Пауза из-за ключа, лимита ключа или баланса (`auth`, `key_budget`, `insufficient_funds`) переживает перезапуск и снимается в начале следующей фазы, только если OpenRouter показывает, что причина устранена: ключ отвечает 200, у ключа остался лимит или на счёте есть деньги. Доказательство пишется в журнал бюджета; непонятный отказ оплаты (`payment_unknown`) ждёт человека. С учётом resume на слот приходится не больше четырёх физических POST. Нулевую стоимость получают только классифицированные отказы до провайдера; неизвестный 402 не освобождается.
 
 **Защита от цикла.** Опция движка `loopGuard` по умолчанию выключена, продукт её не включает. Она сравнивает последние 4000 символов рассуждения с 24000 символами перед ними по шинглам длиной 40. Проверки идут на фиксированных позициях накопленного текста, 6000, 8000 и дальше через 2000, и каждая пересечённая позиция проверяется, поэтому срабатывание и его позиция не зависят от того, как сеть порезала поток. Срабатывание — 80% совпадений на двух проверках подряд. У рассуждения и видимого текста отдельные детекторы; канал рассуждения закрепляется за первым появившимся (провайдеры дублируют его в `reasoning` и `reasoning_details`).
 
@@ -206,16 +208,16 @@ Probe подтверждает, что маршрут принимает зап�
 
 ```text
 npm --prefix frontend run eval -- a8 --phase prepare
-npm --prefix frontend run eval -- a8 --phase preflight --run a8-open-v5 --routes-from a8-open-v4 --caps max --blocks rgym,amc,arxiv,hmmt,livemath --max-usd 100 --max-posts 6000
-npm --prefix frontend run eval -- a8 --phase probe --run a8-open-v5 --live
-npm --prefix frontend run eval -- a8 --phase dev --run a8-open-v5 --live
-npm --prefix frontend run eval -- a8 --phase smoke --run a8-open-v5 --live
-npm --prefix frontend run eval -- a8 --phase loops --run a8-open-v5 --of smoke
+npm --prefix frontend run eval -- a8 --phase preflight --run a8-open-v5b --routes-from a8-open-v4 --caps max --blocks rgym,amc,arxiv,hmmt,livemath --max-usd 100 --max-posts 6000
+npm --prefix frontend run eval -- a8 --phase probe --run a8-open-v5b --live
+npm --prefix frontend run eval -- a8 --phase dev --run a8-open-v5b --live
+npm --prefix frontend run eval -- a8 --phase smoke --run a8-open-v5b --live
+npm --prefix frontend run eval -- a8 --phase loops --run a8-open-v5b --of smoke
 npm --prefix frontend run eval -- a8 --phase reconcile --run a8-open-v5
-npm --prefix frontend run eval -- a8 --phase reconcile --run a8-open-v5 --self-test --live
-npm --prefix frontend run eval -- a8 --phase pilot --run a8-open-v5 --live
-npm --prefix frontend run eval -- a8 --phase loops --run a8-open-v5 --of pilot
-npm --prefix frontend run eval -- a8 --phase test --run a8-open-v5 --live --jobs 12 --model-in-flight 12
+npm --prefix frontend run eval -- a8 --phase reconcile --run a8-open-v5b --self-test --live
+npm --prefix frontend run eval -- a8 --phase pilot --run a8-open-v5b --live
+npm --prefix frontend run eval -- a8 --phase loops --run a8-open-v5b --of pilot
+npm --prefix frontend run eval -- a8 --phase test --run a8-open-v5b --live --jobs 12 --model-in-flight 12
 npm --prefix frontend run eval -- a8 --phase reconcile --run a8-open-v5
 npm --prefix frontend run eval -- a8 --phase report --run a8-open-v5
 ```

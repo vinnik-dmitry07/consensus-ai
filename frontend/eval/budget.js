@@ -441,6 +441,10 @@ export function createCampaignBudget(options = {}) {
             state.paused = true;
             state.pauseReason = event.reason;
             state.resumeAfter = event.resumeAfter ?? null;
+          } else if (event.kind === 'resume' && state.paused && !state.fatal && state.pauseReason === event.reason) {
+            state.paused = false;
+            state.pauseReason = null;
+            state.resumeAfter = null;
           }
         }
       } finally {
@@ -452,6 +456,17 @@ export function createCampaignBudget(options = {}) {
       state.pauseReason = reason;
       state.resumeAfter = resumeAfter;
       if (DURABLE_PAUSE.has(reason)) remember({ kind: 'pause', reason, resumeAfter });
+    },
+    // Lifts a durable pause (auth, key budget, funds) once a person fixed its
+    // cause and the caller has evidence of that. The evidence goes into the
+    // journal, so a restart replays the lift. A fatal stop never lifts.
+    resumeDurable({ reason, evidence }) {
+      if (!state.paused || state.fatal || state.pauseReason !== reason || !DURABLE_PAUSE.has(reason)) return { applied: false };
+      state.paused = false;
+      state.pauseReason = null;
+      state.resumeAfter = null;
+      remember({ kind: 'resume', reason, evidence: evidence || null, at: new Date().toISOString() });
+      return { applied: true };
     },
     isTransientPause() {
       return state.paused && !state.fatal && isTransientReason(state.pauseReason);

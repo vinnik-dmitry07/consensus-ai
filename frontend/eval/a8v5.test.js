@@ -10,6 +10,7 @@ import {
   armCosts,
   bankCounts,
   confirmsCap,
+  durablePauseCure,
   gitState,
   interleave,
   loopReview,
@@ -335,6 +336,46 @@ describe('v5 probe rounds', () => {
     expect(after).toMatchObject({ allConfirmed: true, done: true });
     // A campaign that does not require confirmation finishes either way.
     expect(probeOutcome(rows, first.active, false).done).toBe(true);
+  });
+});
+
+describe('v5 durable pauses', () => {
+  const PRICES = { m: { prompt: '0.000001', completion: '0.000001' } };
+
+  it('lifts a durable pause only with evidence, and replays the lift after a restart', () => {
+    const events = [];
+    const budget = createCampaignBudget({ maxUsd: 10, maxPosts: 10, prices: PRICES, onEvent: (event) => events.push(event) });
+    budget.pause('auth');
+    expect(budget.resumeDurable({ reason: 'key_budget', evidence: 'x' }).applied).toBe(false);
+    expect(budget.state.paused).toBe(true);
+    expect(budget.resumeDurable({ reason: 'auth', evidence: 'GET /api/v1/key answered 200' }).applied).toBe(true);
+    expect(budget.state.paused).toBe(false);
+    expect(events.map((event) => event.kind)).toEqual(['pause', 'resume']);
+    // A restart replays both: the pause, then its lift.
+    const again = createCampaignBudget({ maxUsd: 10, maxPosts: 10, prices: PRICES });
+    again.applyJournal(events);
+    expect(again.state.paused).toBe(false);
+    // Without the lift the pause survives a restart, as before.
+    const stuck = createCampaignBudget({ maxUsd: 10, maxPosts: 10, prices: PRICES });
+    stuck.applyJournal(events.slice(0, 1));
+    expect(stuck.state).toMatchObject({ paused: true, pauseReason: 'auth' });
+    // A fatal stop never lifts.
+    stuck.lockFatal('invariant');
+    expect(stuck.resumeDurable({ reason: 'auth', evidence: 'x' }).applied).toBe(false);
+  });
+
+  it('cures a pause only when OpenRouter shows its cause gone', () => {
+    const key = (data, status = 200) => ({ status, body: { data } });
+    expect(durablePauseCure('auth', key({ usage: 0 }))).toMatchObject({ cured: true });
+    expect(durablePauseCure('auth', key({}, 401)).cured).toBe(false);
+    expect(durablePauseCure('key_budget', key({ limit_remaining: 0 })).cured).toBe(false);
+    expect(durablePauseCure('key_budget', key({ limit_remaining: 12.5 }))).toMatchObject({ cured: true, evidence: 'key limit remaining 12.50' });
+    expect(durablePauseCure('key_budget', key({ limit_remaining: null })).cured).toBe(true);
+    const credits = (total, used) => ({ status: 200, body: { data: { total_credits: total, total_usage: used } } });
+    expect(durablePauseCure('insufficient_funds', key({}), credits(50, 50)).cured).toBe(false);
+    expect(durablePauseCure('insufficient_funds', key({}), credits(60, 50))).toMatchObject({ cured: true, evidence: 'account balance 10.00' });
+    expect(durablePauseCure('insufficient_funds', key({}), null).cured).toBe(false);
+    expect(durablePauseCure('payment_unknown', key({})).cured).toBe(false);
   });
 });
 

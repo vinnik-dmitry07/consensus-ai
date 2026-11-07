@@ -904,7 +904,55 @@ export async function reconcileBudget(campaignPaths, budget, {
   return summary;
 }
 
+const CREDITS_URL = 'https://openrouter.ai/api/v1/credits';
+const CURABLE_PAUSES = ['auth', 'key_budget', 'insufficient_funds'];
+
+// Whether OpenRouter shows the cause of a durable pause gone: the key works
+// again, the key has limit left, or the account has credit. An unknown payment
+// refusal stays for a person to read.
+export function durablePauseCure(reason, keyInfo, creditsInfo = null) {
+  const key = keyInfo?.status === 200 ? keyInfo.body?.data : null;
+  if (!CURABLE_PAUSES.includes(reason) || !key) return { cured: false };
+  if (reason === 'auth') return { cured: true, evidence: 'GET /api/v1/key answered 200' };
+  if (reason === 'key_budget') {
+    const left = key.limit_remaining;
+    return left == null || Number(left) > 0
+      ? { cured: true, evidence: `key limit remaining ${left == null ? 'unlimited' : Number(left).toFixed(2)}` }
+      : { cured: false };
+  }
+  const credits = creditsInfo?.status === 200 ? creditsInfo.body?.data : null;
+  const balance = credits ? Number(credits.total_credits) - Number(credits.total_usage) : NaN;
+  return Number.isFinite(balance) && balance > 0
+    ? { cured: true, evidence: `account balance ${balance.toFixed(2)}` }
+    : { cured: false };
+}
+
+// A durable pause waits for a person: a new key, a raised key limit, or more
+// credit. At the start of a phase it lifts only when OpenRouter shows the cause
+// gone, and the evidence is journaled; otherwise it stays.
+async function liftDurablePause(budget) {
+  if (!budget.state.paused || budget.state.fatal || !CURABLE_PAUSES.includes(budget.state.pauseReason)) return;
+  const reason = budget.state.pauseReason;
+  let keyInfo = null;
+  let creditsInfo = null;
+  try {
+    const key = loadPaidKey();
+    keyInfo = await fetchJson(OPENROUTER_KEY_URL, key);
+    if (reason === 'insufficient_funds') creditsInfo = await fetchJson(CREDITS_URL, key);
+  } catch (error) {
+    console.log(`budget: the ${reason} pause stays; the check failed: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  const cure = durablePauseCure(reason, keyInfo, creditsInfo);
+  if (cure.cured && budget.resumeDurable({ reason, evidence: cure.evidence }).applied) {
+    console.log(`budget: lifted the ${reason} pause (${cure.evidence})`);
+  } else {
+    console.log(`budget: the ${reason} pause stays; OpenRouter does not show its cause gone`);
+  }
+}
+
 async function phaseStart(campaignPaths, budget, phase) {
+  await liftDurablePause(budget);
   try {
     await reconcileBudget(campaignPaths, budget);
   } catch (error) {
