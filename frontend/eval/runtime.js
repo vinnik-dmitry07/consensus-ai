@@ -453,17 +453,21 @@ export function createSession({
       const transportDrop = (isNetworkMessage(result?.error?.message) || isNetworkMessage(result?.error?.kind))
         && result?.error?.status == null;
       if (transportDrop) {
+        // With every allowed attempt spent there is nothing left to retry, so
+        // the drop is the slot's final outcome instead of an endless unknown.
+        const exhausted = (current.httpAttempts || 0) >= attemptBudget;
+        const dropState = exhausted ? 'failed' : 'unknown';
         writeSlot(key, {
           ...current,
           key,
           meta: slotMeta,
           request,
-          state: 'unknown',
+          state: dropState,
           result,
           occupiedMs: Date.now() - started,
         });
         if (!budget.state.paused) budget.pause('network', Date.now() + NETWORK_BACKOFF_MS);
-        emit(`${slotMeta.branch} ${slotMeta.stage} ${slotMeta.model} sample ${slotMeta.sample}${attemptLabel(slotMeta)} unknown`);
+        emit(`${slotMeta.branch} ${slotMeta.stage} ${slotMeta.model} sample ${slotMeta.sample}${attemptLabel(slotMeta)} ${dropState}`);
         return result;
       }
       if (budget.state.paused && !result?.ok) {
@@ -482,6 +486,8 @@ export function createSession({
         request,
         state,
         result,
+        // A loop stop has no provider finish_reason; the engine names it.
+        finishReason: result?.finishReason ?? current.finishReason ?? null,
         completedOrdinal: ordinal,
         occupiedMs: Date.now() - started,
         usageKnown: current.usageKnown === true,

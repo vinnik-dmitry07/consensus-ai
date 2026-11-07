@@ -3,8 +3,19 @@ import { ANSWER_INSTRUCTIONS } from './protocol.js';
 const ANSWER_LINE = /^ANSWER:\s*(.*?)\s*$/i;
 const REFUSAL = /\b(i cannot|i can't|i can’t|i won't|i will not answer|as an ai)\b/i;
 
+// Instructions for the exact-number kind only. Integer and choice tasks keep
+// ANSWER_INSTRUCTIONS byte for byte, so their requests and hashes do not move.
+export const NUMBER_INSTRUCTIONS = [
+  'Answer the question. Put the final answer on the last line in exactly this form:',
+  'ANSWER: <answer>',
+  'The answer is one exact number: an integer, or a fraction p/q in lowest terms.',
+  'Do not write an expression, a decimal approximation, a unit, or more than one value.',
+  'Do not write anything after that line.',
+].join('\n');
+
 export function answerPrompt(task) {
-  const lines = [ANSWER_INSTRUCTIONS, '', 'Question:', task.stem];
+  const head = task.kind === 'number' ? NUMBER_INSTRUCTIONS : ANSWER_INSTRUCTIONS;
+  const lines = [head, '', 'Question:', task.stem];
   if (Array.isArray(task.options) && task.options.length) {
     lines.push('');
     for (const option of task.options) lines.push(`${option.letter}. ${option.text}`);
@@ -31,7 +42,75 @@ export function extractFinalAnswer(text) {
   return { status: 'ok', raw: match[1].trim() };
 }
 
+function bigGcd(left, right) {
+  let a = left < 0n ? -left : left;
+  let b = right < 0n ? -right : right;
+  while (b !== 0n) {
+    [a, b] = [b, a % b];
+  }
+  return a;
+}
+
+function unwrapNumber(raw) {
+  let text = String(raw ?? '').trim().replace(/−/g, '-');
+  let prev = null;
+  while (text !== prev) {
+    prev = text;
+    text = text.replace(/^\$+/, '').replace(/\$+$/, '').trim();
+    text = text.replace(/^\\\(/, '').replace(/\\\)$/, '').trim();
+    text = text.replace(/^\\\[/, '').replace(/\\\]$/, '').trim();
+    const boxed = text.match(/^\\boxed\{([\s\S]*)\}$/);
+    if (boxed) text = boxed[1].trim();
+    text = text.replace(/\.$/, '').trim();
+  }
+  // Spacing around a sign, a slash, or braces is formatting. Space between
+  // two digit runs is not removed: "2 3" stays two values and fails.
+  return text
+    .replace(/\\[,;!]/g, '')
+    .replace(/^([+-])\s+/, '$1')
+    .replace(/\s*\/\s*/g, '/')
+    .replace(/\{\s+/g, '{')
+    .replace(/\s+\}/g, '}')
+    .replace(/\}\s+\{/g, '}{');
+}
+
+function rational(sign, numerator, denominator) {
+  const q = BigInt(denominator);
+  if (q === 0n) return null;
+  let p = BigInt(numerator);
+  if (sign === '-') p = -p;
+  if (p === 0n) return '0';
+  const divisor = bigGcd(p, q);
+  p /= divisor;
+  const reduced = q / divisor;
+  return reduced === 1n ? p.toString() : `${p.toString()}/${reduced.toString()}`;
+}
+
+// Exact canonical form of one number: an integer of any size and sign, or a
+// reduced fraction with a positive denominator. Expressions, several values,
+// and division by zero give null.
+export function canonNumber(raw) {
+  const text = unwrapNumber(raw);
+  if (!text) return null;
+  let match = text.match(/^([+-]?)(\d+)$/);
+  if (match) return rational(match[1], match[2], '1');
+  match = text.match(/^([+-]?)(\d+)\/(\d+)$/);
+  if (match) return rational(match[1], match[2], match[3]);
+  match = text.match(/^([+-]?)\\[dt]?frac\{([+-]?)(\d+)\}\{(\d+)\}$/);
+  if (match) {
+    const negative = (match[1] === '-') !== (match[2] === '-');
+    return rational(negative ? '-' : '+', match[3], match[4]);
+  }
+  match = text.match(/^([+-]?)(\d*)\.(\d+)$/);
+  if (match) {
+    const digits = `${match[2] || '0'}${match[3]}`;
+    return rational(match[1], digits, `1${'0'.repeat(match[3].length)}`);
+  }
+  return null;
+}
+
 export function canonAnswer(raw, task) {
+  if (task.kind === 'number') return canonNumber(raw);
   if (task.kind === 'integer') {
     if (!/^\d{1,3}$/.test(raw)) return null;
     const value = Number(raw);
@@ -140,6 +219,10 @@ function readInteger(text) {
 }
 
 function parsePayload(raw, task) {
+  if (task.kind === 'number') {
+    const value = canonNumber(raw) ?? canonNumber(stripDecorations(raw));
+    return { value, ambiguous: false };
+  }
   const text = stripDecorations(raw);
   if (!text) return { value: null, ambiguous: false };
   if (task.kind === 'integer') return readInteger(text);
@@ -167,6 +250,9 @@ function answerPayloads(text) {
 }
 
 function immediateCandidate(fragment, task) {
+  if (task.kind === 'number') {
+    return { value: canonNumber(String(fragment || '').replace(/^[:\-–—]+\s*/, '')), ambiguous: false };
+  }
   const text = stripDecorations(fragment).replace(/^[:\-–—]+\s*/, '');
   if (!text) return { value: null, ambiguous: false };
   if (task.kind === 'integer') return readInteger(text);
@@ -259,6 +345,8 @@ export function failureKind(result) {
   const kind = result.error?.kind;
   if (kind === 'first-response' || kind === 'idle' || kind === 'total') return 'timeout';
   if (kind === 'aborted') return 'aborted';
+  if (kind === 'context') return 'context';
+  if (kind === 'loop') return 'loop';
   const message = `${result.error?.message || ''} ${result.error?.detail || ''}`.toLowerCase();
   if (message.includes('stream ended') || message.includes('protocol')) return 'truncated';
   if (result.finishReason === 'length') return 'truncated';

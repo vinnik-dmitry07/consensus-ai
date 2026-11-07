@@ -348,6 +348,43 @@ export function createCampaignBudget(options = {}) {
       }
       return { cost: row.cost, unresolved: row.unresolved === true };
     },
+    // Replaces an unresolved reserve with the cost OpenRouter reports for that
+    // attempt's generation. Only an unresolved row changes, so a second
+    // reconcile of the same attempt does nothing. POST counts never change.
+    resettle({ attemptId, cost, source = null }) {
+      const row = state.reservations[attemptId];
+      const value = Number(cost);
+      if (!row || !row.settled || !row.unresolved) return { applied: false };
+      if (cost == null || !Number.isFinite(value) || value < 0) return { applied: false };
+      state.unresolvedUsd = Math.max(0, state.unresolvedUsd - row.usd);
+      state.settledUsd += value;
+      row.unresolved = false;
+      row.cost = value;
+      row.resettled = true;
+      remember({
+        kind: 'resettle',
+        attemptId,
+        cost: value,
+        source,
+        settledUsd: state.settledUsd,
+        unresolvedUsd: state.unresolvedUsd,
+      });
+      notify();
+      return { applied: true, cost: value };
+    },
+    // Key-level spend snapshot. It is an audit only: other requests on the
+    // key and billing delay make it unusable for releasing one reserve.
+    audit(snapshot = {}) {
+      const event = { kind: 'audit', at: new Date().toISOString(), ...snapshot };
+      state.lastAudit = event;
+      remember(event);
+      return event;
+    },
+    unresolvedAttempts() {
+      return Object.entries(state.reservations)
+        .filter(([, row]) => row && row.settled && row.unresolved)
+        .map(([attemptId, row]) => ({ attemptId, ...row }));
+    },
     waitForChange() {
       return new Promise((resolve) => waiters.push(resolve));
     },
@@ -390,6 +427,16 @@ export function createCampaignBudget(options = {}) {
               row.unresolved = false;
               row.cost = Number(event.cost);
             }
+          } else if (event.kind === 'resettle') {
+            const row = state.reservations[event.attemptId];
+            if (!row || !row.settled || !row.unresolved) continue;
+            state.unresolvedUsd = Math.max(0, state.unresolvedUsd - row.usd);
+            state.settledUsd += Number(event.cost);
+            row.unresolved = false;
+            row.cost = Number(event.cost);
+            row.resettled = true;
+          } else if (event.kind === 'audit') {
+            state.lastAudit = event;
           } else if (event.kind === 'pause' && DURABLE_PAUSE.has(event.reason)) {
             state.paused = true;
             state.pauseReason = event.reason;

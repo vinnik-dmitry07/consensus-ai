@@ -24,6 +24,7 @@ import {
   rememberModelCooldown,
 } from './roster.js';
 import { settings } from './settings.js';
+import { createLoopDetector } from './loopGuard.js';
 
 export const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
 export const OPENROUTER_CREDITS_URL = 'https://openrouter.ai/api/v1/credits';
@@ -674,13 +675,100 @@ function visibleStreamText(target) {
   return visibleReasoningText({ reasoning_details: [...target.details.values()] });
 }
 
-function successFromTarget(target, content, usage) {
+function successFromTarget(target, content, usage, annotations = null) {
   const details = [...target.details.values()];
-  return {
+  const result = {
     ok: true,
     content,
     reasoning_details: details.length ? details : undefined,
     usage: usageCounts(usage),
+  };
+  // Eval-only provenance. The product result keeps its old shape.
+  if (annotations) {
+    if (!hasVisibleContent(target.content)) result.contentFromReasoning = true;
+    if (annotations.finishReason) result.providerFinishReason = annotations.finishReason;
+  }
+  return result;
+}
+
+function detailsText(target) {
+  return visibleReasoningText({ reasoning_details: [...target.details.values()] });
+}
+
+function detailsLength(target) {
+  let total = 0;
+  for (const item of target.details.values()) {
+    if (!item || String(item.type || '').includes('encrypted')) continue;
+    for (const key of ['text', 'summary', 'content']) {
+      if (typeof item[key] === 'string' && item[key]) {
+        total += item[key].length;
+        break;
+      }
+    }
+  }
+  return total;
+}
+
+// One canonical reasoning channel: providers send the same text in
+// `reasoning` and `reasoning_details`, and feeding both would double it. The
+// channel is fixed at its first text so later chunks cannot switch it.
+const REASONING_CHANNELS = {
+  reasoning: { length: (target) => target.reasoning.length, text: (target) => target.reasoning },
+  reasoningContent: {
+    length: (target) => target.reasoningContent.length,
+    text: (target) => target.reasoningContent,
+  },
+  details: { length: detailsLength, text: detailsText },
+};
+
+function pickReasoningChannel(target) {
+  if (target.reasoning) return 'reasoning';
+  if (target.reasoningContent) return 'reasoningContent';
+  if (detailsLength(target) > 0) return 'details';
+  return null;
+}
+
+function createStreamLoopGuard(config) {
+  const reasoning = createLoopDetector(config);
+  const content = createLoopDetector(config);
+  if (!reasoning) return null;
+  let channel = null;
+  return {
+    check(target) {
+      if (!channel) channel = pickReasoningChannel(target);
+      if (channel) {
+        const reader = REASONING_CHANNELS[channel];
+        if (reader.length(target) >= reasoning.next) {
+          const hit = reasoning.observe(reader.text(target));
+          if (hit) return { channel, ...hit };
+        }
+      }
+      if (target.content.length >= content.next) {
+        const hit = content.observe(target.content);
+        if (hit) return { channel: 'content', ...hit };
+      }
+      return null;
+    },
+  };
+}
+
+// A stream the loop guard stopped. The caller retries it while attempts
+// remain; on the last attempt it keeps the text read so far.
+function loopTerminal(target, usage, loop, annotations) {
+  const content = visibleStreamText(target);
+  const partial = hasVisibleContent(content)
+    ? {
+      ...successFromTarget(target, content, usage, annotations || {}),
+      loopCut: true,
+      finishReason: 'loop',
+      loop,
+    }
+    : { ...failResult('loop', null, 'Repetition loop before any text', 'loop'), loop };
+  return {
+    ok: false,
+    loop,
+    partial,
+    error: { status: null, message: 'loop', detail: `repetition in ${loop.channel} at ${loop.position}`, kind: 'loop' },
   };
 }
 
@@ -722,13 +810,15 @@ function providerFinish(reason) {
   return null;
 }
 
-function createStreamParser() {
+function createStreamParser(streamOptions = {}) {
   let carry = '';
   let dataLines = [];
   let eventName = '';
   let sawDelta = false;
   const target = emptyTarget();
   let usage = null;
+  const annotations = streamOptions.annotate ? { finishReason: null } : null;
+  const guard = streamOptions.loopGuard ? createStreamLoopGuard(streamOptions.loopGuard) : null;
 
   const consumeParsed = (parsed) => {
     if (parsed?.error) return providerFailure(parsed.error);
@@ -736,12 +826,17 @@ function createStreamParser() {
     const choice = parsed?.choices?.[0];
     if (!choice || typeof choice !== 'object') return null;
     if (choice.error) return providerFailure(choice.error);
+    if (annotations && choice.finish_reason) annotations.finishReason = choice.finish_reason;
     const finished = providerFinish(choice.finish_reason);
     if (finished) return finished;
     if (choice.delta && typeof choice.delta === 'object') {
       sawDelta = true;
       if (choice.delta.tool_calls) return toolCallFailure();
       applyDelta(target, choice.delta);
+      if (guard) {
+        const loop = guard.check(target);
+        if (loop) return loopTerminal(target, usage, loop, annotations);
+      }
       return null;
     }
     if (choice.message && typeof choice.message === 'object' && !sawDelta) {
@@ -770,7 +865,7 @@ function createStreamParser() {
     if (data.trim() === '[DONE]') {
       const content = visibleStreamText(target);
       if (!hasVisibleContent(content)) return failResult('Empty model response');
-      return successFromTarget(target, content, usage);
+      return successFromTarget(target, content, usage, annotations);
     }
     try {
       return consumeParsed(JSON.parse(data));
@@ -827,7 +922,7 @@ function readChunk(reader, signal) {
   });
 }
 
-async function readHttpBody(response, lifetime) {
+async function readHttpBody(response, lifetime, streamOptions = {}) {
   const streamed = response.ok && isEventStream(response);
   if (!response.body) {
     return streamed
@@ -836,7 +931,7 @@ async function readHttpBody(response, lifetime) {
   }
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  const parser = streamed ? createStreamParser() : null;
+  const parser = streamed ? createStreamParser(streamOptions) : null;
   let text = '';
   let terminal = null;
   try {
@@ -860,7 +955,9 @@ async function readHttpBody(response, lifetime) {
     if (!streamed) text += decoder.decode();
   } finally {
     try {
-      await reader.cancel();
+      // A loop stop cancels the connection with its own reason, so the
+      // transport records it apart from a network drop.
+      await reader.cancel(terminal?.loop ? 'loop' : undefined);
     } catch {
       // Cleanup must not replace the result.
     }
@@ -874,7 +971,7 @@ async function readHttpBody(response, lifetime) {
   return { text };
 }
 
-function jsonCompletion(text) {
+function jsonCompletion(text, annotate = false) {
   let data;
   try {
     data = JSON.parse(text);
@@ -891,14 +988,50 @@ function jsonCompletion(text) {
   if (!message || typeof message !== 'object') return failResult('Empty model response');
   if (message.tool_calls) return toolCallFailure();
   let content = message.content;
-  if (!hasVisibleContent(content)) content = visibleReasoningText(message);
+  const fromReasoning = !hasVisibleContent(content);
+  if (fromReasoning) content = visibleReasoningText(message);
   if (!hasVisibleContent(content)) return failResult('Empty model response');
-  return {
+  const result = {
     ok: true,
     content,
     reasoning_details: message.reasoning_details,
     usage: usageCounts(data.usage),
   };
+  if (annotate) {
+    if (fromReasoning) result.contentFromReasoning = true;
+    if (choice.finish_reason) result.providerFinishReason = choice.finish_reason;
+  }
+  return result;
+}
+
+// Conservative prompt size: two characters per token plus a margin per
+// message for the chat template. Used only when a caller passes the route's
+// context window; the product path never does.
+export const CONTEXT_CHARS_PER_TOKEN = 2;
+export const CONTEXT_MESSAGE_MARGIN = 64;
+export const CONTEXT_TEMPLATE_MARGIN = 1024;
+
+export function promptTokenEstimate(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  let chars = 0;
+  for (const message of list) chars += String(message?.content ?? '').length;
+  return Math.ceil(chars / CONTEXT_CHARS_PER_TOKEN)
+    + CONTEXT_MESSAGE_MARGIN * list.length
+    + CONTEXT_TEMPLATE_MARGIN;
+}
+
+function contextFailure(model, payload, contextTokens) {
+  const limit = Number(contextTokens);
+  if (!Number.isFinite(limit) || limit <= 0) return null;
+  const prompt = promptTokenEstimate(payload.messages);
+  const output = Number(payload.max_tokens) || 0;
+  if (prompt + output <= limit) return null;
+  return failResult(
+    'context',
+    null,
+    `Estimated prompt ${prompt} + max_tokens ${output} exceeds the ${limit}-token context of ${model}`,
+    'context',
+  );
 }
 
 async function queryModelAttempts(model, messages, options) {
@@ -919,11 +1052,18 @@ async function queryModelAttempts(model, messages, options) {
   };
 
   const payload = canonicalCompletionRequest(model, messages, options);
+  // The prompt is checked as built, before any POST. Nothing is cut to fit.
+  const tooLong = contextFailure(model, payload, options.contextTokens);
+  if (tooLong) return tooLong;
   const requestedRetries = Number(options.maxRetries);
   const maxRetries = Number.isInteger(requestedRetries) && requestedRetries > 0
     ? requestedRetries
     : 5;
   const free = isFreeModel(model);
+  const streamOptions = {
+    loopGuard: options.loopGuard || null,
+    annotate: options.evalAnnotations === true,
+  };
   let extraWaitMs = 0;
   for (let attempt = 0; attempt < maxRetries; attempt += 1) {
     const outcome = await runModelAttempt({
@@ -938,6 +1078,7 @@ async function queryModelAttempts(model, messages, options) {
       maxRetries,
       runId: options.runId || null,
       retainRoster: options.retainRoster === true,
+      streamOptions,
     });
     if (outcome.retry) {
       extraWaitMs = outcome.extraWaitMs;
@@ -959,6 +1100,7 @@ async function runModelAttempt({
   maxRetries,
   runId = null,
   retainRoster = false,
+  streamOptions = {},
 }) {
   let lifetime = null;
   try {
@@ -980,7 +1122,16 @@ async function runModelAttempt({
       signal: lifetime.signal,
     });
     lifetime.headersArrived();
-    const loaded = await readHttpBody(response, lifetime);
+    const loaded = await readHttpBody(response, lifetime, streamOptions);
+    if (loaded.stream?.loop) {
+      // One more attempt while the caller's limit allows it; the last
+      // attempt keeps the text it produced and is marked loopCut.
+      if (attempt < maxRetries - 1) {
+        console.error(`Repetition loop from ${model}, retrying once`);
+        return { retry: true, extraWaitMs: 0 };
+      }
+      return loaded.stream.partial;
+    }
     if (loaded.stream) {
       noteConfirmedUpstream(model, runId, loaded.stream.error);
       return loaded.stream;
@@ -1041,7 +1192,7 @@ async function runModelAttempt({
       return { ok: false, error };
     }
 
-    const parsed = jsonCompletion(loaded.text);
+    const parsed = jsonCompletion(loaded.text, streamOptions.annotate === true);
     noteConfirmedUpstream(model, runId, parsed.error);
     return parsed;
   } catch (exc) {

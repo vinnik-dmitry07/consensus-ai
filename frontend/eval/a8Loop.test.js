@@ -1,0 +1,229 @@
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import { queryModelResult } from '../src/engine/browser/openrouter.js';
+import { settings } from '../src/engine/browser/settings.js';
+import { loopReview } from './a8.js';
+import { createCampaignBudget } from './budget.js';
+import { createSession } from './runtime.js';
+import { attemptStore, generationIdFrom, installTransport } from './transport.js';
+
+const MODEL = 'alpha/one';
+const PRICES = { [MODEL]: { prompt: '0.000001', completion: '0.000001' } };
+const MESSAGES = [{ role: 'user', content: 'Count the pairs.' }];
+
+function prose(length, seed = 3) {
+  const words = ['basis', 'cyclic', 'divisor', 'graph', 'kernel', 'lemma', 'orbit', 'prime', 'ring', 'torus'];
+  let state = seed;
+  const out = [];
+  let size = 0;
+  while (size < length) {
+    state = (state * 1103515245 + 12345) % 2147483648;
+    const word = `${words[state % words.length]}${state % 991}`;
+    out.push(word);
+    size += word.length + 1;
+  }
+  return out.join(' ').slice(0, length);
+}
+
+// One SSE event per network chunk, delivered on demand, like a live stream:
+// a reader that stops early really leaves the rest unread.
+function sse(deltas, { usage = null, id = 'gen-abc123' } = {}) {
+  const events = deltas.map((delta) => `data: ${JSON.stringify({ id, choices: [{ delta }] })}\n\n`);
+  const last = { id, choices: [{ delta: {}, finish_reason: 'stop' }] };
+  if (usage) last.usage = usage;
+  events.push(`data: ${JSON.stringify(last)}\n\n`, 'data: [DONE]\n\n');
+  const encoder = new TextEncoder();
+  let index = 0;
+  const body = new ReadableStream({
+    pull(controller) {
+      if (index >= events.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(encoder.encode(events[index]));
+      index += 1;
+    },
+  });
+  return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+}
+
+function loopingStream(id) {
+  const paragraph = 'Recheck the residues once more and recount every pair from the start. ';
+  const text = `${prose(3000)} ${paragraph.repeat(400)}`;
+  const parts = [];
+  for (let index = 0; index < 30000; index += 500) parts.push({ reasoning: text.slice(index, index + 500) });
+  return sse(parts, { id });
+}
+
+function finishedStream(id) {
+  return sse([{ reasoning: prose(2000) }, { content: 'ANSWER: 12' }], {
+    id,
+    usage: { prompt_tokens: 10, completion_tokens: 600, total_tokens: 610, cost: 0.0006 },
+  });
+}
+
+function journal(runDir) {
+  return readFileSync(path.join(runDir, 'events.jsonl'), 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+}
+
+describe('loop guard through the eval session', () => {
+  const dirs = [];
+  let session = null;
+  let restore = () => {};
+
+  beforeEach(() => {
+    settings.apiKey = 'sk-user-test';
+  });
+
+  afterEach(() => {
+    session?.uninstall();
+    restore();
+    session = null;
+    restore = () => {};
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  function open(fetchImpl, { runDir = null, retryLimit = 2, contextTokens = null, budget = null } = {}) {
+    session?.uninstall();
+    restore();
+    const dir = runDir || mkdtempSync(path.join(tmpdir(), 'a8-loop-'));
+    if (!runDir) dirs.push(dir);
+    const ledger = budget || createCampaignBudget({ maxUsd: 10, maxPosts: 50, prices: PRICES });
+    session = createSession({
+      runDir: dir,
+      budget: ledger,
+      log() {},
+      retryLimit,
+      retainRoster: true,
+      prepareOptions: (model, stage, options) => ({
+        ...options,
+        maxTokens: 32768,
+        provider: { order: ['host'], allow_fallbacks: false },
+        loopGuard: true,
+        evalAnnotations: true,
+        ...(contextTokens ? { contextTokens } : {}),
+      }),
+    });
+    session.install();
+    const posts = [];
+    restore = installTransport({
+      nativeFetch: async (_url, init) => {
+        posts.push({ key: attemptStore.getStore()?.key || '', body: JSON.parse(init.body || '{}') });
+        return fetchImpl(posts.length);
+      },
+      allowModels: new Set([MODEL]),
+      allowPaid: true,
+      rejectFree: true,
+      budget: ledger,
+      onHttp: session.onHttp,
+      onCooldown: session.onCooldown,
+    });
+    session.setContext({ questionId: 'q1', branch: 'council', stage: 'stage2', sample: 1 });
+    return { runDir: dir, posts, budget: ledger };
+  }
+
+  it('retries a looping attempt once and books two posts', async () => {
+    const { runDir, posts, budget } = open((n) => (n === 1 ? loopingStream('gen-first') : finishedStream('gen-second')));
+    const result = await queryModelResult(MODEL, MESSAGES);
+    expect(result.ok).toBe(true);
+    expect(result.content).toBe('ANSWER: 12');
+    expect(posts).toHaveLength(2);
+    expect(budget.state.posts).toBe(2);
+    const slot = session.slots()[0];
+    expect(slot.state).toBe('completed');
+    expect(slot.httpAttempts).toBe(2);
+    const finished = journal(runDir).filter((event) => event.kind === 'http' && event.phase === 'finished');
+    expect(finished.map((event) => event.generationId)).toEqual(['gen-first', 'gen-second']);
+    expect(finished[0].cancelReason).toBe('loop');
+    expect(finished[0].incomplete).toBe(true);
+    expect(finished[1].cancelReason).toBeNull();
+    // The aborted attempt has no usage, so its reserve stays unresolved.
+    expect(budget.unresolvedAttempts().map((row) => row.attemptId)).toEqual([`${slot.key}#1`]);
+    // The review finds the stop in the real journal and rebuilds it offline.
+    const review = loopReview(runDir, true);
+    expect(review).toHaveLength(1);
+    expect(review[0]).toMatchObject({ attemptId: `${slot.key}#1`, channel: 'reasoning', reproduced: true, outcome: 'retried and finished' });
+  });
+
+  it('keeps the text of a second loop and never makes a third attempt', async () => {
+    const { runDir, posts, budget } = open(() => loopingStream('gen-loop'));
+    const result = await queryModelResult(MODEL, MESSAGES);
+    expect(posts).toHaveLength(2);
+    expect(result.ok).toBe(true);
+    expect(result.loopCut).toBe(true);
+    expect(result.contentFromReasoning).toBe(true);
+    const slot = session.slots()[0];
+    expect(slot.state).toBe('completed');
+    expect(slot.finishReason).toBe('loop');
+    expect(slot.httpAttempts).toBe(2);
+    const review = loopReview(runDir, true);
+    expect(review.map((row) => row.outcome)).toEqual(['kept after a second loop', 'kept after a second loop']);
+    expect(review[1].position).toBe(result.loop.position);
+    // A resumed run reads the stored outcome and posts nothing.
+    const again = open(() => loopingStream('gen-loop'), { runDir, budget });
+    const replayed = await queryModelResult(MODEL, MESSAGES);
+    expect(again.posts).toHaveLength(0);
+    expect(replayed.loopCut).toBe(true);
+    expect(budget.state.posts).toBe(2);
+  });
+
+  it('ends a slot as failed when the last allowed attempt drops on the network', async () => {
+    const { posts } = open(() => {
+      throw new TypeError('fetch failed');
+    }, { retryLimit: 1 });
+    const result = await queryModelResult(MODEL, MESSAGES);
+    expect(result.ok).toBe(false);
+    expect(posts).toHaveLength(1);
+    expect(session.slots()[0].state).toBe('failed');
+  });
+
+  it('refuses an oversized prompt before any post', async () => {
+    const { posts, budget } = open(() => finishedStream('gen-x'), { contextTokens: 1000 });
+    const result = await queryModelResult(MODEL, MESSAGES);
+    expect(result.ok).toBe(false);
+    expect(result.error.kind).toBe('context');
+    expect(posts).toHaveLength(0);
+    expect(budget.state.posts).toBe(0);
+    expect(session.slots()[0].state).toBe('failed');
+  });
+});
+
+describe('reconciling an unresolved reserve', () => {
+  it('applies the reported cost once and replays it from the journal', () => {
+    const events = [];
+    const budget = createCampaignBudget({ maxUsd: 10, maxPosts: 10, prices: PRICES, onEvent: (event) => events.push(event) });
+    expect(budget.admit({ attemptId: 'k#1', model: MODEL, promptTokens: 100, maxTokens: 1000 }).ok).toBe(true);
+    budget.settle({ attemptId: 'k#1', incomplete: true });
+    const held = budget.state.unresolvedUsd;
+    expect(held).toBeGreaterThan(0);
+    expect(budget.resettle({ attemptId: 'k#1', cost: 0.0002, source: 'generation' }).applied).toBe(true);
+    expect(budget.resettle({ attemptId: 'k#1', cost: 0.0002, source: 'generation' }).applied).toBe(false);
+    expect(budget.state.unresolvedUsd).toBeCloseTo(0, 12);
+    expect(budget.state.settledUsd).toBeCloseTo(0.0002, 12);
+    expect(budget.state.posts).toBe(1);
+    // A cost that is unknown never becomes zero.
+    expect(budget.resettle({ attemptId: 'k#1', cost: null }).applied).toBe(false);
+    const replayed = createCampaignBudget({ maxUsd: 10, maxPosts: 10, prices: PRICES });
+    replayed.applyJournal([...events, ...events]);
+    expect(replayed.state.settledUsd).toBeCloseTo(0.0002, 12);
+    expect(replayed.state.unresolvedUsd).toBeCloseTo(0, 12);
+    expect(replayed.state.posts).toBe(1);
+  });
+
+  it('does not touch a reserve whose cost was already known', () => {
+    const budget = createCampaignBudget({ maxUsd: 10, maxPosts: 10, prices: PRICES });
+    budget.admit({ attemptId: 'k#1', model: MODEL, promptTokens: 100, maxTokens: 1000 });
+    budget.settle({ attemptId: 'k#1', usage: { prompt_tokens: 10, completion_tokens: 10, cost: 0.00002 } });
+    const settled = budget.state.settledUsd;
+    expect(budget.resettle({ attemptId: 'k#1', cost: 1 }).applied).toBe(false);
+    expect(budget.state.settledUsd).toBe(settled);
+  });
+
+  it('reads the generation id from a stream body', () => {
+    expect(generationIdFrom('data: {"id":"gen-17-x","choices":[]}\n\n')).toBe('gen-17-x');
+    expect(generationIdFrom('{"error":{"message":"no"}}')).toBeNull();
+  });
+});

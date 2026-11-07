@@ -57,7 +57,7 @@ async function fetchJson(url, log) {
   throw new Error(`Gave up after retries for ${url}`);
 }
 
-async function fetchSplit(repo, config, split, log) {
+export async function fetchSplit(repo, config, split, log) {
   const rows = [];
   let offset = 0;
   const length = 100;

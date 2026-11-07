@@ -1,18 +1,28 @@
+import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { freeEndpointsUrl } from '../src/engine/browser/freeRoster.js';
+import { detectLoop, LOOP_GUARD_DEFAULTS } from '../src/engine/browser/loopGuard.js';
 import { catalogueEntry, OPENROUTER_KEY_URL, OPENROUTER_MODELS_URL, queryModelResult } from '../src/engine/browser/openrouter.js';
 import { settings } from '../src/engine/browser/settings.js';
 import { taskPublicId } from './datasets.js';
-import { answerPrompt, gradeResponse, failureKind } from './grade.js';
+import { answerPrompt, canonAnswer, gradeResponse, failureKind, LENIENT_RULES } from './grade.js';
 import { BudgetPaused, createCampaignBudget } from './budget.js';
 import { createSession, readSlotJournal, snapshotLocal } from './runtime.js';
 import { runIsolated } from './questionScope.js';
 import { installTransport } from './transport.js';
-import { runComparison } from './a8Variants.js';
-import { renderA8Report } from './a8Report.js';
+import { COMPARISON_BRANCHES, runComparison } from './a8Variants.js';
+import { applyGoldOverrides, lenientRows, renderA8Report, renderV5Report } from './a8Report.js';
+import {
+  chronologyGroup,
+  EXTENSION_BLOCKS,
+  LEGACY_BLOCKS,
+  orderBlocks,
+  primaryBlocksOf,
+} from './a8Blocks.js';
+import { extensionItemId, itemsDigest, legacyProvenance, loadExtensionBank, runPrepare } from './a8Prepare.js';
 import {
   CALLS_PER_QUESTION,
   CAMPAIGN_ID,
@@ -35,6 +45,9 @@ import {
   SMOKE_COUNT,
   STAGE_CAPS,
   capsFrom,
+  contextProblems,
+  maxCommonCap,
+  v5Policy,
 } from './a8Profile.js';
 import {
   chooseEndpoint,
@@ -52,7 +65,10 @@ const TEST_QUESTIONS = TEST_COUNTS.aime + TEST_COUNTS.gpqa + TEST_COUNTS.mmlu;
 const EVAL_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const RUNS_ROOT = path.join(EVAL_ROOT, '.runs');
 const BANK_PATH = path.join(EVAL_ROOT, '.cache', 'bank.json');
-const SOURCE_FILES = [
+// Every local module a8.js loads, directly or not. A test keeps this list
+// equal to the import closure, so no module that shapes a call, a schedule,
+// or a grade can change without changing the hash.
+export const SOURCE_FILES = [
   'a8.js',
   'a8Variants.js',
   'a8Report.js',
@@ -65,9 +81,36 @@ const SOURCE_FILES = [
   'protocol.js',
   'variants.js',
   'invariant.js',
+  'report.js',
+  'a8Blocks.js',
+  'a8Prepare.js',
+  'datasets.js',
+  'questionScope.js',
+  'sources.js',
+  'util.js',
   '../src/engine/browser/council.js',
   '../src/engine/browser/openrouter.js',
+  '../src/engine/browser/loopGuard.js',
+  '../src/engine/browser/roster.js',
+  '../src/engine/browser/settings.js',
+  '../src/engine/browser/freeRoster.js',
 ];
+
+// The commit the method runs on, and every hashed file that differs from it
+// or is not tracked. Preflight of an extended campaign refuses a dirty method:
+// the protocol commits the code first.
+export function gitState(files = SOURCE_FILES, cwd = EVAL_ROOT) {
+  const git = (args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    const head = git(['rev-parse', 'HEAD']).trim();
+    // Each porcelain line is "XY path"; X may be a space, so lines are not trimmed.
+    const status = git(['status', '--porcelain', '--untracked-files=all', '--', ...files]);
+    const dirty = status.split('\n').filter((line) => line.trim()).map((line) => line.slice(3).trim());
+    return { head, dirty };
+  } catch (error) {
+    return { head: null, dirty: null, error: error instanceof Error ? error.message : String(error) };
+  }
+}
 
 function readJson(file, fallback = null) {
   if (!existsSync(file)) return fallback;
@@ -131,14 +174,17 @@ export function sourceHash() {
   return sha256(parts.join('\n'));
 }
 
-function loadBank() {
+// The base bank as v1-v4 pinned it. An extended campaign adds the items of
+// its chosen extension blocks and pins their own digest beside this one.
+function loadBank(campaign = null) {
   const bank = readJson(BANK_PATH);
   if (!bank?.items) throw new Error('No cached bank. Run prepare first.');
-  const items = bank.items.map((item) => ({
+  const base = bank.items.map((item) => ({
     ...item,
     id: `${item.split}:${taskPublicId(item)}`,
+    provenance: item.provenance || legacyProvenance(item),
   }));
-  const digest = sha256(stableStringify(items.map((item) => ({
+  const digest = sha256(stableStringify(base.map((item) => ({
     split: item.split,
     block: item.block,
     dataset: item.dataset,
@@ -148,7 +194,24 @@ function loadBank() {
     fingerprint: item.fingerprint,
     choiceCount: item.choiceCount,
   }))));
-  return { bank, items, digest };
+  if (!campaign?.bankExtension) return { bank, items: base, digest, extensionDigest: null, extension: null };
+  const blocks = new Set(campaign.blocks || []);
+  const extension = loadExtensionBank();
+  const added = extension.items
+    .filter((item) => blocks.has(item.block))
+    .map((item) => ({ ...item, id: extensionItemId(item) }));
+  const items = [...base.filter((item) => blocks.has(item.block)), ...added];
+  return { bank, items, digest, extensionDigest: itemsDigest(added), extension };
+}
+
+export function bankCounts(items) {
+  const counts = { smoke: 0, dev: 0, test: 0, blocks: {} };
+  for (const item of items) {
+    counts[item.split] = (counts[item.split] || 0) + 1;
+    counts.blocks[item.block] ||= { dev: 0, smoke: 0, test: 0 };
+    counts.blocks[item.block][item.split] = (counts.blocks[item.block][item.split] || 0) + 1;
+  }
+  return counts;
 }
 
 function pathsFor(runId) {
@@ -162,6 +225,7 @@ function pathsFor(runId) {
     dev: path.join(dir, 'dev'),
     selection: path.join(dir, 'selection.json'),
     comparison: path.join(dir, 'comparison'),
+    reconcile: path.join(dir, 'reconcile'),
     reports: path.join(dir, 'reports'),
   };
 }
@@ -170,21 +234,32 @@ function questionFile(dir, id) {
   return path.join(dir, `${String(id).replace(/[^a-zA-Z0-9._-]+/g, '_')}.json`);
 }
 
-function interleave(items) {
-  const blocks = ['aime', 'gpqa', 'mmlu'];
-  const groups = Object.fromEntries(blocks.map((block) => [
-    block,
-    items.filter((item) => item.block === block).sort((left, right) => compareHash(SCHEDULE_SEED, left.id, right.id)),
-  ]));
+// Round-robin over every block present, each in seeded order. The loop is
+// bounded by the longest block, so an unknown or empty block cannot stall it,
+// and every item appears exactly once.
+export function interleave(items, seed = SCHEDULE_SEED) {
+  const blocks = orderBlocks(items.map((item) => item.block));
+  const groups = blocks.map((block) => (
+    items.filter((item) => item.block === block).sort((left, right) => compareHash(seed, left.id, right.id))
+  ));
+  const longest = Math.max(0, ...groups.map((group) => group.length));
   const order = [];
-  let index = 0;
-  while (order.length < items.length) {
-    for (const block of blocks) {
-      if (groups[block][index]) order.push(groups[block][index]);
+  for (let index = 0; index < longest; index += 1) {
+    for (const group of groups) {
+      if (group[index]) order.push(group[index]);
     }
-    index += 1;
   }
   return order;
+}
+
+// Test order. A campaign with primary blocks runs all of them before the
+// legacy blocks, so a budget stop leaves the secondary comparison short, not
+// the primary one. Older campaigns keep the single interleave.
+export function testOrder(items, primaryBlocks = [], seed = SCHEDULE_SEED) {
+  if (!primaryBlocks?.length) return interleave(items, seed);
+  const primary = items.filter((item) => primaryBlocks.includes(item.block));
+  const rest = items.filter((item) => !primaryBlocks.includes(item.block));
+  return [...interleave(primary, seed), ...interleave(rest, seed)];
 }
 
 async function fetchJson(url, key) {
@@ -239,7 +314,11 @@ function assertReplaySource(id, runId) {
 
 function journalsOf(runId) {
   const paths = pathsFor(runId);
-  const files = [path.join(paths.probe, 'events.jsonl'), path.join(paths.dev, 'events.jsonl')];
+  const files = [
+    path.join(paths.probe, 'events.jsonl'),
+    path.join(paths.dev, 'events.jsonl'),
+    path.join(paths.reconcile, 'events.jsonl'),
+  ];
   if (existsSync(paths.comparison)) {
     for (const name of readdirSync(paths.comparison).sort()) {
       files.push(path.join(paths.comparison, name, 'events.jsonl'));
@@ -300,6 +379,9 @@ export function policyFrom(preflight, campaign = null) {
   return {
     caps: campaign?.stageCaps || STAGE_CAPS,
     timeout: campaign?.streamTimeoutSeconds ?? null,
+    loopGuard: campaign?.loopGuard || null,
+    annotate: campaign?.evalAnnotations === true,
+    contextCheck: campaign?.contextCheck === true,
     routes,
   };
 }
@@ -337,8 +419,14 @@ function assertCompatible(campaignPaths, phase) {
   const campaign = readJson(campaignPaths.campaign);
   if (!campaign) throw new Error('Run preflight before this phase.');
   sameSource(campaign.sourceHash, 'Campaign');
-  const bank = loadBank();
+  const bank = loadBank(campaign);
   if (campaign.bankDigest !== bank.digest) throw new Error('Bank digest does not match the campaign.');
+  if (campaign.bankExtension && campaign.bankExtension.digest !== bank.extensionDigest) {
+    throw new Error('Extension bank items do not match the campaign.');
+  }
+  if (campaign.counts && stableStringify(campaign.counts) !== stableStringify(bankCounts(bank.items))) {
+    throw new Error('Bank counts do not match the campaign.');
+  }
   if (phase === 'probe') return { campaign, bank };
   const preflight = readJson(campaignPaths.preflight);
   if (!preflight?.routes?.length) throw new Error('Preflight has no paid routes.');
@@ -369,6 +457,7 @@ export function runFlags(argv) {
 const REPLAY_PROFILE_FIELDS = [
   'maxAttempts', 'councilSize', 'selfSamples', 'temperature', 'topP',
   'nSamples', 'topK', 'selfExclusion', 'scheduleSeed', 'redTeam', 'generationSeed',
+  'loopGuard', 'tailRule',
 ];
 // Fields a source may differ on. A cap is part of the request, so the request
 // hash already keeps a slot made under another cap from being reused. The
@@ -476,6 +565,119 @@ async function inheritPreflight(campaignPaths, runId, fromIds, caps = STAGE_CAPS
   return 0;
 }
 
+// Listing dates of the models in the cached catalogue. A listing date is when
+// OpenRouter added the model, not its knowledge cutoff.
+function listingDates(ids) {
+  const catalogue = readJson(path.join(EVAL_ROOT, '.cache', 'catalogue.json'), {});
+  const rows = Array.isArray(catalogue?.models) ? catalogue.models : [];
+  const out = {};
+  for (const id of ids) {
+    const row = rows.find((item) => item.id === id);
+    out[id] = row?.created ? new Date(row.created * 1000).toISOString().slice(0, 10) : null;
+  }
+  return { fetchedAt: catalogue?.fetchedAt || null, dates: out };
+}
+
+// Starts an extended campaign on another run's route snapshot. Only the
+// routes come over: no slot is replayed and no spend is carried. No network.
+export async function routesPreflight(campaignPaths, runId, options) {
+  const {
+    routesFrom,
+    capsMode = null,
+    capFlags = {},
+    blocks: requested = [],
+    maxUsd = MAX_USD,
+    maxPosts = MAX_POSTS,
+  } = options;
+  const existing = readJson(campaignPaths.campaign);
+  if (existing) {
+    if (existing.routesInheritedFrom !== routesFrom) throw new Error('This campaign already exists with other routes.');
+    sameSource(existing.sourceHash, 'Campaign');
+    console.log(`preflight already done on routes from ${existing.routesInheritedFrom}`);
+    return 0;
+  }
+  if (!routesFrom || routesFrom === runId) throw new Error('--routes-from needs another run.');
+  const git = (options.gitState || gitState)();
+  if (!git.head) throw new Error(`Cannot read the git commit (${git.error || 'unknown'}). Preflight pins the commit it runs on.`);
+  if (git.dirty.length) {
+    throw new Error(`Commit the method before preflight. Changed or untracked hashed files: ${git.dirty.join(', ')}`);
+  }
+  const sourcePreflight = readJson(pathsFor(routesFrom).preflight);
+  if (!sourcePreflight?.routes?.length) throw new Error(`Run ${routesFrom} has no route snapshot.`);
+  const candidates = sourcePreflight.candidates || [];
+  const candidateRoutes = sourcePreflight.routes.filter((route) => candidates.includes(route.id));
+  if (candidateRoutes.length < COUNCIL_SIZE) throw new Error(`Run ${routesFrom} has only ${candidateRoutes.length} candidates.`);
+  let caps;
+  if (capsMode === 'max') {
+    if (Object.values(capFlags).some((value) => value != null)) {
+      throw new Error('Use either --caps max or explicit cap flags.');
+    }
+    const cap = maxCommonCap(candidateRoutes);
+    caps = capsFrom({ stage1: cap, stage2: cap, stage3: cap });
+  } else if (capsMode != null) {
+    throw new Error(`Unknown --caps ${capsMode}`);
+  } else {
+    caps = capsFrom(capFlags);
+  }
+  const largest = Math.max(...Object.values(caps));
+  const problems = candidateRoutes.flatMap((route) => contextProblems(route, largest));
+  if (problems.length) throw new Error(`Routes cannot take a ${largest}-token cap: ${problems.join('; ')}`);
+  const unknown = requested.filter((block) => !EXTENSION_BLOCKS.includes(block));
+  if (unknown.length) throw new Error(`Unknown blocks ${unknown.join(', ')}`);
+  const extra = orderBlocks(requested);
+  const blocks = orderBlocks([...LEGACY_BLOCKS, ...extra]);
+  const loaded = loadBank({ blocks, bankExtension: { blocks: extra } });
+  for (const block of extra) {
+    if (!loaded.items.some((item) => item.block === block && item.split === 'test')) {
+      throw new Error(`Block ${block} has no test items. Run a8 --phase prepare.`);
+    }
+  }
+  const counts = bankCounts(loaded.items);
+  const routeIds = sourcePreflight.routes.map((route) => route.id);
+  const coverage = {};
+  for (const [name, row] of Object.entries(loaded.extension.coverage || {})) {
+    if (extra.includes(row.block)) coverage[name] = row;
+  }
+  writeJson(campaignPaths.preflight, {
+    ...sourcePreflight,
+    routesInheritedFrom: routesFrom,
+    inheritedAt: new Date().toISOString(),
+  });
+  const profile = profileDocument(caps, { ...v5Policy(), smokeCount: counts.smoke });
+  writeJson(campaignPaths.campaign, {
+    id: runId,
+    ...profile,
+    maxUsd,
+    maxPosts,
+    primaryPair: PRIMARY_PAIR,
+    blocks,
+    primaryBlocks: primaryBlocksOf(blocks),
+    bankProtocolHash: loaded.bank.protocolHash,
+    bankDigest: loaded.digest,
+    bankExtension: {
+      file: '.cache/bank-a8x.json',
+      blocks: extra,
+      digest: loaded.extensionDigest,
+      bankVersion: loaded.extension.version,
+      sources: Object.fromEntries(Object.entries(loaded.extension.sources || {})
+        .filter(([name]) => coverage[name])),
+      coverage,
+    },
+    counts,
+    routesInheritedFrom: routesFrom,
+    modelListings: listingDates(routeIds),
+    sourceHash: sourceHash(),
+    gitHead: git.head,
+    createdAt: new Date().toISOString(),
+  });
+  console.log(`preflight: commit ${git.head.slice(0, 12)}, source hash ${sourceHash().slice(0, 12)}`);
+  console.log(`preflight: routes from ${routesFrom}, ${candidateRoutes.length} candidates, no replay, no carried spend`);
+  console.log(`preflight caps: one cap of ${largest} tokens on every stage; stream deadline ${profile.streamTimeoutSeconds}s`);
+  console.log(`preflight blocks: ${blocks.join(', ')}; primary ${primaryBlocksOf(blocks).join(', ')}`);
+  console.log(`preflight counts: smoke ${counts.smoke}, dev ${counts.dev}, test ${counts.test}; budget $${maxUsd} / ${maxPosts} POSTs`);
+  return 0;
+}
+
 async function preflight(campaignPaths, live, caps = STAGE_CAPS) {
   if (!live) {
     const saved = readJson(campaignPaths.preflight);
@@ -491,14 +693,7 @@ async function preflight(campaignPaths, live, caps = STAGE_CAPS) {
     throw new Error('Probe already started. Refusing to rewrite the route snapshot.');
   }
   const { items, digest, bank } = loadBank();
-  const counts = {
-    smoke: items.filter((item) => item.split === 'smoke').length,
-    dev: items.filter((item) => item.split === 'dev').length,
-    test: items.filter((item) => item.split === 'test').length,
-  };
-  if (counts.smoke !== SMOKE_COUNT || counts.dev !== DEV_PER_BLOCK * 3 || counts.test !== TEST_QUESTIONS) {
-    throw new Error(`Unexpected bank counts ${JSON.stringify(counts)}`);
-  }
+  checkBankCounts(items);
   console.log('preflight: reading the weekly catalogue');
   const weekly = await fetchJson(`${OPENROUTER_MODELS_URL}?sort=top-weekly`);
   const rows = Array.isArray(weekly.body?.data) ? weekly.body.data : [];
@@ -587,7 +782,7 @@ async function preflight(campaignPaths, live, caps = STAGE_CAPS) {
   }
   writeJson(campaignPaths.preflight, preflightDoc);
   const campaign = existing || {
-    id: CAMPAIGN_ID,
+    id: path.basename(campaignPaths.dir),
     ...profileDocument(caps),
     primaryPair: PRIMARY_PAIR,
     bankProtocolHash: bank.protocolHash,
@@ -601,6 +796,95 @@ async function preflight(campaignPaths, live, caps = STAGE_CAPS) {
   writeJson(campaignPaths.campaign, campaign);
   console.log(`preflight: ${routes.length} billable routes, candidates ${preflightDoc.candidates.join(', ')}`);
   return 0;
+}
+
+const GENERATION_URL = 'https://openrouter.ai/api/v1/generation';
+
+// Key-level spend as an audit event. Other requests on the key and billing
+// delay make it unusable for releasing a single reserve, so it never does.
+async function auditKey(budget, phase, moment) {
+  if (!(process.env.or_key || process.env.OR_KEY)) return null;
+  try {
+    const info = await fetchJson(OPENROUTER_KEY_URL, loadPaidKey());
+    const data = info.body?.data || {};
+    return budget.audit({
+      phase,
+      moment,
+      status: info.status,
+      usage: data.usage ?? null,
+      limitRemaining: data.limit_remaining ?? null,
+    });
+  } catch (error) {
+    return budget.audit({ phase, moment, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+function generationIds(files) {
+  const ids = new Map();
+  for (const file of files) {
+    if (!existsSync(file)) continue;
+    for (const line of readFileSync(file, 'utf8').split('\n')) {
+      if (!line.includes('"generationId"')) continue;
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (event.kind === 'http' && event.phase === 'finished' && event.attemptId && event.generationId) {
+        ids.set(event.attemptId, event.generationId);
+      }
+    }
+  }
+  return ids;
+}
+
+// Asks OpenRouter what each unresolved attempt really cost. A cost it does
+// not report (no id, 404, an unfinished record, a failed GET) stays held.
+export async function reconcileBudget(campaignPaths, budget, {
+  log = console.log,
+  fetchImpl = fetchJson,
+  journals = null,
+} = {}) {
+  const pending = budget.unresolvedAttempts();
+  const summary = { unresolved: pending.length, lookedUp: 0, settled: 0, withoutId: 0 };
+  if (!pending.length) return summary;
+  const ids = generationIds(journals || journalsOf(path.basename(campaignPaths.dir)));
+  const key = loadPaidKey();
+  for (const row of pending) {
+    const generationId = ids.get(row.attemptId);
+    if (!generationId) {
+      summary.withoutId += 1;
+      continue;
+    }
+    summary.lookedUp += 1;
+    let info;
+    try {
+      info = await fetchImpl(`${GENERATION_URL}?id=${encodeURIComponent(generationId)}`, key);
+    } catch {
+      continue;
+    }
+    const cost = info?.status === 200 ? info.body?.data?.total_cost : null;
+    if (cost == null) continue;
+    if (budget.resettle({ attemptId: row.attemptId, cost, source: `generation:${generationId}` }).applied) {
+      summary.settled += 1;
+    }
+  }
+  log(
+    `reconcile: ${summary.unresolved} unresolved reserves, ${summary.lookedUp} looked up, `
+    + `${summary.settled} settled, ${summary.withoutId} without a generation id; `
+    + `held now $${budget.state.unresolvedUsd.toFixed(4)}`,
+  );
+  return summary;
+}
+
+async function phaseStart(campaignPaths, budget, phase) {
+  try {
+    await reconcileBudget(campaignPaths, budget);
+  } catch (error) {
+    console.log(`reconcile skipped: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  await auditKey(budget, phase, 'start');
 }
 
 function installPaid(session, budget, routes) {
@@ -628,6 +912,11 @@ export function prepareFor(policy) {
     // The deadline is a client setting, not a request field, so it does not
     // enter the request hash and a replayed slot still matches.
     if (policy.timeout) next.timeout = policy.timeout;
+    // Client-only too: the loop guard, provenance marks, and the context
+    // check change what the engine does with a stream, not what it sends.
+    if (policy.loopGuard) next.loopGuard = policy.loopGuard;
+    if (policy.annotate) next.evalAnnotations = true;
+    if (policy.contextCheck && route.context) next.contextTokens = route.context;
     return next;
   };
 }
@@ -733,6 +1022,41 @@ async function runPasses({ label, order, isDone, runOne, budget, session, run })
   }
 }
 
+// The cap is confirmed on a route once a request carrying it came back HTTP
+// 200 as a finished stream with a usage block. HTTP 200 alone is not enough:
+// a stream can carry an error.
+export function confirmsCap(row) {
+  return row?.http === 200 && row.usageKnown === true && (row.finishReason === 'stop' || row.finishReason === 'length');
+}
+
+// Which round the probe runs and on which routes. A probe that ended without
+// confirming every route runs again as a new round on the routes still
+// unconfirmed, as a new attempt of the same request: a finished slot never
+// posts again, so the round goes into the slot key. Round 1 asks every route.
+export function probePlan(saved, rows, preflightDoc) {
+  const round = saved ? (saved.round || 1) + 1 : 1;
+  const active = saved?.active ? [...saved.active] : [...(preflightDoc.candidates || [])];
+  const reserves = (preflightDoc.reserves || []).filter((id) => !active.includes(id));
+  const retry = round === 1
+    ? null
+    : active.filter((model) => !(rows || []).some((row) => row.model === model && confirmsCap(row)));
+  return { round, attempt: round - 1, active, reserves, retry };
+}
+
+// A campaign that must confirm its cap is done only once every route has
+// confirmed it; until then the probe can run again.
+export function probeOutcome(rows, active, requireCapConfirmation) {
+  const capConfirmed = {};
+  const parsedAnswers = {};
+  for (const model of active) {
+    const own = (rows || []).filter((row) => row.model === model);
+    capConfirmed[model] = own.some(confirmsCap);
+    parsedAnswers[model] = own.filter((row) => row.status === 'graded').length;
+  }
+  const allConfirmed = Object.values(capConfirmed).every(Boolean);
+  return { capConfirmed, parsedAnswers, allConfirmed, done: allConfirmed || !requireCapConfirmation };
+}
+
 async function runProbe(campaignPaths) {
   const { campaign, bank } = assertCompatible(campaignPaths, 'probe');
   const preflightDoc = readJson(campaignPaths.preflight);
@@ -751,8 +1075,10 @@ async function runProbe(campaignPaths) {
   const key = loadPaidKey();
   settings.apiKey = key;
   const budget = openBudget(campaignPaths, priceMap(preflightDoc), campaign);
-  const active = [...(preflightDoc.candidates || [])];
-  const reserves = [...(preflightDoc.reserves || [])];
+  await phaseStart(campaignPaths, budget, 'probe');
+  const results = readJson(path.join(campaignPaths.probe, 'rows.json'), []);
+  const plan = probePlan(saved, results, preflightDoc);
+  const { round, attempt, active, reserves } = plan;
   const routes = preflightDoc.routes.filter((route) => active.includes(route.id) || reserves.includes(route.id));
   // The probe checks that each route answers today, so it never replays.
   const session = createSession({
@@ -765,16 +1091,23 @@ async function runProbe(campaignPaths) {
   session.install();
   const restore = installPaid(session, budget, routes);
   const smoke = bank.items.filter((item) => item.split === 'smoke');
-  const results = readJson(path.join(campaignPaths.probe, 'rows.json'), []);
   const baseSnap = snapshotLocal();
   try {
     let replacements = saved?.replacements || 0;
+    if (plan.retry) console.log(`probe round ${round}: retrying ${plan.retry.join(', ')}`);
     for (let index = 0; index < smoke.length; index += 1) {
       const task = smoke[index];
-      console.log(`probe ${index + 1}/${smoke.length} ${task.block}: ${active.length} routes at once`);
-      const models = [...active];
+      const models = plan.retry ? active.filter((model) => plan.retry.includes(model)) : [...active];
+      if (!models.length) break;
+      console.log(`probe ${index + 1}/${smoke.length} ${task.block}: ${models.length} routes at once`);
       const answered = await runIsolated(baseSnap, 0, async () => {
-        session.setContext({ questionId: task.id, branch: 'probe', stage: 'stage1', sample: 1 });
+        session.setContext({
+          questionId: task.id,
+          branch: 'probe',
+          stage: 'stage1',
+          sample: 1,
+          ...(attempt > 0 ? { attempt } : {}),
+        });
         const settled = await Promise.allSettled(models.map((model) => (
           queryModelResult(model, [{ role: 'user', content: answerPrompt(task) }])
         )));
@@ -791,14 +1124,24 @@ async function runProbe(campaignPaths) {
           console.log('probe paused: cooldown');
           return 2;
         }
-        const slot = session.slots().find((item) => item.meta?.questionId === task.id && item.meta?.model === model);
+        const slot = session.slots().find((item) => (
+          item.meta?.questionId === task.id && item.meta?.model === model && (item.meta?.attempt || 0) === attempt
+        ));
         const grade = result?.ok ? gradeResponse(task, result.content || '') : gradeResponse(task, '', failureKind(result));
+        // A resumed round answers again from its journal; keep one row per
+        // question, route, and round.
+        const stale = results.findIndex((row) => row.id === task.id && row.model === model && (row.round || 1) === round);
+        if (stale >= 0) results.splice(stale, 1);
         results.push({
           id: task.id,
+          round,
           model,
           http: slot?.httpStatus ?? null,
           correct: grade.correct,
           status: grade.status,
+          finishReason: slot?.finishReason ?? null,
+          usageKnown: slot?.usageKnown === true,
+          maxTokens: slot?.request?.max_tokens ?? null,
         });
         console.log(`probe ${model} http ${slot?.httpStatus ?? 'n/a'} ${grade.status}`);
         if (slot?.httpStatus === 401) {
@@ -807,6 +1150,17 @@ async function runProbe(campaignPaths) {
           return 2;
         }
         const bad = slot?.httpStatus === 400 || slot?.httpStatus === 404;
+        // A campaign that confirms its cap never swaps a route silently: a
+        // refused request may mean the route cannot take the cap.
+        if (bad && campaign.requireCapConfirmation) {
+          writeJson(path.join(campaignPaths.probe, 'rows.json'), results);
+          console.log(`probe stopped: ${model} answered HTTP ${slot.httpStatus}: ${result?.error?.detail || result?.error?.message || ''}`);
+          console.log(
+            'Caps are fixed at this campaign\'s preflight. Check the route limit, then start a new campaign id '
+            + 'with explicit cap flags (--stage1-cap, --stage2-cap, --final-cap) before any dev.',
+          );
+          return 2;
+        }
         if (bad && replacements < RESERVE_LIMIT && reserves.length) {
           const replacement = reserves.shift();
           const place = active.indexOf(model);
@@ -822,19 +1176,36 @@ async function runProbe(campaignPaths) {
       }
     }
     writeJson(path.join(campaignPaths.probe, 'rows.json'), results);
+    const { capConfirmed, parsedAnswers: parsed, allConfirmed, done } = probeOutcome(
+      results,
+      active,
+      campaign.requireCapConfirmation === true,
+    );
     writeJson(path.join(campaignPaths.probe, 'results.json'), {
-      done: true,
+      done,
+      round,
       active,
       replacements,
+      capConfirmed,
+      parsedAnswers: parsed,
+      allConfirmed,
       settledUsd: budget.state.settledUsd,
       unresolvedUsd: budget.state.unresolvedUsd,
       posts: budget.state.posts,
     });
+    for (const model of active) {
+      console.log(`probe cap ${capConfirmed[model] ? 'confirmed' : 'NOT confirmed'} on ${model}; parsed answers ${parsed[model]}`);
+    }
     console.log(`probe done. Active: ${active.join(', ')}`);
+    if (!done) {
+      console.log('probe: the cap is not confirmed on every route; dev will not start. Run the probe again to retry the unconfirmed routes.');
+      return 2;
+    }
     return 0;
   } finally {
     session.uninstall();
     restore();
+    await auditKey(budget, 'probe', 'end');
   }
 }
 
@@ -854,11 +1225,15 @@ async function runDev(campaignPaths, run) {
   const { campaign, bank, preflight: preflightDoc } = assertCompatible(campaignPaths, 'dev');
   const probe = readJson(path.join(campaignPaths.probe, 'results.json'));
   if (!probe?.done) throw new Error('Finish the probe before dev.');
+  if (campaign.requireCapConfirmation && !probe.allConfirmed) {
+    throw new Error('The probe did not confirm the cap on every route.');
+  }
   const models = probe.active;
   const routes = preflightDoc.routes.filter((route) => models.includes(route.id));
   const key = loadPaidKey();
   settings.apiKey = key;
   const budget = openBudget(campaignPaths, priceMap(preflightDoc), campaign);
+  await phaseStart(campaignPaths, budget, 'dev');
   const devDir = campaignPaths.dev;
   mkdirSync(devDir, { recursive: true });
   const devSource = path.join(devDir, 'source.json');
@@ -992,7 +1367,95 @@ async function runDev(campaignPaths, run) {
   } finally {
     session.uninstall();
     restore();
+    await auditKey(budget, 'dev', 'end');
   }
+}
+
+// Pilot questions: the first `perBlock` dev questions of every block in
+// seeded order, chosen before any answer is seen.
+export function pilotItems(items, perBlock, seed = SCHEDULE_SEED) {
+  const dev = items.filter((item) => item.split === 'dev');
+  return orderBlocks(dev.map((item) => item.block)).flatMap((block) => (
+    dev.filter((item) => item.block === block)
+      .sort((left, right) => compareHash(seed, left.id, right.id))
+      .slice(0, perBlock)
+  ));
+}
+
+function quantileOf(values, q) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const index = Math.min(sorted.length - 1, Math.ceil(q * sorted.length) - 1);
+  return sorted[Math.max(0, index)];
+}
+
+// Spend and posts of each pilot question from the campaign ledger: a settled
+// attempt counts at its cost, an unresolved one at its whole reserve. Only
+// comparison calls count: pilot questions are dev questions, and the dev
+// phase posted its own calls on the same question ids.
+export function pilotForecast({ campaign, budget, items, order }) {
+  const perQuestion = new Map(order.map((id) => [id, { usd: 0, posts: 0 }]));
+  for (const [attemptId, row] of Object.entries(budget.state.reservations || {})) {
+    const [questionId, branch] = attemptId.split('|');
+    if (!COMPARISON_BRANCHES.includes(branch)) continue;
+    const entry = perQuestion.get(questionId);
+    if (!entry) continue;
+    entry.posts += 1;
+    entry.usd += row.unresolved || row.cost == null ? Number(row.usd || 0) : Number(row.cost || 0);
+  }
+  const byId = new Map(items.map((item) => [item.id, item]));
+  const blocks = {};
+  for (const [id, entry] of perQuestion) {
+    const block = byId.get(id)?.block;
+    if (!block) continue;
+    blocks[block] ||= { usd: [], posts: [] };
+    blocks[block].usd.push(entry.usd);
+    blocks[block].posts.push(entry.posts);
+  }
+  const q = campaign.forecastQuantile ?? 0.9;
+  const stats = {};
+  for (const [block, row] of Object.entries(blocks)) {
+    const mean = (values) => values.reduce((sum, value) => sum + value, 0) / values.length;
+    stats[block] = {
+      pilotQuestions: row.usd.length,
+      meanUsd: mean(row.usd),
+      highUsd: quantileOf(row.usd, q),
+      meanPosts: mean(row.posts),
+      highPosts: quantileOf(row.posts, q),
+    };
+  }
+  // A block with no dev questions borrows the dearest choice block.
+  const choiceProxy = ['gpqa', 'mmlu'].map((block) => stats[block]).filter(Boolean)
+    .sort((left, right) => right.highUsd - left.highUsd)[0] || null;
+  const tests = campaign.counts?.blocks || {};
+  const lines = [];
+  let mainUsd = 0;
+  let highUsd = 0;
+  let mainPosts = 0;
+  let highPosts = 0;
+  for (const [block, counts] of Object.entries(tests)) {
+    const testCount = counts.test || 0;
+    if (!testCount) continue;
+    const row = stats[block] || choiceProxy;
+    if (!row) throw new Error(`No pilot cost for block ${block}`);
+    mainUsd += row.meanUsd * testCount;
+    highUsd += row.highUsd * testCount;
+    mainPosts += row.meanPosts * testCount;
+    highPosts += row.highPosts * testCount;
+    lines.push({ block, testCount, proxy: stats[block] ? null : 'dearest choice block', ...row });
+  }
+  const remainingUsd = campaign.maxUsd - (budget.state.settledUsd + budget.state.unresolvedUsd);
+  const remainingPosts = campaign.maxPosts - budget.state.posts;
+  return {
+    blocks: lines,
+    mainUsd,
+    highUsd,
+    mainPosts,
+    highPosts,
+    remainingUsd,
+    remainingPosts,
+    gate: highUsd <= remainingUsd && highPosts <= remainingPosts ? 'pass' : 'fail',
+  };
 }
 
 function runnerNote(run) {
@@ -1000,12 +1463,26 @@ function runnerNote(run) {
     jobs: run.jobs,
     httpInFlight: run.inFlight,
     perModelInFlight: run.modelInFlight,
+    acceptForecast: run.acceptForecast === true,
     note: 'Pacing only. Requests, caps, and retry limits are unchanged.',
   };
 }
 
 async function runPipeline(campaignPaths, phase, run) {
   const { campaign, bank, preflight: preflightDoc } = assertCompatible(campaignPaths, phase);
+  if (phase === 'test' && campaign.pilotGate) {
+    const forecast = readJson(path.join(campaignPaths.comparison, 'pilot', 'forecast.json'));
+    if (forecast?.gate !== 'pass' && !run.acceptForecast) {
+      console.log(
+        forecast
+          ? `test not started: the conservative forecast $${forecast.highUsd.toFixed(2)} / ${Math.ceil(forecast.highPosts)} POSTs `
+            + `exceeds what is left ($${forecast.remainingUsd.toFixed(2)} / ${forecast.remainingPosts}). `
+            + 'Pass --accept-forecast to start anyway.'
+          : 'test not started: run the pilot first.',
+      );
+      return 2;
+    }
+  }
   const selection = readJson(campaignPaths.selection);
   if (!selection?.council || selection.council.length !== COUNCIL_SIZE) throw new Error('Selection is not frozen.');
   if (selection.sourceHash !== sourceHash()) {
@@ -1021,19 +1498,16 @@ async function runPipeline(campaignPaths, phase, run) {
   const shared = routes.find((route) => route.id === selection.h);
   if (!shared) throw new Error('Selection is missing the shared H/B route.');
   let items;
+  const pilotFirst = campaign.pilotPerBlock ?? PILOT_PER_BLOCK;
+  const pilotMax = campaign.pilotPerBlockMax ?? pilotFirst;
   if (phase === 'smoke') items = bank.items.filter((item) => item.split === 'smoke');
-  else if (phase === 'pilot') {
-    const dev = bank.items.filter((item) => item.split === 'dev');
-    items = ['aime', 'gpqa', 'mmlu'].flatMap((block) => (
-      dev.filter((item) => item.block === block)
-        .sort((left, right) => compareHash(SCHEDULE_SEED, left.id, right.id))
-        .slice(0, PILOT_PER_BLOCK)
-    ));
-  } else items = interleave(bank.items.filter((item) => item.split === 'test'));
+  else if (phase === 'pilot') items = pilotItems(bank.items, pilotMax);
+  else items = testOrder(bank.items.filter((item) => item.split === 'test'), campaign.primaryBlocks);
   const dir = path.join(campaignPaths.comparison, phase);
   mkdirSync(dir, { recursive: true });
   const orderFile = path.join(dir, 'order.json');
-  const order = readJson(orderFile) || items.map((item) => item.id);
+  const initial = phase === 'pilot' ? pilotItems(bank.items, pilotFirst).map((item) => item.id) : items.map((item) => item.id);
+  const order = readJson(orderFile) || initial;
   if (!existsSync(orderFile)) writeJson(orderFile, order);
   writeJson(path.join(dir, 'runner.json'), { ...runnerNote(run), startedAt: new Date().toISOString() });
   const byId = new Map(items.map((item) => [item.id, item]));
@@ -1041,6 +1515,7 @@ async function runPipeline(campaignPaths, phase, run) {
   settings.apiKey = key;
   const baseSnap = snapshotLocal();
   const budget = openBudget(campaignPaths, priceMap({ routes }), campaign);
+  await phaseStart(campaignPaths, budget, phase);
   const replay = replaySources(campaign);
   const session = createSession({
     runDir: dir,
@@ -1052,35 +1527,68 @@ async function runPipeline(campaignPaths, phase, run) {
   });
   session.install();
   const restore = installPaid(session, budget, routes);
-  try {
-    const code = await runPasses({
-      label: phase,
-      order,
-      isDone: (id) => readJson(questionFile(dir, id))?.status === 'complete',
-      budget,
-      session,
-      run,
-      runOne: async (id, index) => {
-        const task = byId.get(id);
-        try {
-          const result = await runIsolated(baseSnap, index, () => (
-            runComparison(task, session, frozen, { scheduleSeed: SCHEDULE_SEED })
-          ));
-          const fresh = session.slots().filter((item) => item.meta?.questionId === id);
-          if (fresh.some((item) => String(item.meta?.model || '').endsWith(':free'))) {
-            throw new EvalInvariantError('A free model id reached the journal.');
-          }
-          result.reuse = reuseStats(fresh);
-          writeJson(questionFile(dir, id), result);
-          return result;
-        } catch (error) {
-          if (isEvalInvariant(error)) writeJson(questionFile(dir, id), { id, status: 'fatal', reason: error.message });
-          throw error;
+  const passes = () => runPasses({
+    label: phase,
+    order,
+    isDone: (id) => readJson(questionFile(dir, id))?.status === 'complete',
+    budget,
+    session,
+    run,
+    runOne: async (id, index) => {
+      const task = byId.get(id);
+      try {
+        const result = await runIsolated(baseSnap, index, () => (
+          runComparison(task, session, frozen, { scheduleSeed: SCHEDULE_SEED, tailRule: campaign.tailRule || null })
+        ));
+        const fresh = session.slots().filter((item) => item.meta?.questionId === id);
+        if (fresh.some((item) => String(item.meta?.model || '').endsWith(':free'))) {
+          throw new EvalInvariantError('A free model id reached the journal.');
         }
-      },
-    });
+        result.reuse = reuseStats(fresh);
+        writeJson(questionFile(dir, id), result);
+        return result;
+      } catch (error) {
+        if (isEvalInvariant(error)) writeJson(questionFile(dir, id), { id, status: 'fatal', reason: error.message });
+        throw error;
+      }
+    },
+  });
+  try {
+    let code = await passes();
     if (code) return code;
-    if (phase === 'pilot') {
+    if (phase === 'pilot' && campaign.pilotGate) {
+      let forecast = pilotForecast({ campaign, budget, items, order });
+      if (forecast.gate !== 'pass' && order.length < items.length) {
+        console.log(
+          `pilot: the conservative forecast $${forecast.highUsd.toFixed(2)} does not fit the $${forecast.remainingUsd.toFixed(2)} left; `
+          + `extending the pilot to ${pilotMax} questions per block, as set before the run`,
+        );
+        for (const item of items) if (!order.includes(item.id)) order.push(item.id);
+        writeJson(orderFile, order);
+        code = await passes();
+        if (code) return code;
+        forecast = pilotForecast({ campaign, budget, items, order });
+      }
+      writeJson(path.join(dir, 'forecast.json'), {
+        ...forecast,
+        pilotQuestions: order.length,
+        extended: order.length > initial.length,
+        quantile: campaign.forecastQuantile ?? 0.9,
+        computedAt: new Date().toISOString(),
+        note: 'Per block: mean and high-quantile cost of a pilot question (all 12 comparison calls, retries, unresolved reserves at full value; dev calls on the same question excluded) times the block\'s test count. With two to four pilot questions per block the 0.9 quantile is the dearest of them. A block without dev questions borrows the dearest choice block.',
+      });
+      for (const row of forecast.blocks) {
+        console.log(
+          `pilot ${row.block}: ${row.testCount} test questions at $${row.meanUsd.toFixed(4)} mean, `
+          + `$${row.highUsd.toFixed(4)} high${row.proxy ? ` (${row.proxy})` : ''}`,
+        );
+      }
+      console.log(
+        `pilot forecast: $${forecast.mainUsd.toFixed(2)} expected, $${forecast.highUsd.toFixed(2)} conservative, `
+        + `${Math.ceil(forecast.highPosts)} POSTs conservative; left $${forecast.remainingUsd.toFixed(2)} / ${forecast.remainingPosts} POSTs; `
+        + `gate ${forecast.gate}`,
+      );
+    } else if (phase === 'pilot') {
       const rows = order.map((id) => readJson(questionFile(dir, id))).filter(Boolean);
       const fresh = rows.reduce((sum, row) => sum + (row.reuse?.freshPosts || 0), 0);
       const spent = budget.state.settledUsd - Number(campaign.carriedSpend?.settledUsd || 0);
@@ -1100,7 +1608,73 @@ async function runPipeline(campaignPaths, phase, run) {
   } finally {
     session.uninstall();
     restore();
+    await auditKey(budget, phase, 'end');
   }
+}
+
+// One deliberately cut stream on a route the campaign uses, then a lookup of
+// its generation: shows whether reconcile can price an aborted attempt.
+async function reconcileSelfTest(campaignPaths, campaign, preflightDoc, budget, modelFlag) {
+  const selection = readJson(campaignPaths.selection);
+  const model = modelFlag || selection?.b;
+  if (!model) throw new Error('--self-test needs --model until dev has chosen B.');
+  const route = preflightDoc.routes.find((item) => item.id === model);
+  if (!route) throw new Error(`${model} is not a route of this campaign.`);
+  const policy = prepareFor(policyFrom({ routes: [route] }, campaign));
+  // Any repeated character trips this guard, so the stream is cut within its
+  // first tokens, through the same path a real loop stop takes.
+  const tripwire = { tailChars: 1, historyChars: 1, shingleChars: 1, stride: 1, checkEvery: 1, consecutive: 1, threshold: 0.01 };
+  const session = createSession({
+    runDir: campaignPaths.reconcile,
+    budget,
+    prepareOptions: (id, stage, options) => ({ ...policy(id, stage, options), maxTokens: 256, loopGuard: tripwire }),
+    maxInFlight: 1,
+    ...sessionBudget(),
+    retryLimit: 1,
+  });
+  session.install();
+  const restore = installPaid(session, budget, [route]);
+  let result;
+  try {
+    session.setContext({ questionId: `selftest-${Date.now()}`, branch: 'reconcile', stage: 'stage1', sample: 1 });
+    result = await queryModelResult(model, [{ role: 'user', content: 'Write the numbers from 1 to 200, one per line.' }]);
+    await session.drain();
+  } finally {
+    session.uninstall();
+    restore();
+  }
+  const attempt = budget.unresolvedAttempts().find((row) => row.attemptId.startsWith('selftest-'));
+  console.log(`self-test: ${model} stream ${result?.loopCut ? 'cut by the tripwire' : 'not cut'}; unresolved reserve ${attempt ? 'held' : 'absent'}`);
+  let summary = null;
+  for (let wait = 0; wait < 3 && attempt; wait += 1) {
+    await sleep(10_000);
+    summary = await reconcileBudget(campaignPaths, budget);
+    if (!budget.unresolvedAttempts().some((row) => row.attemptId === attempt.attemptId)) break;
+  }
+  const priced = attempt ? !budget.unresolvedAttempts().some((row) => row.attemptId === attempt.attemptId) : false;
+  const record = { model, at: new Date().toISOString(), cut: result?.loopCut === true, attemptId: attempt?.attemptId || null, priced, summary };
+  writeJson(path.join(campaignPaths.reconcile, 'selftest.json'), record);
+  console.log(`self-test: an aborted attempt ${priced ? 'was priced by its generation record' : 'stayed unresolved'}`);
+  return record;
+}
+
+async function runReconcile(campaignPaths, argv) {
+  const campaign = readJson(campaignPaths.campaign);
+  if (!campaign) throw new Error('Run preflight before this phase.');
+  const preflightDoc = readJson(campaignPaths.preflight);
+  settings.apiKey = loadPaidKey();
+  const budget = openBudget(campaignPaths, priceMap(preflightDoc), campaign);
+  if (argv.includes('--self-test')) {
+    sameSource(campaign.sourceHash, 'Campaign');
+    await reconcileSelfTest(campaignPaths, campaign, preflightDoc, budget, flagValue(argv, '--model'));
+  }
+  await reconcileBudget(campaignPaths, budget);
+  await auditKey(budget, 'reconcile', 'end');
+  console.log(
+    `budget: settled $${budget.state.settledUsd.toFixed(4)}, held $${budget.state.unresolvedUsd.toFixed(4)}, `
+    + `${budget.state.posts} POSTs of ${campaign.maxPosts}; key usage ${budget.state.lastAudit?.usage ?? 'n/a'}`,
+  );
+  return 0;
 }
 
 function historicalNote() {
@@ -1123,7 +1697,298 @@ function historicalNote() {
   };
 }
 
-async function report(campaignPaths) {
+function stageName(meta) {
+  if (meta.stage === 'stage3') return `${meta.branch} synthesis`;
+  if (meta.stage === 'stage2') return 'judges';
+  if (meta.stage === 'sample') return 'B samples';
+  return 'Stage 1';
+}
+
+// Per-stage counts from one phase journal: calls, cap hits, loop stops (every
+// aborted attempt), answers kept after a second loop, context refusals, and
+// failed slots.
+export function stageCounters(file) {
+  const counters = {};
+  const slots = readSlotJournal(file);
+  for (const slot of slots.values()) {
+    if (!slot.meta) continue;
+    const row = counters[stageName(slot.meta)] ||= { calls: 0, cap: 0, loopStops: 0, loopCut: 0, context: 0, failed: 0 };
+    row.calls += 1;
+    const reason = slot.result?.finishReason ?? slot.finishReason;
+    if (reason === 'length') row.cap += 1;
+    if (slot.result?.loopCut) row.loopCut += 1;
+    if (slot.result?.error?.kind === 'context') row.context += 1;
+    if (slot.state === 'failed') row.failed += 1;
+  }
+  if (existsSync(file)) {
+    for (const line of readFileSync(file, 'utf8').split('\n')) {
+      if (!line.includes('"cancelReason":"loop"')) continue;
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const slot = slots.get(event.key);
+      if (slot?.meta) counters[stageName(slot.meta)].loopStops += 1;
+    }
+  }
+  return counters;
+}
+
+// Cost of the test questions from the ledger: once as paid, and per method
+// as if each ran alone, with B's first answer counted in both. A held
+// (unresolved) attempt counts at its whole reserve and is shown apart.
+export function armCosts(reservations, bModel) {
+  const out = { test: 0, A8: 0, S8: 0, heldA8: 0, heldS8: 0 };
+  for (const [attemptId, row] of Object.entries(reservations || {})) {
+    const [questionId, branch, stage, , model] = attemptId.split('#')[0].split('|');
+    if (!String(questionId).startsWith('test:')) continue;
+    const held = row.unresolved === true || row.cost == null;
+    const usd = held ? Number(row.usd || 0) : Number(row.cost || 0);
+    out.test += usd;
+    const add = (arm) => {
+      out[arm] += usd;
+      if (held) out[`held${arm}`] += usd;
+    };
+    if (branch === 'council' && stage === 'stage1') {
+      add('A8');
+      if (model === bModel) add('S8');
+    } else if ((branch === 'council' && stage === 'stage2') || branch === 'A8') {
+      add('A8');
+    } else if (branch === 'replicates' || branch === 'S8') {
+      add('S8');
+    }
+  }
+  return out;
+}
+
+function ledgerOf(file, campaign) {
+  const ledger = createCampaignBudget({ maxUsd: campaign.maxUsd || MAX_USD, maxPosts: campaign.maxPosts || MAX_POSTS, prices: {} });
+  ledger.applyJournal(readJsonl(file));
+  return ledger;
+}
+
+function goldOverridesFrom(argv, byId) {
+  const file = flagValue(argv, '--gold-overrides');
+  if (!file) return null;
+  const raw = readJson(path.resolve(file));
+  if (!raw || typeof raw !== 'object') throw new Error(`Cannot read gold overrides from ${file}`);
+  const canonical = {};
+  for (const [id, entry] of Object.entries(raw)) {
+    const task = byId.get(id);
+    if (!task) throw new Error(`Gold override for unknown question ${id}`);
+    const gold = canonAnswer(String(entry?.gold ?? entry), task);
+    if (gold == null) throw new Error(`Gold override for ${id} does not read as a ${task.kind} answer`);
+    canonical[id] = gold;
+  }
+  return { file, sha: sha256(readFileSync(path.resolve(file), 'utf8')), canonical, raw };
+}
+
+async function reportV5(campaignPaths, campaign, argv) {
+  const dir = path.join(campaignPaths.comparison, 'test');
+  let rows = [];
+  if (existsSync(dir)) {
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith('.json') || name === 'order.json' || name === 'runner.json') continue;
+      const row = readJson(path.join(dir, name));
+      if (row?.id) rows.push(row);
+    }
+  }
+  const { items } = loadBank(campaign);
+  const byId = new Map(items.map((item) => [item.id, item]));
+  const selection = readJson(campaignPaths.selection) || {};
+  const listings = Object.fromEntries((selection.council || []).map((id) => [id, campaign.modelListings?.dates?.[id] ?? null]));
+  const overrides = goldOverridesFrom(argv, byId);
+  if (overrides) rows = applyGoldOverrides(rows, overrides.canonical).rows;
+  const primaryBlocks = campaign.primaryBlocks || [];
+  rows = rows.map((row) => ({
+    ...row,
+    set: primaryBlocks.includes(row.block) ? 'primary' : 'legacy',
+    group: chronologyGroup(byId.get(row.id)?.provenance, Object.values(listings)),
+    adapted: Boolean(byId.get(row.id)?.provenance?.adapted),
+  }));
+  const tasksInForce = new Map(items.map((item) => {
+    const gold = overrides?.canonical?.[item.id];
+    return [item.id, gold == null ? item : { ...item, goldCanon: gold }];
+  }));
+  const tailApplied = { stage1: 0, samples: 0, stage2: 0 };
+  for (const row of rows) {
+    for (const key of Object.keys(tailApplied)) tailApplied[key] += row.tailApplied?.[key] || 0;
+  }
+  const ledger = ledgerOf(campaignPaths.budget, campaign);
+  const testBlocks = campaign.counts?.blocks || {};
+  const plannedPrimary = primaryBlocks.reduce((sum, block) => sum + (testBlocks[block]?.test || 0), 0);
+  const planned = campaign.counts?.test ?? rows.length;
+  const complete = rows.length === planned && rows.every((row) => row.status === 'complete');
+  const amc = (campaign.blocks || []).includes('amc');
+  const goldLines = [];
+  if (amc) goldLines.push('AMC 2026 gold: unofficial key published by Think Academy on 2026-11-06; rescore with --gold-overrides once the official key is out.');
+  if (overrides) goldLines.push(`Gold overrides from ${overrides.file} (sha ${overrides.sha.slice(0, 12)}) applied to ${Object.keys(overrides.canonical).length} questions; the uncorrected report is kept apart.`);
+  const text = renderV5Report({
+    rows,
+    planned,
+    plannedPrimary,
+    complete,
+    primaryBlocks,
+    family: campaign.secondaryFamily,
+    lenientRows: lenientRows(rows, tasksInForce),
+    lenientRules: LENIENT_RULES,
+    listings,
+    coverage: campaign.bankExtension?.coverage,
+    counters: stageCounters(path.join(dir, 'events.jsonl')),
+    tailApplied,
+    spend: {
+      settledUsd: ledger.state.settledUsd,
+      unresolvedUsd: ledger.state.unresolvedUsd,
+      posts: ledger.state.posts,
+      audit: ledger.state.lastAudit || null,
+    },
+    armCost: armCosts(ledger.state.reservations, selection.b),
+    maxUsd: campaign.maxUsd,
+    maxPosts: campaign.maxPosts,
+    gold: goldLines.join(' '),
+    caps: campaign.stageCaps,
+    loopGuard: campaign.loopGuard,
+    tailRule: campaign.tailRule,
+  });
+  const name = overrides ? 'report-corrected' : 'report';
+  mkdirSync(campaignPaths.reports, { recursive: true });
+  writeFileSync(path.join(campaignPaths.reports, `${name}.md`), text, 'utf8');
+  writeJson(path.join(campaignPaths.reports, `${name}.json`), {
+    campaign: campaign.id || null,
+    complete,
+    planned,
+    plannedPrimary,
+    scored: rows.filter((row) => row.status === 'complete').length,
+    groups: rows.reduce((map, row) => ({ ...map, [row.group]: (map[row.group] || 0) + 1 }), {}),
+    tailApplied,
+    overrides: overrides ? { file: overrides.file, sha: overrides.sha, entries: overrides.raw } : null,
+  });
+  console.log(text);
+  console.log(`Wrote ${path.join(campaignPaths.reports, `${name}.md`)}`);
+  return complete ? 0 : 2;
+}
+
+// ---------------------------------------------------------------------------
+// Review of loop stops. The protocol reads every pilot stop by hand before
+// test; a false stop halts the campaign. Read-only: no call, no budget.
+
+// Text of one saved stream body: the reasoning channel the engine reads first,
+// and the visible content, each as the stream accumulated it.
+export function streamTexts(body) {
+  const parts = { reasoning: '', reasoningContent: '', details: '', content: '' };
+  for (const line of String(body || '').split('\n')) {
+    if (!line.startsWith('data:')) continue;
+    const data = line.slice(5).trim();
+    if (!data || data === '[DONE]') continue;
+    let chunk;
+    try {
+      chunk = JSON.parse(data);
+    } catch {
+      continue;
+    }
+    const delta = chunk?.choices?.[0]?.delta || {};
+    if (typeof delta.reasoning === 'string') parts.reasoning += delta.reasoning;
+    if (typeof delta.reasoning_content === 'string') parts.reasoningContent += delta.reasoning_content;
+    for (const item of Array.isArray(delta.reasoning_details) ? delta.reasoning_details : []) {
+      if (String(item?.type || '').includes('encrypted')) continue;
+      const text = [item?.text, item?.summary, item?.content].find((value) => typeof value === 'string');
+      if (text) parts.details += text;
+    }
+    if (typeof delta.content === 'string') parts.content += delta.content;
+  }
+  let channel = null;
+  if (parts.reasoning) channel = 'reasoning';
+  else if (parts.reasoningContent) channel = 'reasoningContent';
+  else if (parts.details) channel = 'details';
+  return { channel, reasoning: channel ? parts[channel] : '', content: parts.content };
+}
+
+// Every attempt a phase stopped for a loop, rebuilt from its saved body: where
+// the detector fired, how much repeated, what the slot kept in the end, and
+// the text just before the stop for a person to judge.
+export function loopReview(dir, config, { excerptChars = 1200 } = {}) {
+  const journal = path.join(dir, 'events.jsonl');
+  if (!existsSync(journal)) return [];
+  const slots = new Map();
+  const stops = [];
+  for (const line of readFileSync(journal, 'utf8').split('\n')) {
+    if (!line.trim()) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (event.kind === 'slot' && event.key) slots.set(event.key, event.slot);
+    if (event.kind === 'http' && event.phase === 'finished' && event.cancelReason === 'loop') stops.push(event);
+  }
+  return stops.map((event) => {
+    const slot = slots.get(event.key) || {};
+    const bodyFile = event.bodyFile ? path.join(dir, 'bodies', event.bodyFile) : null;
+    const texts = streamTexts(bodyFile && existsSync(bodyFile) ? readFileSync(bodyFile, 'utf8') : '');
+    let channel = null;
+    let hit = texts.reasoning ? detectLoop(texts.reasoning, config) : null;
+    if (hit) channel = texts.channel;
+    else if (texts.content) {
+      hit = detectLoop(texts.content, config);
+      if (hit) channel = 'content';
+    }
+    const text = channel === 'content' ? texts.content : texts.reasoning;
+    let outcome = 'pending';
+    if (slot.result?.loopCut) outcome = 'kept after a second loop';
+    else if (slot.state === 'completed') outcome = 'retried and finished';
+    else if (slot.state) outcome = slot.state;
+    return {
+      attemptId: event.attemptId || null,
+      questionId: slot.meta?.questionId ?? null,
+      branch: slot.meta?.branch ?? null,
+      stage: slot.meta?.stage ?? null,
+      model: event.model || slot.meta?.model || null,
+      bodyFile: event.bodyFile || null,
+      channel,
+      position: hit?.position ?? null,
+      share: hit?.share ?? null,
+      chars: text.length,
+      reproduced: Boolean(hit),
+      outcome,
+      excerpt: hit ? text.slice(Math.max(0, hit.position - excerptChars), hit.position) : text.slice(-excerptChars),
+    };
+  });
+}
+
+const LOOP_REVIEW_DIRS = ['probe', 'dev', 'smoke', 'pilot', 'test'];
+
+function runLoopReview(campaignPaths, argv) {
+  const campaign = readJson(campaignPaths.campaign);
+  if (!campaign?.loopGuard) throw new Error('This campaign has no loop guard.');
+  const of = flagValue(argv, '--of') || 'pilot';
+  if (!LOOP_REVIEW_DIRS.includes(of)) throw new Error(`--of takes one of ${LOOP_REVIEW_DIRS.join(', ')}`);
+  let dir = path.join(campaignPaths.comparison, of);
+  if (of === 'probe') dir = campaignPaths.probe;
+  else if (of === 'dev') dir = campaignPaths.dev;
+  const rows = loopReview(dir, campaign.loopGuard);
+  mkdirSync(campaignPaths.reports, { recursive: true });
+  const file = path.join(campaignPaths.reports, `loops-${of}.json`);
+  writeJson(file, { phase: of, loopGuard: campaign.loopGuard, reviewedAt: new Date().toISOString(), stops: rows });
+  console.log(`${of}: ${rows.length} loop stops`);
+  for (const row of rows) {
+    console.log(
+      `\n${row.questionId} ${row.branch}/${row.stage} ${row.model} body ${row.bodyFile}: `
+      + `${row.reproduced ? `${row.channel} at ${row.position} of ${row.chars} chars, ${(row.share * 100).toFixed(0)}% repeated` : 'NOT reproduced offline'}; `
+      + `${row.outcome}`,
+    );
+    console.log(`--- last ${Math.min(400, row.excerpt.length)} chars before the stop ---`);
+    console.log(row.excerpt.slice(-400));
+  }
+  console.log(`\nWrote ${file}. Read every stop: a stop on text that was not looping halts the campaign before test.`);
+  return 0;
+}
+
+async function report(campaignPaths, argv = []) {
+  const extended = readJson(campaignPaths.campaign, {});
+  if (extended.primaryBlocks?.length) return reportV5(campaignPaths, extended, argv);
   const dir = path.join(campaignPaths.comparison, 'test');
   const rows = [];
   if (existsSync(dir)) {
@@ -1186,6 +2051,7 @@ async function report(campaignPaths) {
 
 export async function runA8Command(argv) {
   const phase = flagValue(argv, '--phase');
+  if (phase === 'prepare') return runPrepare(argv);
   const runId = flagValue(argv, '--run') || CAMPAIGN_ID;
   const live = argv.includes('--live');
   const dry = argv.includes('--dry-run');
@@ -1196,13 +2062,16 @@ export async function runA8Command(argv) {
   }
   const maxUsd = flagValue(argv, '--max-usd');
   const maxPosts = flagValue(argv, '--max-posts');
+  const routesFrom = flagValue(argv, '--routes-from');
   const campaignPaths = pathsFor(runId);
   mkdirSync(campaignPaths.dir, { recursive: true });
   // Caps are chosen once, at preflight, and then read from campaign.json.
   const capFlags = {
+    stage1: positiveFlag(argv, '--stage1-cap', null),
     stage2: positiveFlag(argv, '--stage2-cap', null),
     stage3: positiveFlag(argv, '--final-cap', null),
   };
+  const capsMode = flagValue(argv, '--caps');
   const caps = capsFrom(capFlags);
   const existing = readJson(campaignPaths.campaign);
   if (existing) {
@@ -1213,13 +2082,17 @@ export async function runA8Command(argv) {
         throw new Error(`This campaign caps ${stage} at ${existing.stageCaps?.[stage]}. Caps are fixed at preflight.`);
       }
     }
+    if (routesFrom && existing.routesInheritedFrom !== routesFrom) {
+      throw new Error(`This campaign takes its routes from ${existing.routesInheritedFrom || 'its own preflight'}.`);
+    }
   } else if (phase !== 'preflight') {
     throw new Error('Run preflight before this phase.');
-  } else if (maxUsd != null && Number(maxUsd) !== MAX_USD) {
-    throw new Error(`This profile locks maxUsd at ${MAX_USD}.`);
-  } else if (maxPosts != null && Number(maxPosts) !== MAX_POSTS) {
-    throw new Error(`This profile locks maxPosts at ${MAX_POSTS}.`);
+  } else if (!routesFrom && maxUsd != null && Number(maxUsd) !== MAX_USD) {
+    throw new Error(`This profile locks maxUsd at ${MAX_USD}. A new extended campaign (--routes-from) sets its own.`);
+  } else if (!routesFrom && maxPosts != null && Number(maxPosts) !== MAX_POSTS) {
+    throw new Error(`This profile locks maxPosts at ${MAX_POSTS}. A new extended campaign (--routes-from) sets its own.`);
   }
+  if (routesFrom && flagValue(argv, '--from')) throw new Error('Use either --from (replay) or --routes-from (routes only).');
   const fromFlag = flagValue(argv, '--from');
   const from = fromFlag ? fromFlag.split(',').map((id) => id.trim()).filter(Boolean) : null;
   if (from && phase !== 'preflight') {
@@ -1228,16 +2101,35 @@ export async function runA8Command(argv) {
       throw new Error(`This campaign replays from [${pinned.join(', ')}]. --from is fixed at preflight.`);
     }
   }
+  // Read-only and safe beside a running phase, so it takes no lock.
+  if (phase === 'loops') return runLoopReview(campaignPaths, argv);
   const release = acquireLock(campaignPaths.dir);
   try {
     if (phase === 'preflight') {
+      if (routesFrom) {
+        const blocksFlag = flagValue(argv, '--blocks');
+        return await routesPreflight(campaignPaths, runId, {
+          routesFrom,
+          capsMode,
+          capFlags,
+          blocks: blocksFlag ? blocksFlag.split(',').map((block) => block.trim()).filter(Boolean) : [],
+          maxUsd: maxUsd != null ? positiveFlag(argv, '--max-usd', MAX_USD) : MAX_USD,
+          maxPosts: maxPosts != null ? positiveFlag(argv, '--max-posts', MAX_POSTS) : MAX_POSTS,
+        });
+      }
+      if (capsMode) throw new Error('--caps max needs --routes-from.');
       if (from) return await inheritPreflight(campaignPaths, runId, from, caps);
       return await preflight(campaignPaths, live, caps);
     }
-    if (phase === 'report') return await report(campaignPaths);
+    if (phase === 'report') return await report(campaignPaths, argv);
+    if (phase === 'reconcile') {
+      // Plain reconcile only reads prices; the self-test posts a paid call.
+      if (argv.includes('--self-test') && !live) throw new Error('reconcile --self-test posts only with --live');
+      return await runReconcile(campaignPaths, argv);
+    }
     if (!live) throw new Error(`${phase} posts only with --live`);
     if (phase === 'probe') return await runProbe(campaignPaths);
-    const run = runFlags(argv);
+    const run = { ...runFlags(argv), acceptForecast: argv.includes('--accept-forecast') };
     if (phase === 'dev') return await runDev(campaignPaths, run);
     if (phase === 'smoke' || phase === 'pilot' || phase === 'test') {
       return await runPipeline(campaignPaths, phase, run);

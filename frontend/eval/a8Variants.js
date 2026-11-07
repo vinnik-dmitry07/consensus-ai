@@ -3,6 +3,7 @@ import {
   calculateAggregateRankings,
   canonicalLabelToModel,
   computeConsensus,
+  formatStage2Result,
   stage1CollectResponsesStreaming,
   stage2CollectRankingsStreaming,
   stage3SynthesizeFinal,
@@ -20,6 +21,10 @@ import { selfMoaPrompt } from './variants.js';
 function messages(content) {
   return [{ role: 'user', content }];
 }
+
+// Every slot branch a comparison writes. The pilot forecast counts only these,
+// so calls another phase made on the same question, such as dev, stay out.
+export const COMPARISON_BRANCHES = Object.freeze(['council', 'replicates', 'A8', 'S8']);
 
 export function finalOrder(questionId, seed) {
   const digest = sha256(`${seed}\nfinal\n${questionId}`);
@@ -139,6 +144,25 @@ export function orderBySlots(session, rows, metaOf, textOf) {
     .map((item) => item.row);
 }
 
+// A call that ended at its cap or at the loop guard and whose content is its
+// own reasoning, because no visible answer was ever written.
+export function cutReasoning(result) {
+  if (!result?.ok) return false;
+  const reason = result.finishReason;
+  return (reason === 'length' || reason === 'loop') && result.contentFromReasoning === true;
+}
+
+function slotResult(slot) {
+  if (!slot?.result) return null;
+  return { ...slot.result, finishReason: slot.result.finishReason ?? slot.finishReason ?? null };
+}
+
+// What the next stage sees of a cut answer: a fixed marker and the end of the
+// reasoning. Finished answers pass whole. Scores always read the full text.
+export function forwardText(text, rule) {
+  return `${rule.marker}\n${String(text || '').slice(-rule.chars)}`;
+}
+
 class Pending extends Error {
   constructor(reason) {
     super(reason);
@@ -168,9 +192,10 @@ export async function runComparison(task, session, frozen, options = {}) {
     calls: [],
   };
   const stop = (status, reason) => ({ ...outcome, status, reason, pending: status !== 'complete' });
-  const context = (branch, stage, sample = 1, model = undefined) => (
-    model ? { questionId, branch, stage, sample, model } : { questionId, branch, stage, sample }
-  );
+  const context = (branch, stage, sample = 1, model = undefined) => {
+    if (!COMPARISON_BRANCHES.includes(branch)) throw new Error(`Comparison branch ${branch} is not declared`);
+    return model ? { questionId, branch, stage, sample, model } : { questionId, branch, stage, sample };
+  };
   const guard = () => {
     const paused = budgetPaused(session);
     if (paused) throw new Pending(paused);
@@ -218,13 +243,32 @@ export async function runComparison(task, session, frozen, options = {}) {
       return row && String(row.response || '').trim();
     });
 
+    // The tail rule. Each row is matched to its own slot by model and text,
+    // never by completion order.
+    const tailRule = options.tailRule || null;
+    const tailApplied = { stage1: 0, samples: 0, stage2: 0 };
+    const forwardedStage1 = stage1Results.map((row) => {
+      if (!tailRule) return row;
+      const slot = slotForText(session, context('council', 'stage1', 1, row.model), row.response || '');
+      if (!cutReasoning(slotResult(slot))) return row;
+      tailApplied.stage1 += 1;
+      return { ...row, response: forwardText(row.response, tailRule) };
+    });
+    const forwardedSamples = samples.map((item, index) => {
+      if (!tailRule) return item;
+      const result = index === 0 ? slotResult(sample1Slot) : item.result;
+      if (!cutReasoning(result)) return item;
+      tailApplied.samples += 1;
+      return { ...item, text: forwardText(item.text, tailRule) };
+    });
+
     // A8 needs Stage 2; S8 needs only the five samples. They run side by side.
     async function runA8() {
       let stage2Results = [];
       if (councilReady) {
         const stage2 = await collectStage(
           session,
-          stage2CollectRankingsStreaming(prompt, stage1Results, { roster }),
+          stage2CollectRankingsStreaming(prompt, forwardedStage1, { roster }),
         );
         stage2Results = orderBySlots(
           session,
@@ -234,12 +278,26 @@ export async function runComparison(task, session, frozen, options = {}) {
         );
       }
       guard();
-      const ranked = stage2Results.length
-        ? calculateAggregateRankings(stage1Results, stage2Results)
-        : { responseRankings: [], aggregateRankings: [], rankingFallback: false };
       // How many judges reached their FINAL RANKING line. The others were cut
       // at the Stage 2 cap and their ranking came from the fallback regex.
       const judgesComplete = stage2Results.filter((row) => /FINAL RANKING/i.test(row.ranking || '')).length;
+      // A cut judge is parsed from its tail only, so an unbounded stretch of
+      // reasoning cannot reach the chairman through issues or disputed claims.
+      if (tailRule) {
+        stage2Results = stage2Results.map((row) => {
+          const slot = slotForText(session, context('council', 'stage2', 1, row.model), row.ranking || '');
+          if (!cutReasoning(slotResult(slot))) return row;
+          tailApplied.stage2 += 1;
+          return formatStage2Result(
+            row.model,
+            { content: forwardText(row.ranking, tailRule), usage: row.usage },
+            { label_to_index: row.label_to_index, self_excluded: row.self_excluded },
+          );
+        });
+      }
+      const ranked = stage2Results.length
+        ? calculateAggregateRankings(stage1Results, stage2Results)
+        : { responseRankings: [], aggregateRankings: [], rankingFallback: false };
       const finish = (arm) => ({ arm, ranked, judgesComplete });
       if (!councilReady || !stage2Results.length) {
         return finish(terminal(councilReady ? 'no_stage2' : 'incomplete_council'));
@@ -258,7 +316,7 @@ export async function runComparison(task, session, frozen, options = {}) {
       );
       session.setContext(context('A8', 'stage3', 1, frozen.chairmanModel));
       try {
-        const stage3 = await stage3SynthesizeFinal(prompt, stage1Results, stage2Results, metadata, {
+        const stage3 = await stage3SynthesizeFinal(prompt, forwardedStage1, stage2Results, metadata, {
           roster,
         });
         await session.drain();
@@ -283,7 +341,7 @@ export async function runComparison(task, session, frozen, options = {}) {
       }
       const result = await queryModelResult(
         frozen.chairmanModel,
-        messages(selfMoaPrompt(prompt, samples)),
+        messages(selfMoaPrompt(prompt, forwardedSamples)),
       );
       await session.drain();
       if (result?.skipped) throw new Pending('cooldown');
@@ -327,7 +385,12 @@ export async function runComparison(task, session, frozen, options = {}) {
       replicateTexts: samples.map((item) => item.text),
       sameText: new Set(samples.map((item) => item.text)).size === 1,
       sameAnswer: new Set(replicateGrades.map((grade) => grade.extracted ?? '')).size === 1,
+      // Extracted answers, kept so a corrected gold can rescore every vote
+      // and the oracle without another call.
+      councilAnswers: councilGrades.map((grade) => (grade.status === 'graded' ? grade.extracted : null)),
+      replicateAnswers: replicateGrades.map((grade) => (grade.status === 'graded' ? grade.extracted : null)),
     };
+    if (tailRule) outcome.tailApplied = tailApplied;
     outcome.rankingFallback = Boolean(ranked.rankingFallback);
     outcome.callsExpected = frozen.councilModels.length + (SELF_SAMPLES - 1) + frozen.councilModels.length + 2;
     return outcome;

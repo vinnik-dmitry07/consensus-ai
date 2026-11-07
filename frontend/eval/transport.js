@@ -33,7 +33,15 @@ const ALLOWED_GET = new Set([
   '/api/v1/models',
   '/api/v1/key',
   '/api/v1/credits',
+  '/api/v1/generation',
 ]);
+
+// OpenRouter puts the generation id on every SSE chunk and on a JSON body.
+// The id lets a later reconcile ask what an aborted attempt really cost.
+export function generationIdFrom(text) {
+  const match = String(text || '').match(/"id"\s*:\s*"(gen-[^"\s]+)"/);
+  return match ? match[1] : null;
+}
 
 function headerObject(headers) {
   const out = {};
@@ -241,6 +249,8 @@ export function installTransport({
         promptTokens: parsed.usage?.prompt_tokens ?? null,
         completionTokens: parsed.usage?.completion_tokens ?? null,
         finishReason: parsed.finishReason,
+        generationId: generationIdFrom(text),
+        cancelReason: incomplete ? (error || null) : null,
         limit,
         serviceMs: Date.now() - started,
       });

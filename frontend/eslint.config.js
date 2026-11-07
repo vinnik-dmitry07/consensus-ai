@@ -5,7 +5,8 @@ import reactRefresh from 'eslint-plugin-react-refresh'
 import { defineConfig, globalIgnores } from 'eslint/config'
 
 export default defineConfig([
-  globalIgnores(['dist']),
+  // eval/.cache holds gitignored data and a private Python venv.
+  globalIgnores(['dist', 'eval/.cache', 'eval/.runs']),
   {
     files: ['**/*.{js,jsx}'],
     extends: [
