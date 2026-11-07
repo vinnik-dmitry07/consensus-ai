@@ -375,8 +375,10 @@ export async function runComparison(task, session, frozen, options = {}) {
     outcome.arms = arms;
     outcome.finalOrder = order;
     outcome.diagnostics = {
-      councilVote: plurality(councilGrades, (tied) => [...tied].sort()[0]),
-      replicateVote: plurality(replicateGrades, (tied) => [...tied].sort()[0]),
+      // Both votes use P8's rule, ties broken by the seeded hash, so S8 is
+      // compared with the vote of B's five samples under the same rule as P8.
+      councilVote: voteArm(task, councilGrades),
+      replicateVote: voteArm(task, replicateGrades),
       judgesComplete: a8.judgesComplete ?? 0,
       leader: leaderGrade,
       oracle: councilGrades.some((grade) => grade.correct === 1) ? 1 : 0,

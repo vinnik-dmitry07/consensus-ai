@@ -129,19 +129,20 @@ export function maxCommonCap(routes) {
 
 export const V5_PILOT_PER_BLOCK = 2;
 export const V5_PILOT_PER_BLOCK_MAX = 4;
-// With two to four pilot questions per block, this quantile picks the dearest
-// one: the conservative forecast is the worst pilot question of each block.
-export const FORECAST_QUANTILE = 0.9;
+// The stress forecast of a block is max(factor x mean, dearest pilot
+// question). The factor is an assumption fixed before the pilot.
+export const FORECAST_STRESS_FACTOR = 1.5;
 
-// The secondary family of an extended campaign, under one Holm correction.
-// The primary pair, A8 against S8 on the new blocks, is not in it. Groups B
-// and C are pooled: with the v4 council B is one month of ArXivMath, too small
-// to test, and a near-powerless entry would only cost the others power. The report still
-// shows A, B, and C one by one as diagnostics.
+// The secondary family of an extended campaign, under one Holm correction,
+// always four entries. The primary pair, A8 against S8 on the new blocks, is
+// not in it. Groups B and C are pooled: with the v4 council B is one month of
+// ArXivMath, too small to test, and a near-powerless entry would only cost the
+// others power. The legacy blocks are not in it either: caps were tuned on
+// them four times, which no multiplicity correction undoes, so the report
+// shows them as a regression check. A, B, and C one by one are diagnostics.
 export const V5_SECONDARY_FAMILY = [
   { name: 'A8 - S8, group A', left: 'A8', right: 'S8', set: 'primary', groups: ['A'] },
   { name: 'A8 - S8, groups B and C', left: 'A8', right: 'S8', set: 'primary', groups: ['B', 'C'] },
-  { name: 'A8 - S8, legacy blocks', left: 'A8', right: 'S8', set: 'legacy' },
   { name: 'A8 - P8', left: 'A8', right: 'P8', set: 'primary' },
   { name: 'S8 - P8', left: 'S8', right: 'P8', set: 'primary' },
 ];
@@ -156,7 +157,7 @@ export function v5Policy() {
     pilotGate: true,
     pilotPerBlock: V5_PILOT_PER_BLOCK,
     pilotPerBlockMax: V5_PILOT_PER_BLOCK_MAX,
-    forecastQuantile: FORECAST_QUANTILE,
+    forecastStressFactor: FORECAST_STRESS_FACTOR,
     secondaryFamily: V5_SECONDARY_FAMILY,
     devPerBlock: null,
   };

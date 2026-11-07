@@ -21,12 +21,24 @@ import {
   probePlan,
   reconcileBudget,
   SOURCE_FILES,
+  runStages,
   stageCounters,
   streamTexts,
   testOrder,
+  testStages,
 } from './a8.js';
+import { rgymCheck } from './a8Prepare.js';
+import { sha256 } from './util.js';
 import { capsFrom, contextProblems, maxCommonCap, profileDocument, v5Policy } from './a8Profile.js';
-import { applyGoldOverrides, interpretV5, lenientRows, renderA8Report, renderV5Report, secondaryFamily } from './a8Report.js';
+import {
+  applyGoldOverrides,
+  interpretV5,
+  lenientRows,
+  renderA8Report,
+  renderV5Report,
+  secondaryFamily,
+  transitions,
+} from './a8Report.js';
 import { createCampaignBudget } from './budget.js';
 
 // Route limits as the a8-open-v4 snapshot records them.
@@ -94,6 +106,27 @@ describe('v5 scheduling', () => {
     expect(orderBlocks(['mystery', 'rgym', 'aime'])).toEqual(['aime', 'rgym', 'mystery']);
   });
 
+  it('sends no legacy question while a primary one is unfinished', async () => {
+    const items = [item('p1', 'rgym'), item('p2', 'amc'), item('l1', 'aime'), item('l2', 'gpqa')];
+    const order = ['p1', 'l1', 'p2', 'l2'];
+    expect(testStages(order, items, ['rgym', 'amc'])).toEqual([['p1', 'p2'], ['l1', 'l2']]);
+    expect(testStages(order, items, [])).toEqual([order]);
+    const started = [];
+    // The primary stage stops on a pause: the legacy stage never starts.
+    expect(await runStages(testStages(order, items, ['rgym', 'amc']), async (ids, index) => {
+      started.push(index);
+      return index === 0 ? 2 : 0;
+    })).toBe(2);
+    expect(started).toEqual([0]);
+    // A finished primary stage lets the legacy stage run; an empty stage is skipped.
+    started.length = 0;
+    expect(await runStages([['p1'], [], ['l1']], async (ids, index) => {
+      started.push(index);
+      return 0;
+    })).toBe(0);
+    expect(started).toEqual([0, 2]);
+  });
+
   it('runs every primary block before the legacy ones, and keeps old campaigns on one interleave', () => {
     const items = [
       ...Array.from({ length: 4 }, (_, index) => item(`a${index}`, 'aime')),
@@ -125,7 +158,7 @@ describe('v5 scheduling', () => {
     expect(bankCounts(items).blocks.amc).toEqual({ dev: 0, smoke: 0, test: 1 });
   });
 
-  it('forecasts per block with held reserves at full value and gates on the high case', () => {
+  it('forecasts per block with held reserves at full value and gates on the stress case of the primary set', () => {
     const budget = createCampaignBudget({ maxUsd: 10, maxPosts: 100, prices: { m: { prompt: '0.000001', completion: '0.000001' } } });
     const spend = [['dev:aime:1', 0.3], ['dev:aime:2', 0.5], ['dev:gpqa:1', 0.1]];
     for (const [id, cost] of spend) {
@@ -134,22 +167,37 @@ describe('v5 scheduling', () => {
     }
     budget.admit({ attemptId: 'dev:aime:2|council|stage2|1|m|h#1', model: 'm', promptTokens: 10, maxTokens: 10 });
     budget.settle({ attemptId: 'dev:aime:2|council|stage2|1|m|h#1', incomplete: true });
-    // Ten AIME questions at about $0.5 each do not fit what $6 leaves.
+    // AIME pilot questions cost $0.3 and $0.5 (plus a tiny held reserve), GPQA $0.1.
+    // Here AIME and AMC are the primary set and GPQA the legacy one.
     const campaign = {
       maxUsd: 6,
       maxPosts: 100,
-      forecastQuantile: 0.9,
+      forecastStressFactor: 1.5,
+      primaryBlocks: ['aime', 'amc'],
       counts: { blocks: { aime: { test: 10 }, gpqa: { test: 4 }, amc: { test: 2 } } },
     };
     const items = [item('dev:aime:1', 'aime', 'dev'), item('dev:aime:2', 'aime', 'dev'), item('dev:gpqa:1', 'gpqa', 'dev')];
     const forecast = pilotForecast({ campaign, budget, items, order: items.map((entry) => entry.id) });
     const aime = forecast.blocks.find((entry) => entry.block === 'aime');
     expect(aime.meanPosts).toBe(1.5);
-    expect(aime.highUsd).toBeGreaterThan(0.5);
-    expect(forecast.blocks.find((entry) => entry.block === 'amc').proxy).toBe('dearest choice block');
-    expect(forecast.highUsd).toBeGreaterThan(forecast.mainUsd);
+    // Stress is max(1.5 x mean, dearest question): 1.5 x 0.4 beats 0.5.
+    expect(aime.stressUsd).toBeCloseTo(1.5 * aime.meanUsd, 6);
+    expect(aime.stressPosts).toBe(2.25);
+    const gpqa = forecast.blocks.find((entry) => entry.block === 'gpqa');
+    expect(gpqa).toMatchObject({ primary: false, stressPosts: 1.5 });
+    // AMC has no pilot questions and takes the largest value over all pilot blocks, AIME here, not GPQA.
+    const amc = forecast.blocks.find((entry) => entry.block === 'amc');
+    expect(amc.proxy).toBe('largest over the pilot blocks');
+    expect(amc.stressUsd).toBe(aime.stressUsd);
+    expect(forecast.primary.stressUsd).toBeCloseTo(12 * aime.stressUsd, 6);
+    expect(forecast.full.stressUsd).toBeCloseTo(forecast.primary.stressUsd + 4 * gpqa.stressUsd, 6);
+    expect(forecast.formula).toMatch(/max\(factor x mean, dearest pilot question\)/);
     expect(forecast.gate).toBe('fail');
-    expect(pilotForecast({ campaign: { ...campaign, maxUsd: 10 }, budget, items, order: items.map((entry) => entry.id) }).gate).toBe('pass');
+    // The gate needs only the primary set: here it fits while the whole test does not.
+    const roomy = pilotForecast({ campaign: { ...campaign, maxUsd: 8.3 }, budget, items, order: items.map((entry) => entry.id) });
+    expect(roomy.primary.fits).toBe(true);
+    expect(roomy.full.fits).toBe(false);
+    expect(roomy.gate).toBe('pass');
     // The dev phase posts on the same question ids; those calls are not pilot cost.
     budget.admit({ attemptId: 'dev:aime:1|dev|stage1|1|m|h#1', model: 'm', promptTokens: 10, maxTokens: 10 });
     budget.settle({ attemptId: 'dev:aime:1|dev|stage1|1|m|h#1', usage: { prompt_tokens: 1, completion_tokens: 1, cost: 2 } });
@@ -188,6 +236,31 @@ describe('v5 method hash', () => {
     expect(Array.isArray(state.dirty)).toBe(true);
     // Paths come back whole, from the repository root.
     for (const file of state.dirty) expect(file).toMatch(/^frontend\/eval\/a8\.js$/);
+  });
+});
+
+describe('v5 reasoning-gym gold checks', () => {
+  const row = (sourceId, question = 'What is 2 + 2?') => ({ dataset: 'rgym-aiw', sourceId, question });
+  const record = (sourceId, decision, reason = null, question = 'What is 2 + 2?') => [
+    `rgym-aiw:${sourceId}`,
+    { dataset: 'rgym-aiw', sourceId, decision, reason, questionSha: sha256(question).slice(0, 16) },
+  ];
+
+  it('needs a check per row, on the same statement, that agrees with the hashed exclusion list', () => {
+    const verify = new Map([
+      record('test-ok', 'include'),
+      record('test-20261106-3', 'exclude', 'ambiguous'),
+      record('test-20261106-4', 'exclude', 'wrong_gold'),
+      record('test-unlisted', 'exclude', 'ambiguous'),
+    ]);
+    expect(rgymCheck(row('test-ok'), verify)).toBeNull();
+    expect(rgymCheck(row('test-20261106-3'), verify)).toBe('ambiguous');
+    expect(() => rgymCheck(row('test-missing'), verify)).toThrow(/no gold check/);
+    expect(() => rgymCheck(row('test-ok', 'What is 2 + 3?'), verify)).toThrow(/changed after its gold check/);
+    // The list says ambiguous, the check says wrong_gold: refused.
+    expect(() => rgymCheck(row('test-20261106-4'), verify)).toThrow(/exclusion list says ambiguous/);
+    // Excluded by the check but missing from the hashed list: refused.
+    expect(() => rgymCheck(row('test-unlisted'), verify)).toThrow(/exclusion list says include/);
   });
 });
 
@@ -290,17 +363,33 @@ describe('v5 accounting', () => {
     dirs.push(dir);
     const meta = (stage, branch = 'council') => ({ questionId: 'q', branch, stage, sample: 1, model: 'm', requestHash: stage });
     const events = [
-      { kind: 'slot', key: 'k1', slot: { key: 'k1', meta: meta('stage2'), state: 'completed', result: { ok: true, finishReason: 'length' } } },
+      {
+        kind: 'slot',
+        key: 'k1',
+        slot: {
+          key: 'k1', meta: meta('stage2'), state: 'completed', request: { max_tokens: 32768 }, usage: { completion_tokens: 32768 }, result: { ok: true, finishReason: 'length' },
+        },
+      },
+      {
+        kind: 'slot',
+        key: 'k4',
+        slot: {
+          key: 'k4', meta: meta('stage2', 'A8'), state: 'completed', request: { max_tokens: 32768 }, usage: { completion_tokens: 16000 }, result: { ok: true, finishReason: 'length' },
+        },
+      },
       { kind: 'slot', key: 'k2', slot: { key: 'k2', meta: meta('stage2'), state: 'completed', result: { ok: true, loopCut: true, finishReason: 'loop' } } },
       { kind: 'http', phase: 'finished', key: 'k2', cancelReason: 'loop' },
       { kind: 'http', phase: 'finished', key: 'k2', cancelReason: 'loop' },
+      { kind: 'http', phase: 'finished', key: 'k1', status: 402, credit: 'in_flight_budget' },
+      { kind: 'http', phase: 'finished', key: 'k1', status: 402, credit: 'insufficient_funds' },
       { kind: 'slot', key: 'k3', slot: { key: 'k3', meta: meta('stage3', 'A8'), state: 'failed', result: { ok: false, error: { kind: 'context' } } } },
     ];
     const file = path.join(dir, 'events.jsonl');
     writeFileSync(file, events.map((event) => JSON.stringify(event)).join('\n'));
+    const zero = { calls: 0, cap: 0, belowCap: 0, loopStops: 0, loopCut: 0, context: 0, failed: 0, creditRetries: 0 };
     expect(stageCounters(file)).toEqual({
-      judges: { calls: 2, cap: 1, loopStops: 2, loopCut: 1, context: 0, failed: 0 },
-      'A8 synthesis': { calls: 1, cap: 0, loopStops: 0, loopCut: 0, context: 1, failed: 1 },
+      judges: { ...zero, calls: 3, cap: 2, belowCap: 1, loopStops: 2, loopCut: 1, creditRetries: 1 },
+      'A8 synthesis': { ...zero, calls: 1, context: 1, failed: 1 },
     });
   });
 
@@ -379,12 +468,75 @@ describe('v5 report', () => {
     expect(rows[0].arms.A8.correct).toBe(0);
   });
 
-  it('never reads p >= 0.05 as equality and gives no claim on a partial test', () => {
-    const base = { n: 100, delta: 0.01, p: 0.6, interval: { low: -0.04, high: 0.06, degenerate: false } };
-    expect(interpretV5(base, 100, true).join(' ')).toMatch(/not evidence that the two methods are equal/);
-    expect(interpretV5(base, 100, true).join(' ')).toMatch(/do not decide the sign/);
-    expect(interpretV5({ ...base, delta: -0.08, p: 0.01, interval: { low: -0.12, high: -0.03 } }, 100, true)[0]).toMatch(/S8 is ahead/);
+  it('answers direction, size, and equivalence apart, and never reads p >= 0.05 as equality', () => {
+    const interval = (low, high) => ({ low, high, degenerate: false });
+    const base = { n: 100, wins: 15, losses: 15, delta: 0, p: 1, interval: interval(-0.04, 0.04), interval90: interval(-0.03, 0.03) };
+    const reading = interpretV5(base, 100, true).join(' | ');
+    expect(reading).toMatch(/direction: not established; this is not evidence that the two methods are equal/);
+    expect(reading).toMatch(/A8 ahead by more than 5 percentage points: not supported by the 95% interval/);
+    expect(reading).toMatch(/S8 ahead by more than 5 percentage points: not supported by the 95% interval/);
+    expect(reading).toMatch(/practical equivalence within ±5 percentage points: supported by the 90% interval \(an approximate bootstrap criterion/);
+    // A bound equal to the threshold does not pass it.
+    const edge = interpretV5({ ...base, interval: interval(0.05, 0.12), interval90: interval(0.05, 0.1) }, 100, true).join(' | ');
+    expect(edge).toMatch(/A8 ahead by more than 5 percentage points: undecided/);
+    expect(edge).toMatch(/practical equivalence within ±5 percentage points: not shown/);
+    const wide = interpretV5({ ...base, interval90: interval(-0.06, 0.03) }, 100, true).join(' | ');
+    expect(wide).toMatch(/practical equivalence within ±5 percentage points: not shown/);
+    const s8 = interpretV5({ ...base, delta: -0.08, p: 0.01, interval: interval(-0.12, -0.06) }, 100, true);
+    expect(s8[0]).toMatch(/S8 is ahead/);
+    expect(s8.join(' | ')).toMatch(/S8 ahead by more than 5 percentage points: supported/);
+    const degenerate = interpretV5({ ...base, interval: { low: 0, high: 0, degenerate: true } }, 100, true);
+    expect(degenerate).toHaveLength(2);
+    expect(degenerate[1]).toMatch(/degenerate/);
+    expect(interpretV5({ ...base, wins: 4, losses: 3 }, 100, true).join(' | ')).toMatch(/only 7 discordant pairs/);
     expect(interpretV5(base, 120, true)[0]).toMatch(/interim/);
+    expect(interpretV5(base, 100, false)[0]).toMatch(/interim/);
+  });
+
+  it('keeps the primary reading final when only the legacy blocks are pending, and shows the mechanisms', () => {
+    const diag = (leader, vote, council, b3) => ({
+      diagnostics: { leader: { status: 'graded', correct: leader }, replicateVote: { status: 'graded', correct: vote } },
+      oracleCouncil: council,
+      oracleB3: b3,
+    });
+    const rows = [
+      row('test:rgym:1', 'rgym', { A8: 1, S8: 0, P8: 1, B8: 0 }, { set: 'primary', group: 'A', ...diag(0, 1, 1, 1) }),
+      row('test:arxiv:1', 'arxiv', { A8: 1, S8: 1, P8: 0, B8: 1 }, { set: 'primary', group: 'C', ...diag(1, 1, 1, 1) }),
+      row('test:hmmt:1', 'hmmt', { A8: 0, S8: 1, P8: 0, B8: 0 }, { set: 'primary', group: 'C', ...diag(1, 0, 1, 0) }),
+      { id: 'test:aime:1', block: 'aime', status: 'pending', set: 'legacy', group: 'C' },
+    ];
+    const input = {
+      rows,
+      planned: 4,
+      plannedPrimary: 3,
+      plannedLegacy: 1,
+      primaryComplete: true,
+      legacyComplete: false,
+      moneyFinal: false,
+      primaryBlocks: ['rgym', 'arxiv', 'hmmt'],
+      family: profileDocument(capsFrom({}), v5Policy()).secondaryFamily,
+      listings: {},
+      dev: { table: [{ id: 'b/one', correct: 30, expected: 40, successes: 40, accuracy: 0.75 }, { id: 'c/two', correct: 28, expected: 40, successes: 39, accuracy: 0.7 }], blocks: { aime: 8, rgym: 4 } },
+    };
+    const text = renderV5Report(input);
+    expect(text).toContain('Primary set: 3 of 3 pairs, complete. Legacy blocks: 0 of 1, incomplete. Pending questions: 1. Cost: preliminary');
+    expect(text).not.toMatch(/Reading: interim/);
+    expect(text).toContain('Reading: direction: not established');
+    expect(text).toContain('One corrected gold moves this difference by at most 66.7 pp.');
+    expect(text).toContain('## Regression check on the legacy blocks (diagnostic)');
+    expect(text).toContain('No completed legacy pairs yet.');
+    expect(text).toContain('| Stage 2 leader | 66.7% |');
+    expect(text).toContain('| Oracle@3, B samples 1 to 3 | 66.7% |');
+    // Chairman over the leader: rgym fixed, hmmt broke; 2/3 before, 2/3 after.
+    expect(text).toContain('| Chairman over the Stage 2 leader | 3 | 66.7% | 66.7% | 1 | 1 |');
+    expect(text).toContain('| Self-MoA synthesis over the vote of five samples | 3 | 66.7% | 66.7% | 1 | 1 |');
+    expect(text).toContain('## Without one block at a time (diagnostic)');
+    expect(text).toContain('| b/one | 30 / 40 | 40 / 40 | 75.0% |');
+    expect(text).toContain('Gap between the first and the second: 5.0 pp.');
+    const pending = renderV5Report({ ...input, primaryComplete: false });
+    expect(pending).toContain('Reading: interim');
+    const step = transitions(rows.slice(0, 3), (entry) => entry.diagnostics.leader, (entry) => entry.arms.A8);
+    expect(step.final - step.base).toBeCloseTo((step.fixes - step.breaks) / step.n);
   });
 
   it('builds the primary set, the Holm family, and the chronology table', () => {
@@ -399,19 +551,25 @@ describe('v5 report', () => {
     expect(results.map((entry) => entry.name)).toEqual([
       'A8 - S8, group A',
       'A8 - S8, groups B and C',
-      'A8 - S8, legacy blocks',
       'A8 - P8',
       'S8 - P8',
     ]);
-    expect(results.map((entry) => entry.n)).toEqual([1, 2, 1, 3, 3]);
+    expect(results.map((entry) => entry.n)).toEqual([1, 2, 3, 3]);
     // A family recorded with a single `group` still reads.
     expect(secondaryFamily(rows, [{ name: 'B', left: 'A8', right: 'S8', set: 'primary', group: 'B' }])[0].n).toBe(1);
     expect(results.every((entry) => entry.holmP >= entry.p)).toBe(true);
+    // An empty group stays in the family at p = 1, so the others are corrected for four tests.
+    const withoutA = secondaryFamily(rows.filter((entry) => entry.group !== 'A'), family);
+    expect(withoutA).toHaveLength(4);
+    expect(withoutA[0]).toMatchObject({ n: 0, p: 1, empty: true, holmP: 1 });
     const text = renderV5Report({
       rows,
       planned: 4,
       plannedPrimary: 3,
-      complete: true,
+      plannedLegacy: 1,
+      primaryComplete: true,
+      legacyComplete: true,
+      moneyFinal: true,
       primaryBlocks: ['rgym', 'arxiv', 'hmmt'],
       family,
       listings: { 'b/one': '2026-10-08' },
@@ -426,14 +584,16 @@ describe('v5 report', () => {
       loopGuard: {},
       tailRule: { chars: 8000 },
     });
-    expect(text).toContain('Completed pairs: 3');
-    expect(text).toContain('| A8 - S8, legacy blocks | 1 |');
+    expect(text).toContain('Primary set: 3 of 3 pairs, complete. Legacy blocks: 1 of 1, complete. Pending questions: 0. Cost: final.');
+    expect(text).not.toContain('| A8 - S8, legacy blocks |');
+    expect(text).toMatch(/A8 − S8: 0\.0 pp on 1\. Wins \/ losses \/ ties: 0 \/ 0 \/ 1\./);
     expect(text).toContain('| A | 1 | reasoning-gym |');
     expect(text).toContain('| arxivmath-0926 | ArXivMath | 53 | 25 | unsupported_answer 28 |');
     expect(text).toContain('Tail rule applied: Stage 1 answers 1, B samples 0, judges 1.');
     expect(text).toContain('one cap of 32768 tokens');
-    expect(text).not.toMatch(/equivalent/);
+    expect(text).toContain('Preparation phases (probe, dev, smoke, pilot, self-test): $0.5000.');
     expect(text).toContain('this is not evidence that the two methods are equal');
+    expect(text).toContain('It does not isolate the council, model diversity, the caps, or the loop guard');
   });
 
   it('adds the lenient reading and the adapted-items sensitivity line as diagnostics', () => {
@@ -463,7 +623,7 @@ describe('v5 report', () => {
       lenientRules: 'lenient-v1',
       planned: 3,
       plannedPrimary: 3,
-      complete: true,
+      primaryComplete: true,
       primaryBlocks: ['rgym', 'amc', 'arxiv'],
       family: profileDocument(capsFrom({}), v5Policy()).secondaryFamily,
       listings: {},

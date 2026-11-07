@@ -223,6 +223,7 @@ export function installTransport({
       const parsed = usageFromText(text, contentType);
       const incomplete = !bodyLooksComplete(text, contentType);
       const limit = status === 429 ? classifyLimitMessage(text) : null;
+      const credit = classifyCreditResponse(status, text);
       if (status === 429 && limit === 'platform_day') {
         budget.pause('platform_day', nextUtcMidnight());
       }
@@ -252,10 +253,10 @@ export function installTransport({
         generationId: generationIdFrom(text),
         cancelReason: incomplete ? (error || null) : null,
         limit,
+        credit: credit?.kind || null,
         serviceMs: Date.now() - started,
       });
       budget.charge?.(model, parsed.usage, parsed.known, body.max_tokens);
-      const credit = classifyCreditResponse(status, text);
       const released = credit?.preProvider === true && !parsed.known;
       budget.settle?.({
         attemptId: store.attemptId,
@@ -306,6 +307,9 @@ export function installTransport({
         incomplete: false,
         usage: null,
         usageKnown: false,
+        // Which refusal this was, so the report can count the free in-flight
+        // credit refusals that the transport retries once.
+        credit: credit?.kind || null,
         serviceMs: Date.now() - started,
       });
       const released = credit?.preProvider === true;

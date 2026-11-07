@@ -160,12 +160,35 @@ function splitPool(source, items) {
   return out;
 }
 
-function rgymItems(rows) {
+// The gold check of each generated row, keyed like MANUAL_EXCLUSIONS. Every
+// row needs one, made on the same statement, and an excluded row must be in
+// the hashed exclusion list with the same reason.
+export function rgymCheck(row, verify) {
+  const id = `${row.dataset}:${row.sourceId}`;
+  const check = verify?.get(id);
+  if (!check) throw new Error(`rgym ${id} has no gold check in the verify file`);
+  if (check.questionSha !== sha256(String(row.question)).slice(0, 16)) {
+    throw new Error(`rgym ${id} changed after its gold check`);
+  }
+  const manual = MANUAL_EXCLUSIONS[id] || null;
+  const excluded = check.decision === 'exclude';
+  if (excluded !== Boolean(manual) || (manual && check.reason !== manual)) {
+    throw new Error(`rgym ${id}: the gold check says ${check.decision} (${check.reason || 'no reason'}), the exclusion list says ${manual || 'include'}`);
+  }
+  return manual;
+}
+
+function rgymItems(rows, verify) {
   const items = [];
   const exclusions = [];
   rows.forEach((row, index) => {
     const goldCanon = canonNumber(row.answer);
     const base = { dataset: row.dataset, sourceId: row.sourceId, block: 'rgym', row: index };
+    const manual = rgymCheck(row, verify);
+    if (manual) {
+      exclusions.push({ ...base, reason: manual });
+      return;
+    }
     if (!row.question || goldCanon == null) {
       exclusions.push({ ...base, reason: row.question ? 'unsupported_answer' : 'broken_statement' });
       return;
@@ -315,8 +338,16 @@ export async function buildExtensionBank({ log = console.log, refresh = false } 
       continue;
     }
     sources[name] = { file: manual.file, fileSha: fileSha(file), rows: rows.length, note: manual.note || null };
+    let verify = null;
+    if (manual.verify) {
+      const verifyFile = path.join(MANUAL_DIR, manual.verify);
+      const record = readJson(verifyFile);
+      if (!record?.records) throw new Error(`${manual.verify} is missing; every ${manual.block} row needs its gold check`);
+      verify = new Map(record.records.map((entry) => [`${entry.dataset}:${entry.sourceId}`, entry]));
+      sources[name].verify = { file: manual.verify, fileSha: fileSha(verifyFile), records: record.records.length };
+    }
     coverage[name] = { block: manual.block, total: rows.length, eligible: 0, excluded: {} };
-    const built = name === 'rgym' ? rgymItems(rows) : amcItems(rows, manual);
+    const built = name === 'rgym' ? rgymItems(rows, verify) : amcItems(rows, manual);
     for (const exclusion of built.exclusions) {
       exclusions.push(exclusion);
       coverage[name].excluded[exclusion.reason] = (coverage[name].excluded[exclusion.reason] || 0) + 1;

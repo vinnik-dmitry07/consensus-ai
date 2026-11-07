@@ -137,6 +137,9 @@ describe('A8 comparison', () => {
     expect(calls).toHaveLength(12);
     expect(calls.filter((call) => call.model === 'alpha/one').length).toBeGreaterThan(0);
     expect(calls.every((call) => !call.content.includes('GOLD-TOKEN-99'))).toBe(true);
+    // Both diagnostic votes follow P8's rule, so the council vote is P8 itself.
+    expect(outcome.diagnostics.councilVote).toEqual(outcome.arms.P8);
+    expect(outcome.diagnostics.replicateVote).toMatchObject({ status: 'graded', correct: 0, text: '' });
     expect(outcome.arms.A8.model).toBe('alpha/one');
     expect(outcome.arms.S8.model).toBe('alpha/one');
     expect(outcome.arms.P8.status).toBe('graded');
@@ -255,8 +258,9 @@ describe('rejectFree', () => {
     }
   });
 
-  it('pauses after a second in-flight 402', async () => {
+  it('pauses after a second in-flight 402, names the refusal, and counts every POST', async () => {
     let calls = 0;
+    const events = [];
     const budget = createCampaignBudget({
       maxUsd: 10,
       maxPosts: 5,
@@ -274,6 +278,7 @@ describe('rejectFree', () => {
       allowPaid: true,
       rejectFree: true,
       budget,
+      onHttp: (event) => events.push(event),
     });
     try {
       const response = await attemptStore.run({ key: 'slot' }, () => fetch('https://openrouter.ai/api/v1/chat/completions', {
@@ -288,6 +293,11 @@ describe('rejectFree', () => {
       expect(await response.text()).toContain('in_flight');
       expect(calls).toBe(2);
       expect(budget.state.pauseReason).toBe('in_flight_budget');
+      // Both physical POSTs went through admit, and the journal names the refusal.
+      expect(budget.state.posts).toBe(2);
+      expect(events.filter((event) => event.phase === 'finished').map((event) => event.credit)).toEqual(['in_flight_budget', 'in_flight_budget']);
+      // Only the first POST of the run is reserved as an attempt; the free retry is not.
+      expect(events.filter((event) => event.phase === 'reserved')).toHaveLength(1);
     } finally {
       restore();
     }

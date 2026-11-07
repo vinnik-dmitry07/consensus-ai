@@ -98,6 +98,8 @@ export const HF_SOURCES = {
 export const MANUAL_SOURCES = {
   rgym: {
     file: 'rgym.jsonl',
+    // One independent gold check per row; prepare refuses a row without one.
+    verify: 'rgym-verify.json',
     block: 'rgym',
     generator: 'frontend/eval/tools/rgym_generate.py',
     procedural: true,
@@ -119,8 +121,17 @@ export const SPLIT_SEED_A8X = 'a8x-split-v1';
 // largest value, so the list is explicit.
 // hmmt_feb_2026:32 asks for every possible value and tells the model to box a
 // comma-separated list, which clashes with the one-number ANSWER line.
+// The reasoning-gym entries come from the independent gold check recorded in
+// .cache/manual/rgym-verify.json: three aiw questions ask about a person the
+// statement never introduces, one aiw colleague puzzle has a gold that counts
+// a person twice, and one gsm_symbolic question asks for 60.8 students.
 export const MANUAL_EXCLUSIONS = {
   'hmmt_feb_2026:32': 'set_valued',
+  'rgym-aiw:test-20261106-2': 'wrong_gold',
+  'rgym-aiw:test-20261106-3': 'ambiguous',
+  'rgym-aiw:test-20261106-4': 'ambiguous',
+  'rgym-aiw:test-20261106-9': 'ambiguous',
+  'rgym-gsm_symbolic:test-20261106-8': 'inconsistent',
 };
 
 // Which blocks a v5 test reports as the primary set. Legacy blocks are a

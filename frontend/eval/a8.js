@@ -31,6 +31,7 @@ import {
   DEFAULT_MAX_RESUMES,
   DEFAULT_MODEL_IN_FLIGHT,
   DEV_PER_BLOCK,
+  FORECAST_STRESS_FACTOR,
   MAX_ATTEMPTS,
   MAX_IN_FLIGHT,
   MAX_POSTS,
@@ -260,6 +261,29 @@ export function testOrder(items, primaryBlocks = [], seed = SCHEDULE_SEED) {
   const primary = items.filter((item) => primaryBlocks.includes(item.block));
   const rest = items.filter((item) => !primaryBlocks.includes(item.block));
   return [...interleave(primary, seed), ...interleave(rest, seed)];
+}
+
+// Stages of a test run. A campaign with primary blocks finishes every primary
+// question before the first legacy question is sent: with many workers, one
+// queue would let legacy questions spend while primary ones still wait on a
+// retry or a cooldown.
+export function testStages(order, items, primaryBlocks = []) {
+  if (!primaryBlocks?.length) return [order];
+  const blockOf = new Map(items.map((item) => [item.id, item.block]));
+  const primary = order.filter((id) => primaryBlocks.includes(blockOf.get(id)));
+  const legacy = order.filter((id) => !primaryBlocks.includes(blockOf.get(id)));
+  return [primary, legacy];
+}
+
+// Runs stages in order. A stage that stops (pause, fatal, unfinished) leaves
+// every later stage unstarted.
+export async function runStages(stages, runStage) {
+  for (const [index, ids] of stages.entries()) {
+    if (!ids.length) continue;
+    const code = await runStage(ids, index);
+    if (code) return code;
+  }
+  return 0;
 }
 
 async function fetchJson(url, key) {
@@ -675,6 +699,8 @@ export async function routesPreflight(campaignPaths, runId, options) {
   console.log(`preflight caps: one cap of ${largest} tokens on every stage; stream deadline ${profile.streamTimeoutSeconds}s`);
   console.log(`preflight blocks: ${blocks.join(', ')}; primary ${primaryBlocksOf(blocks).join(', ')}`);
   console.log(`preflight counts: smoke ${counts.smoke}, dev ${counts.dev}, test ${counts.test}; budget $${maxUsd} / ${maxPosts} POSTs`);
+  const primaryTest = primaryBlocksOf(blocks).reduce((sum, block) => sum + (counts.blocks[block]?.test || 0), 0);
+  console.log(`preflight test: ${primaryTest} primary questions (${primaryBlocksOf(blocks).join(', ')}), then ${counts.test - primaryTest} legacy (${LEGACY_BLOCKS.join(', ')})`);
   return 0;
 }
 
@@ -1382,17 +1408,16 @@ export function pilotItems(items, perBlock, seed = SCHEDULE_SEED) {
   ));
 }
 
-function quantileOf(values, q) {
-  if (!values.length) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  const index = Math.min(sorted.length - 1, Math.ceil(q * sorted.length) - 1);
-  return sorted[Math.max(0, index)];
-}
+const FORECAST_FORMULA = 'Per block: base = mean cost of a pilot question; stress = max(factor x mean, dearest pilot question). '
+  + 'Same for POSTs. A pilot question counts all its comparison calls and retries, a settled call at its cost and an unresolved one at its whole reserve; '
+  + 'dev calls on the same question are left out. A block without pilot questions takes, for each value, the largest among the blocks with pilot data. '
+  + 'The gate is the stress forecast of the primary set against what is left; the factor is an assumption, not a quantile or a guarantee.';
 
 // Spend and posts of each pilot question from the campaign ledger: a settled
 // attempt counts at its cost, an unresolved one at its whole reserve. Only
 // comparison calls count: pilot questions are dev questions, and the dev
-// phase posted its own calls on the same question ids.
+// phase posted its own calls on the same question ids. Two forecasts: the
+// primary set alone, which gates the test, and the whole test.
 export function pilotForecast({ campaign, budget, items, order }) {
   const perQuestion = new Map(order.map((id) => [id, { usd: 0, posts: 0 }]));
   for (const [attemptId, row] of Object.entries(budget.state.reservations || {})) {
@@ -1412,49 +1437,67 @@ export function pilotForecast({ campaign, budget, items, order }) {
     blocks[block].usd.push(entry.usd);
     blocks[block].posts.push(entry.posts);
   }
-  const q = campaign.forecastQuantile ?? 0.9;
+  const factor = campaign.forecastStressFactor ?? FORECAST_STRESS_FACTOR;
+  const mean = (values) => values.reduce((sum, value) => sum + value, 0) / values.length;
   const stats = {};
   for (const [block, row] of Object.entries(blocks)) {
-    const mean = (values) => values.reduce((sum, value) => sum + value, 0) / values.length;
     stats[block] = {
       pilotQuestions: row.usd.length,
+      observedUsd: row.usd,
+      observedPosts: row.posts,
       meanUsd: mean(row.usd),
-      highUsd: quantileOf(row.usd, q),
+      stressUsd: Math.max(factor * mean(row.usd), Math.max(...row.usd)),
       meanPosts: mean(row.posts),
-      highPosts: quantileOf(row.posts, q),
+      stressPosts: Math.max(factor * mean(row.posts), Math.max(...row.posts)),
     };
   }
-  // A block with no dev questions borrows the dearest choice block.
-  const choiceProxy = ['gpqa', 'mmlu'].map((block) => stats[block]).filter(Boolean)
-    .sort((left, right) => right.highUsd - left.highUsd)[0] || null;
-  const tests = campaign.counts?.blocks || {};
+  // A block without pilot questions takes, value by value, the largest among
+  // all blocks with pilot data, not only the choice blocks.
+  const known = Object.values(stats);
+  const largest = (field) => (known.length ? Math.max(...known.map((row) => row[field])) : null);
+  const proxy = known.length ? {
+    pilotQuestions: 0,
+    meanUsd: largest('meanUsd'),
+    stressUsd: largest('stressUsd'),
+    meanPosts: largest('meanPosts'),
+    stressPosts: largest('stressPosts'),
+  } : null;
+  const primaryBlocks = campaign.primaryBlocks || [];
+  const sums = () => ({ baseUsd: 0, stressUsd: 0, basePosts: 0, stressPosts: 0 });
+  const primary = sums();
+  const full = sums();
   const lines = [];
-  let mainUsd = 0;
-  let highUsd = 0;
-  let mainPosts = 0;
-  let highPosts = 0;
-  for (const [block, counts] of Object.entries(tests)) {
+  for (const [block, counts] of Object.entries(campaign.counts?.blocks || {})) {
     const testCount = counts.test || 0;
     if (!testCount) continue;
-    const row = stats[block] || choiceProxy;
+    const row = stats[block] || proxy;
     if (!row) throw new Error(`No pilot cost for block ${block}`);
-    mainUsd += row.meanUsd * testCount;
-    highUsd += row.highUsd * testCount;
-    mainPosts += row.meanPosts * testCount;
-    highPosts += row.highPosts * testCount;
-    lines.push({ block, testCount, proxy: stats[block] ? null : 'dearest choice block', ...row });
+    const targets = primaryBlocks.length && !primaryBlocks.includes(block) ? [full] : [primary, full];
+    for (const target of targets) {
+      target.baseUsd += row.meanUsd * testCount;
+      target.stressUsd += row.stressUsd * testCount;
+      target.basePosts += row.meanPosts * testCount;
+      target.stressPosts += row.stressPosts * testCount;
+    }
+    lines.push({ block, testCount, primary: !primaryBlocks.length || primaryBlocks.includes(block), proxy: stats[block] ? null : 'largest over the pilot blocks', ...row });
   }
   const remainingUsd = campaign.maxUsd - (budget.state.settledUsd + budget.state.unresolvedUsd);
   const remainingPosts = campaign.maxPosts - budget.state.posts;
+  const fits = (sum) => sum.stressUsd <= remainingUsd && sum.stressPosts <= remainingPosts;
+  primary.fits = fits(primary);
+  full.fits = fits(full);
+  const all = [...perQuestion.values()];
   return {
+    formula: FORECAST_FORMULA,
+    stressFactor: factor,
     blocks: lines,
-    mainUsd,
-    highUsd,
-    mainPosts,
-    highPosts,
+    primary,
+    full,
+    pilotMeanUsd: all.length ? mean(all.map((entry) => entry.usd)) : 0,
+    pilotMeanPosts: all.length ? mean(all.map((entry) => entry.posts)) : 0,
     remainingUsd,
     remainingPosts,
-    gate: highUsd <= remainingUsd && highPosts <= remainingPosts ? 'pass' : 'fail',
+    gate: primary.fits ? 'pass' : 'fail',
   };
 }
 
@@ -1474,13 +1517,16 @@ async function runPipeline(campaignPaths, phase, run) {
     const forecast = readJson(path.join(campaignPaths.comparison, 'pilot', 'forecast.json'));
     if (forecast?.gate !== 'pass' && !run.acceptForecast) {
       console.log(
-        forecast
-          ? `test not started: the conservative forecast $${forecast.highUsd.toFixed(2)} / ${Math.ceil(forecast.highPosts)} POSTs `
+        forecast?.primary
+          ? `test not started: the stress forecast of the primary set, $${forecast.primary.stressUsd.toFixed(2)} / ${Math.ceil(forecast.primary.stressPosts)} POSTs, `
             + `exceeds what is left ($${forecast.remainingUsd.toFixed(2)} / ${forecast.remainingPosts}). `
             + 'Pass --accept-forecast to start anyway.'
           : 'test not started: run the pilot first.',
       );
       return 2;
+    }
+    if (forecast?.full && !forecast.full.fits) {
+      console.log('test: the legacy blocks may not all fit what is left; they run only after the primary set, within the remaining budget');
     }
   }
   const selection = readJson(campaignPaths.selection);
@@ -1527,9 +1573,9 @@ async function runPipeline(campaignPaths, phase, run) {
   });
   session.install();
   const restore = installPaid(session, budget, routes);
-  const passes = () => runPasses({
-    label: phase,
-    order,
+  const passes = (ids = order, label = phase) => runPasses({
+    label,
+    order: ids,
     isDone: (id) => readJson(questionFile(dir, id))?.status === 'complete',
     budget,
     session,
@@ -1554,39 +1600,71 @@ async function runPipeline(campaignPaths, phase, run) {
     },
   });
   try {
-    let code = await passes();
+    const stages = phase === 'test' ? testStages(order, items, campaign.primaryBlocks) : [order];
+    let code = await runStages(stages, (ids, index) => {
+      if (stages.length > 1) {
+        console.log(index === 0
+          ? `test: ${ids.length} primary questions first; the legacy blocks wait until every one is complete`
+          : `test: every primary question is complete; starting ${ids.length} legacy questions`);
+      }
+      return passes(ids, stages.length > 1 ? `${phase}:${index === 0 ? 'primary' : 'legacy'}` : phase);
+    });
     if (code) return code;
     if (phase === 'pilot' && campaign.pilotGate) {
+      // Prices first: a held reserve that the generation record can settle
+      // should not inflate the forecast.
+      const settle = async () => {
+        try {
+          await reconcileBudget(campaignPaths, budget);
+        } catch (error) {
+          console.log(`reconcile skipped: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      };
+      await settle();
       let forecast = pilotForecast({ campaign, budget, items, order });
+      let extensionNote = null;
       if (forecast.gate !== 'pass' && order.length < items.length) {
-        console.log(
-          `pilot: the conservative forecast $${forecast.highUsd.toFixed(2)} does not fit the $${forecast.remainingUsd.toFixed(2)} left; `
-          + `extending the pilot to ${pilotMax} questions per block, as set before the run`,
-        );
-        for (const item of items) if (!order.includes(item.id)) order.push(item.id);
-        writeJson(orderFile, order);
-        code = await passes();
-        if (code) return code;
-        forecast = pilotForecast({ campaign, budget, items, order });
+        // Extend once, and only when it could change the decision: the base
+        // forecast of the primary set must fit what the extension leaves.
+        const added = items.length - order.length;
+        const extensionUsd = forecast.pilotMeanUsd * added;
+        const extensionPosts = forecast.pilotMeanPosts * added;
+        const room = forecast.primary.baseUsd + extensionUsd <= forecast.remainingUsd
+          && forecast.primary.basePosts + extensionPosts <= forecast.remainingPosts;
+        if (room) {
+          console.log(
+            `pilot: the stress forecast of the primary set, $${forecast.primary.stressUsd.toFixed(2)}, does not fit the $${forecast.remainingUsd.toFixed(2)} left; `
+            + `extending the pilot by ${added} questions to at most ${pilotMax} per block, as set before the run`,
+          );
+          for (const item of items) if (!order.includes(item.id)) order.push(item.id);
+          writeJson(orderFile, order);
+          code = await passes();
+          if (code) return code;
+          await settle();
+          forecast = pilotForecast({ campaign, budget, items, order });
+        } else {
+          extensionNote = `not extended: even the base forecast of the primary set plus the expected $${extensionUsd.toFixed(2)} of the extension exceeds what is left`;
+          console.log(`pilot: ${extensionNote}`);
+        }
       }
       writeJson(path.join(dir, 'forecast.json'), {
         ...forecast,
         pilotQuestions: order.length,
         extended: order.length > initial.length,
-        quantile: campaign.forecastQuantile ?? 0.9,
+        extensionNote,
         computedAt: new Date().toISOString(),
-        note: 'Per block: mean and high-quantile cost of a pilot question (all 12 comparison calls, retries, unresolved reserves at full value; dev calls on the same question excluded) times the block\'s test count. With two to four pilot questions per block the 0.9 quantile is the dearest of them. A block without dev questions borrows the dearest choice block.',
       });
       for (const row of forecast.blocks) {
         console.log(
-          `pilot ${row.block}: ${row.testCount} test questions at $${row.meanUsd.toFixed(4)} mean, `
-          + `$${row.highUsd.toFixed(4)} high${row.proxy ? ` (${row.proxy})` : ''}`,
+          `pilot ${row.block}${row.primary ? '' : ' (legacy)'}: ${row.testCount} test questions at $${row.meanUsd.toFixed(4)} base, `
+          + `$${row.stressUsd.toFixed(4)} stress${row.proxy ? ` (${row.proxy})` : ''}`,
         );
       }
+      const show = (sum) => `$${sum.baseUsd.toFixed(2)} base, $${sum.stressUsd.toFixed(2)} stress, ${Math.ceil(sum.stressPosts)} POSTs stress`;
       console.log(
-        `pilot forecast: $${forecast.mainUsd.toFixed(2)} expected, $${forecast.highUsd.toFixed(2)} conservative, `
-        + `${Math.ceil(forecast.highPosts)} POSTs conservative; left $${forecast.remainingUsd.toFixed(2)} / ${forecast.remainingPosts} POSTs; `
-        + `gate ${forecast.gate}`,
+        `pilot forecast: primary set ${show(forecast.primary)}; whole test ${show(forecast.full)}; `
+        + `left $${forecast.remainingUsd.toFixed(2)} / ${forecast.remainingPosts} POSTs; gate ${forecast.gate}`
+        + `${forecast.full.fits ? '' : '; the legacy blocks may not all fit and run last'}`,
       );
     } else if (phase === 'pilot') {
       const rows = order.map((id) => readJson(questionFile(dir, id))).filter(Boolean);
@@ -1712,17 +1790,27 @@ export function stageCounters(file) {
   const slots = readSlotJournal(file);
   for (const slot of slots.values()) {
     if (!slot.meta) continue;
-    const row = counters[stageName(slot.meta)] ||= { calls: 0, cap: 0, loopStops: 0, loopCut: 0, context: 0, failed: 0 };
+    const row = counters[stageName(slot.meta)] ||= {
+      calls: 0, cap: 0, belowCap: 0, loopStops: 0, loopCut: 0, context: 0, failed: 0, creditRetries: 0,
+    };
     row.calls += 1;
     const reason = slot.result?.finishReason ?? slot.finishReason;
     if (reason === 'length') row.cap += 1;
+    // A length stop with fewer completion tokens than were asked for. In v4
+    // every length stop sat exactly on the cap, so this is a sign to check for
+    // a provider clamp, not proof of one. Without usage it stays unknown.
+    const asked = Number(slot.request?.max_tokens);
+    const used = slot.usage?.completion_tokens;
+    if (reason === 'length' && used != null && Number.isFinite(asked) && Number(used) < asked) row.belowCap += 1;
     if (slot.result?.loopCut) row.loopCut += 1;
     if (slot.result?.error?.kind === 'context') row.context += 1;
     if (slot.state === 'failed') row.failed += 1;
   }
   if (existsSync(file)) {
     for (const line of readFileSync(file, 'utf8').split('\n')) {
-      if (!line.includes('"cancelReason":"loop"')) continue;
+      const loop = line.includes('"cancelReason":"loop"');
+      const credit = line.includes('"credit":"in_flight_budget"');
+      if (!loop && !credit) continue;
       let event;
       try {
         event = JSON.parse(line);
@@ -1730,7 +1818,10 @@ export function stageCounters(file) {
         continue;
       }
       const slot = slots.get(event.key);
-      if (slot?.meta) counters[stageName(slot.meta)].loopStops += 1;
+      if (!slot?.meta) continue;
+      const row = counters[stageName(slot.meta)];
+      if (loop && event.cancelReason === 'loop') row.loopStops += 1;
+      if (credit && event.credit === 'in_flight_budget') row.creditRetries += 1;
     }
   }
   return counters;
@@ -1812,6 +1903,16 @@ async function reportV5(campaignPaths, campaign, argv) {
     const gold = overrides?.canonical?.[item.id];
     return [item.id, gold == null ? item : { ...item, goldCanon: gold }];
   }));
+  // Oracles from the stored canonical answers against the gold in force.
+  rows = rows.map((row) => {
+    const gold = tasksInForce.get(row.id)?.goldCanon;
+    const hit = (answers) => (Array.isArray(answers) ? Number(answers.some((answer) => answer != null && answer === gold)) : null);
+    return {
+      ...row,
+      oracleCouncil: hit(row.diagnostics?.councilAnswers),
+      oracleB3: hit(row.diagnostics?.replicateAnswers?.slice(0, 3)),
+    };
+  });
   const tailApplied = { stage1: 0, samples: 0, stage2: 0 };
   for (const row of rows) {
     for (const key of Object.keys(tailApplied)) tailApplied[key] += row.tailApplied?.[key] || 0;
@@ -1820,7 +1921,17 @@ async function reportV5(campaignPaths, campaign, argv) {
   const testBlocks = campaign.counts?.blocks || {};
   const plannedPrimary = primaryBlocks.reduce((sum, block) => sum + (testBlocks[block]?.test || 0), 0);
   const planned = campaign.counts?.test ?? rows.length;
-  const complete = rows.length === planned && rows.every((row) => row.status === 'complete');
+  const plannedLegacy = planned - plannedPrimary;
+  // The primary set, the legacy blocks, and the money each have a status of
+  // their own: a budget stop on the legacy blocks does not make the primary
+  // reading interim, and unresolved reserves leave only the money preliminary.
+  const isDone = (row) => row.status === 'complete';
+  const primaryAll = rows.filter((row) => row.set === 'primary');
+  const legacyAll = rows.filter((row) => row.set === 'legacy');
+  const primaryComplete = primaryAll.length === plannedPrimary && primaryAll.every(isDone);
+  const legacyComplete = legacyAll.length === plannedLegacy && legacyAll.every(isDone);
+  const moneyFinal = Number(ledger.state.unresolvedUsd || 0) === 0;
+  const complete = primaryComplete && legacyComplete;
   const amc = (campaign.blocks || []).includes('amc');
   const goldLines = [];
   if (amc) goldLines.push('AMC 2026 gold: unofficial key published by Think Academy on 2026-11-06; rescore with --gold-overrides once the official key is out.');
@@ -1829,9 +1940,18 @@ async function reportV5(campaignPaths, campaign, argv) {
     rows,
     planned,
     plannedPrimary,
+    plannedLegacy,
     complete,
+    primaryComplete,
+    legacyComplete,
+    moneyFinal,
     primaryBlocks,
     family: campaign.secondaryFamily,
+    dev: selection.table ? {
+      table: selection.table,
+      blocks: Object.fromEntries(Object.entries(campaign.counts?.blocks || {})
+        .filter(([, counts]) => counts.dev).map(([block, counts]) => [block, counts.dev])),
+    } : null,
     lenientRows: lenientRows(rows, tasksInForce),
     lenientRules: LENIENT_RULES,
     listings,
@@ -1858,8 +1978,12 @@ async function reportV5(campaignPaths, campaign, argv) {
   writeJson(path.join(campaignPaths.reports, `${name}.json`), {
     campaign: campaign.id || null,
     complete,
+    primaryComplete,
+    legacyComplete,
+    moneyFinal,
     planned,
     plannedPrimary,
+    plannedLegacy,
     scored: rows.filter((row) => row.status === 'complete').length,
     groups: rows.reduce((map, row) => ({ ...map, [row.group]: (map[row.group] || 0) + 1 }), {}),
     tailApplied,
@@ -1867,7 +1991,7 @@ async function reportV5(campaignPaths, campaign, argv) {
   });
   console.log(text);
   console.log(`Wrote ${path.join(campaignPaths.reports, `${name}.md`)}`);
-  return complete ? 0 : 2;
+  return primaryComplete ? 0 : 2;
 }
 
 // ---------------------------------------------------------------------------
