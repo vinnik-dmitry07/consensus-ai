@@ -198,6 +198,8 @@ Probe подтверждает, что маршрут принимает зап�
 
 Прогнозов два: только основная часть и основная плюс прежняя. Допуск к test даёт стресс-прогноз основной части против остатка. Если прежняя часть не помещается, test всё равно стартует, а прежние вопросы идут после основных в пределах остатка. Перед расчётом идёт бесплатный `reconcile`. Если допуск не получен, pilot расширяется один раз до четырёх вопросов на блок, и только когда базовый прогноз основной части помещается в остаток за вычетом ожидаемой стоимости расширения; иначе он останавливается с расчётом недостатка. Формула, допущение, наблюдения и резервы пишутся в `forecast.json`. Test не стартует без пройденного шлюза, если не передан `--accept-forecast`.
 
+**Темп.** Флаги `--jobs`, `--in-flight` и `--model-in-flight` задают только темп и в хеш метода не входят. Узкое место — модель B = H: на неё приходятся 8 из 12 вызовов вопроса, и в начале вопроса она получает пять вызовов сразу. В v4 при 12 вопросах и 12 вызовах на модель вызовы StepFun ждали места в очереди с медианой 35 с, это четверть их времени; DeepSeek и GLM не ждали ни разу, ответов 429 не было ни в v3, ни в v4. Поэтому лимит на модель поднят до 40, а число вопросов до 20; общий лимит HTTP по умолчанию равен 7 × число вопросов и покрывает пик. Pilot идёт сразу всеми 14 вопросами и проверяет, что маршрут B выдерживает 40 потоков без 429; если 429 появятся, test идёт с лимитом 24. Резерв одного вызова StepFun при лимите 32768 — около $0.11, так что даже 60 вызовов в полёте держат около $7 и бюджет не тормозит. Остающаяся задержка внутри вопроса — общий барьер после Stage 1 и генераций B; он удлиняет вопрос, но не ограничивает пропускную способность, которую задают число вопросов и лимит на модель.
+
 **Проверка циклов перед test.** `a8 --phase loops --of pilot` восстанавливает каждую остановку детектора по сохранённому телу потока: модель, стадию, позицию, долю повтора, итог слота и текст перед остановкой. Список пишется в `reports/loops-pilot.json`. Каждую остановку человек читает до test; остановка на тексте, который не зацикливался, останавливает кампанию. Фаза ничего не отправляет и может идти рядом с работающей фазой. Точность pilot метод не меняет.
 
 **Расход.** Прерванный поток не приносит `usage`, и его резерв остаётся удержанным. Каждая попытка сохраняет `generationId`; `a8 --phase reconcile` спрашивает OpenRouter фактическую стоимость через `/api/v1/generation` и заменяет резерв ею, один раз. Неизвестная стоимость не становится нулём. В начале каждой фазы reconcile идёт сам, а счётчик ключа пишется как аудит, без влияния на резервы. `--self-test` один раз намеренно обрывает короткий вызов на маршруте B и проверяет, что его цена находится. Это платный вызов, поэтому он требует `--live`, и нужен он, только если ни одна прерванная попытка ещё не получила цену.
@@ -210,14 +212,14 @@ Probe подтверждает, что маршрут принимает зап�
 npm --prefix frontend run eval -- a8 --phase prepare
 npm --prefix frontend run eval -- a8 --phase preflight --run a8-open-v5b --routes-from a8-open-v4 --caps max --blocks rgym,amc,arxiv,hmmt,livemath --max-usd 100 --max-posts 6000
 npm --prefix frontend run eval -- a8 --phase probe --run a8-open-v5b --live
-npm --prefix frontend run eval -- a8 --phase dev --run a8-open-v5b --live
-npm --prefix frontend run eval -- a8 --phase smoke --run a8-open-v5b --live
+npm --prefix frontend run eval -- a8 --phase dev --run a8-open-v5b --live --jobs 20 --model-in-flight 20
+npm --prefix frontend run eval -- a8 --phase smoke --run a8-open-v5b --live --jobs 3 --model-in-flight 15
 npm --prefix frontend run eval -- a8 --phase loops --run a8-open-v5b --of smoke
 npm --prefix frontend run eval -- a8 --phase reconcile --run a8-open-v5b
 npm --prefix frontend run eval -- a8 --phase reconcile --run a8-open-v5b --self-test --live
-npm --prefix frontend run eval -- a8 --phase pilot --run a8-open-v5b --live
+npm --prefix frontend run eval -- a8 --phase pilot --run a8-open-v5b --live --jobs 14 --model-in-flight 40
 npm --prefix frontend run eval -- a8 --phase loops --run a8-open-v5b --of pilot
-npm --prefix frontend run eval -- a8 --phase test --run a8-open-v5b --live --jobs 12 --model-in-flight 12
+npm --prefix frontend run eval -- a8 --phase test --run a8-open-v5b --live --jobs 20 --model-in-flight 40
 npm --prefix frontend run eval -- a8 --phase reconcile --run a8-open-v5b
 npm --prefix frontend run eval -- a8 --phase report --run a8-open-v5b
 ```
