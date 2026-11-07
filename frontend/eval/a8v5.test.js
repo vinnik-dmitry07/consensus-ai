@@ -525,6 +525,22 @@ describe('v5 report', () => {
     expect(fixed[0].diagnostics.leader.correct).toBe(0);
     expect(fixed[0].diagnostics.rescue).toBe(1);
     expect(rows[0].arms.A8.correct).toBe(0);
+    // Every diagnostic moves with the gold: the five-sample vote and the
+    // stage-to-stage counts still add up after the correction.
+    const voted = [{
+      ...rows[0],
+      diagnostics: { ...rows[0].diagnostics, replicateVote: { correct: 1, status: 'graded', extracted: 'B' } },
+    }];
+    const corrected = applyGoldOverrides(voted, { 'test:amc:1': 'C' }).rows;
+    expect(corrected[0].diagnostics.replicateVote.correct).toBe(0);
+    for (const [baseOf, finalOf] of [
+      [(row) => row.diagnostics.leader, (row) => row.arms.A8],
+      [(row) => row.diagnostics.replicateVote, (row) => row.arms.S8],
+    ]) {
+      const step = transitions(corrected, baseOf, finalOf);
+      expect(step.final - step.base).toBeCloseTo((step.fixes - step.breaks) / step.n);
+    }
+    expect(transitions(corrected, (row) => row.diagnostics.leader, (row) => row.arms.A8)).toMatchObject({ fixes: 1, breaks: 0 });
   });
 
   it('answers direction, size, and equivalence apart, and never reads p >= 0.05 as equality', () => {
