@@ -13,6 +13,21 @@ import { stableStringify } from './util.js';
 
 export const attemptStore = new AsyncLocalStorage();
 
+const CAPACITY_TEXT = /temporarily (rate-limited|at cap|unavailable|overloaded)|rate-limited upstream|at capacity/i;
+const STREAMED_TEXT = /"(content|reasoning|reasoning_content|text)":"[^"]/;
+
+// Why an answer was refused before anything was generated, or null: every
+// 429, and a 200 stream whose only payload is a capacity error. A stream that
+// carried any text is not a refusal, since the provider may bill for it.
+export function refusedBeforeGeneration(status, text) {
+  if (status === 429) return 'rate_limited';
+  if (status !== 200) return null;
+  const body = String(text || '');
+  if (!body.includes('"error"') || !CAPACITY_TEXT.test(body)) return null;
+  if (STREAMED_TEXT.test(body)) return null;
+  return 'capacity';
+}
+
 const NETWORK_MARKERS = [
   'fetch failed',
   'terminated',
@@ -257,12 +272,17 @@ export function installTransport({
         serviceMs: Date.now() - started,
       });
       budget.charge?.(model, parsed.usage, parsed.known, body.max_tokens);
-      const released = credit?.preProvider === true && !parsed.known;
+      // A refusal before generation costs nothing: a credit refusal before the
+      // provider, a 429, or an in-stream capacity error with no streamed text.
+      // Holding its full reserve would only shrink the budget for nothing.
+      const refused = refusedBeforeGeneration(status, text);
+      const releaseReason = (credit?.preProvider === true ? credit.kind : null) || refused;
+      const released = Boolean(releaseReason) && !parsed.known;
       budget.settle?.({
         attemptId: store.attemptId,
-        usage: released ? { cost: 0, releaseReason: credit.kind } : parsed.usage,
+        usage: released ? { cost: 0, releaseReason } : parsed.usage,
         incomplete: released ? false : (incomplete || !parsed.known),
-        reason: credit?.kind || null,
+        reason: credit?.kind || refused || null,
       });
       if (credit?.kind === 'in_flight_budget' && store.inFlightRetried) {
         budget.pause?.('in_flight_budget', null);

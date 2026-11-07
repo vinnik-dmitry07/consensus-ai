@@ -29,6 +29,7 @@ import {
   testStages,
 } from './a8.js';
 import { rgymCheck } from './a8Prepare.js';
+import { questionWaits } from './a8Variants.js';
 import { sha256 } from './util.js';
 import { capsFrom, contextProblems, maxCommonCap, profileDocument, v5Policy } from './a8Profile.js';
 import {
@@ -336,6 +337,23 @@ describe('v5 probe rounds', () => {
     expect(after).toMatchObject({ allConfirmed: true, done: true });
     // A campaign that does not require confirmation finishes either way.
     expect(probeOutcome(rows, first.active, false).done).toBe(true);
+  });
+});
+
+describe('v5 cooldown waits', () => {
+  it('waits only on a skip from this run of the question or a route still cooling', () => {
+    const slots = [{ meta: { questionId: 'q', model: 'a/one', stage: 'stage2' }, state: 'skipped', skippedAt: 1000 }];
+    const session = { slots: () => slots, cooldowns: new Map() };
+    // A skip left from an earlier pass whose cooldown ended: the stage asks again.
+    expect(questionWaits(session, 'q', 2000, 5000)).toBe(false);
+    // Skipped during this run of the question.
+    expect(questionWaits(session, 'q', 500, 5000)).toBe(true);
+    // The route is still cooling.
+    session.cooldowns.set('a/one', 9000);
+    expect(questionWaits(session, 'q', 2000, 5000)).toBe(true);
+    expect(questionWaits(session, 'other', 0, 5000)).toBe(false);
+    slots[0].state = 'completed';
+    expect(questionWaits(session, 'q', 0, 5000)).toBe(false);
   });
 });
 

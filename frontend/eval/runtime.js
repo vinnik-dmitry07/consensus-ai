@@ -19,6 +19,22 @@ const LOCAL_KEYS = [
 ];
 const TERMINAL = new Set(['completed', 'failed', 'skipped']);
 const NETWORK_BACKOFF_MS = 30_000;
+// How long a route that answered "out of capacity" inside its stream is left
+// alone. An upstream 429 brings its own cooldown from the transport.
+export const CAPACITY_COOLDOWN_MS = 120_000;
+const CAPACITY_TEXT = /temporarily (rate-limited|at cap|unavailable|overloaded)|rate-limited upstream|at capacity/i;
+
+// A refusal before any generation because the route is out of capacity: the
+// upstream 429 the engine reports as skipped, or an in-stream provider error
+// such as "temporarily at cap" with no text. Rate limits are the provider's
+// load, not the method's answer, so such a refusal is not a model attempt:
+// the slot waits for the route's cooldown and is asked again.
+export function isCapacityRefusal(result) {
+  if (!result || result.ok) return false;
+  if (String(result.content || '').trim()) return false;
+  const text = `${result.error?.message || ''} ${result.error?.detail || ''}`;
+  return CAPACITY_TEXT.test(text);
+}
 
 // A counting gate that hands a released place straight to the next waiter, so
 // a caller arriving between release and wake-up cannot push it over the limit.
@@ -383,13 +399,17 @@ export function createSession({
           request,
           state: 'skipped',
           result: skipped,
+          skippedAt: Date.now(),
         });
         return skipped;
       }
       const attemptBudget = retryLimit ?? ENGINE_RETRY_LIMIT;
       // Attempts already spent on this exact request in a replay source count
-      // against the same per-call limit.
-      const spent = Math.max(existing?.httpAttempts || 0, priorAttempts?.get(key) || 0);
+      // against the same per-call limit. `raw` numbers every POST, so attempt
+      // ids stay unique; refusals before generation do not count as spent.
+      const raw = Math.max(existing?.httpAttempts || 0, priorAttempts?.get(key) || 0);
+      const limitedBefore = existing?.limitedAttempts || 0;
+      const spent = Math.max(0, raw - limitedBefore);
       const remaining = attemptBudget - spent;
       if (remaining <= 0) {
         const exhausted = existing?.result || {
@@ -414,7 +434,8 @@ export function createSession({
         request,
         state: 'running',
         result: null,
-        httpAttempts: spent,
+        httpAttempts: raw,
+        limitedAttempts: limitedBefore,
       });
       const started = Date.now();
       let result;
@@ -424,7 +445,7 @@ export function createSession({
         await httpGate.acquire();
         heldHttp = true;
         result = await attemptStore.run(
-          { key, expected: request, httpSeq: spent },
+          { key, expected: request, httpSeq: raw },
           () => execute({ ...effective, maxRetries: remaining, retainRoster }),
         );
       } catch (error) {
@@ -450,12 +471,33 @@ export function createSession({
         if (heldModel) heldModel.release();
       }
       const current = slots.get(key) || {};
+      // A refusal before generation that came from a POST of this call: the
+      // slot waits for the route's cooldown, and the POST is not a model
+      // attempt. An in-stream refusal sets the cooldown here; an upstream 429
+      // already set it in the transport.
+      if (isCapacityRefusal(result) && (current.httpAttempts || 0) > raw && !budget.state.paused) {
+        if (!result.skipped) onCooldown(model, Date.now() + CAPACITY_COOLDOWN_MS);
+        const refused = { ...result, skipped: true };
+        writeSlot(key, {
+          ...current,
+          key,
+          meta: slotMeta,
+          request,
+          state: 'skipped',
+          result: refused,
+          limitedAttempts: limitedBefore + 1,
+          skippedAt: Date.now(),
+          occupiedMs: Date.now() - started,
+        });
+        emit(`${slotMeta.branch} ${slotMeta.stage} ${slotMeta.model} sample ${slotMeta.sample}${attemptLabel(slotMeta)} refused for capacity; waits for the cooldown`);
+        return refused;
+      }
       const transportDrop = (isNetworkMessage(result?.error?.message) || isNetworkMessage(result?.error?.kind))
         && result?.error?.status == null;
       if (transportDrop) {
         // With every allowed attempt spent there is nothing left to retry, so
         // the drop is the slot's final outcome instead of an endless unknown.
-        const exhausted = (current.httpAttempts || 0) >= attemptBudget;
+        const exhausted = (current.httpAttempts || 0) - (current.limitedAttempts || 0) >= attemptBudget;
         const dropState = exhausted ? 'failed' : 'unknown';
         writeSlot(key, {
           ...current,
@@ -486,6 +528,7 @@ export function createSession({
         request,
         state,
         result,
+        ...(state === 'skipped' ? { skippedAt: Date.now() } : {}),
         // A loop stop has no provider finish_reason; the engine names it.
         finishReason: result?.finishReason ?? current.finishReason ?? null,
         completedOrdinal: ordinal,

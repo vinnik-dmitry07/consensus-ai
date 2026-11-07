@@ -9,6 +9,7 @@ import {
   stage3SynthesizeFinal,
 } from '../src/engine/browser/council.js';
 import { queryModelResult } from '../src/engine/browser/openrouter.js';
+import { catalogueId } from '../src/engine/browser/roster.js';
 import { answerPrompt, failureKind, gradeResponse, plurality } from './grade.js';
 import { N_SAMPLES, SCHEDULE_SEED, SELF_EXCLUSION, SELF_SAMPLES, TOP_K } from './a8Profile.js';
 import { compareHash, sha256 } from './util.js';
@@ -61,9 +62,17 @@ function budgetPaused(session) {
   return session.budget.state.paused ? session.budget.state.pauseReason : null;
 }
 
-function coolingSkip(session, questionId) {
+// A question waits while one of its calls was skipped during this run of the
+// question, or is skipped and its route is still cooling. A skip left over
+// from an earlier pass whose cooldown has ended does not hold the question:
+// the stage that owns the call asks for it again. Checking only "any skipped
+// slot" stopped a question after Stage 1 on a stale judge or S8 skip, before
+// that stage could retry it, on every pass.
+export function questionWaits(session, questionId, since, now = Date.now()) {
   return session.slots().some((slot) => (
-    slot.meta?.questionId === questionId && slot.state === 'skipped'
+    slot.meta?.questionId === questionId
+    && slot.state === 'skipped'
+    && ((slot.skippedAt ?? 0) >= since || (session.cooldowns?.get(catalogueId(slot.meta.model)) || 0) > now)
   ));
 }
 
@@ -181,6 +190,7 @@ function settleBranches(settled) {
 }
 
 export async function runComparison(task, session, frozen, options = {}) {
+  const startedAt = Date.now();
   const roster = rosterOf(frozen);
   const prompt = answerPrompt(task);
   const questionId = task.id;
@@ -199,7 +209,7 @@ export async function runComparison(task, session, frozen, options = {}) {
   const guard = () => {
     const paused = budgetPaused(session);
     if (paused) throw new Pending(paused);
-    if (coolingSkip(session, questionId)) throw new Pending('cooldown');
+    if (questionWaits(session, questionId, startedAt)) throw new Pending('cooldown');
   };
 
   try {
@@ -320,6 +330,9 @@ export async function runComparison(task, session, frozen, options = {}) {
           roster,
         });
         await session.drain();
+        // A chairman call refused for capacity waits for its cooldown, as the
+        // S8 synthesis does, instead of grading an empty answer.
+        guard();
         const grade = gradeResponse(task, stage3.response || '');
         return finish({
           ...grade,

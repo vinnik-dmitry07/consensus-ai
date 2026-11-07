@@ -65,6 +65,17 @@ function finishedStream(id) {
   });
 }
 
+function upstream429() {
+  const error = { message: 'Provider returned error', code: 429, metadata: { raw: `${MODEL} is temporarily rate-limited upstream. Please retry shortly.` } };
+  return new Response(JSON.stringify({ error }), { status: 429, headers: { 'content-type': 'application/json', 'Retry-After': '0' } });
+}
+
+function capacityStream(id) {
+  const error = { code: 502, message: `Upstream error from Host: ${MODEL} is temporarily at capacity. Please retry shortly.` };
+  const body = `: OPENROUTER PROCESSING\n\ndata: ${JSON.stringify({ id, choices: [], error })}\n\ndata: [DONE]\n\n`;
+  return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+}
+
 function journal(runDir) {
   return readFileSync(path.join(runDir, 'events.jsonl'), 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
 }
@@ -98,6 +109,9 @@ describe('loop guard through the eval session', () => {
       log() {},
       retryLimit,
       retainRoster: true,
+      // As in the campaign sessions: a skipped slot is asked again once its
+      // route has cooled down.
+      retryAfterCooldown: true,
       prepareOptions: (model, stage, options) => ({
         ...options,
         maxTokens: 32768,
@@ -178,6 +192,44 @@ describe('loop guard through the eval session', () => {
     expect(result.ok).toBe(false);
     expect(posts).toHaveLength(1);
     expect(session.slots()[0].state).toBe('failed');
+  });
+
+  it('spends no model attempt on an upstream 429 and settles it at $0', async () => {
+    const { posts, budget } = open((n) => (n <= 2 ? upstream429() : finishedStream('gen-ok')));
+    const first = await queryModelResult(MODEL, MESSAGES);
+    expect(first.skipped).toBe(true);
+    expect(session.slots()[0]).toMatchObject({ state: 'skipped', limitedAttempts: 1 });
+    // The engine keeps its own cooldown in the question's local storage; a
+    // campaign starts every pass of a question from a fresh copy of it.
+    globalThis.localStorage.removeItem('llm-council-model-cooldowns');
+    expect((await queryModelResult(MODEL, MESSAGES)).skipped).toBe(true);
+    globalThis.localStorage.removeItem('llm-council-model-cooldowns');
+    // Two refusals used to exhaust the two attempts and fail the slot for good.
+    const third = await queryModelResult(MODEL, MESSAGES);
+    expect(third.ok).toBe(true);
+    expect(third.content).toBe('ANSWER: 12');
+    expect(posts).toHaveLength(3);
+    expect(session.slots()[0]).toMatchObject({ state: 'completed', httpAttempts: 3, limitedAttempts: 2 });
+    // Both refusals settled at $0: nothing is held, and every POST is counted.
+    expect(budget.unresolvedAttempts()).toEqual([]);
+    expect(budget.state.posts).toBe(3);
+  });
+
+  it('treats an in-stream capacity error as a refusal: cooldown, no attempt spent, $0', async () => {
+    const { posts, budget } = open((n) => (n === 1 ? capacityStream('gen-cap') : finishedStream('gen-ok')));
+    const first = await queryModelResult(MODEL, MESSAGES);
+    expect(first.skipped).toBe(true);
+    expect(Math.max(...session.cooldowns.values())).toBeGreaterThan(Date.now() + 60_000);
+    expect(budget.unresolvedAttempts()).toEqual([]);
+    // While the route cools down, a call posts nothing.
+    expect((await queryModelResult(MODEL, MESSAGES)).skipped).toBe(true);
+    expect(posts).toHaveLength(1);
+    // After the cooldown the call is asked again and completes.
+    for (const id of session.cooldowns.keys()) session.cooldowns.set(id, 0);
+    const done = await queryModelResult(MODEL, MESSAGES);
+    expect(done.ok).toBe(true);
+    expect(posts).toHaveLength(2);
+    expect(session.slots()[0]).toMatchObject({ state: 'completed', httpAttempts: 2, limitedAttempts: 1 });
   });
 
   it('refuses an oversized prompt before any post', async () => {
