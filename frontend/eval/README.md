@@ -213,13 +213,13 @@ npm --prefix frontend run eval -- a8 --phase probe --run a8-open-v5b --live
 npm --prefix frontend run eval -- a8 --phase dev --run a8-open-v5b --live
 npm --prefix frontend run eval -- a8 --phase smoke --run a8-open-v5b --live
 npm --prefix frontend run eval -- a8 --phase loops --run a8-open-v5b --of smoke
-npm --prefix frontend run eval -- a8 --phase reconcile --run a8-open-v5
+npm --prefix frontend run eval -- a8 --phase reconcile --run a8-open-v5b
 npm --prefix frontend run eval -- a8 --phase reconcile --run a8-open-v5b --self-test --live
 npm --prefix frontend run eval -- a8 --phase pilot --run a8-open-v5b --live
 npm --prefix frontend run eval -- a8 --phase loops --run a8-open-v5b --of pilot
 npm --prefix frontend run eval -- a8 --phase test --run a8-open-v5b --live --jobs 12 --model-in-flight 12
-npm --prefix frontend run eval -- a8 --phase reconcile --run a8-open-v5
-npm --prefix frontend run eval -- a8 --phase report --run a8-open-v5
+npm --prefix frontend run eval -- a8 --phase reconcile --run a8-open-v5b
+npm --prefix frontend run eval -- a8 --phase report --run a8-open-v5b
 ```
 
 Self-test в цепочке нужен, только если предыдущий `reconcile` не нашёл цену ни одной прерванной попытки.
