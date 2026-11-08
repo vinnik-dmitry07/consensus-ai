@@ -30,5 +30,9 @@
   "test:livemath-202505:qd6e2cba62273": {
     "exclude": true,
     "reason": "ill-posed: the statement contradicts elimination after two losses; 5, 6, 7 or 8 are defensible"
+  },
+  "test:livemath-202505:q67e1b2e8f173": {
+    "exclude": true,
+    "reason": "the source key 28 is not the minimum: Lindstrom detecting matrices identify 32 items with 15 count queries; the exact minimum is unknown"
   }
 }

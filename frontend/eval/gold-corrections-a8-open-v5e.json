@@ -18,5 +18,9 @@
   "test:livemath-202505:q23c8cc2d2f10": {
     "exclude": true,
     "reason": "ill-posed: a letter in the statement is undefined and the readings give 90, 0, 101 or 8"
+  },
+  "test:livemath-202505:q67e1b2e8f173": {
+    "exclude": true,
+    "reason": "the source key 28 is not the minimum: Lindstrom detecting matrices identify 32 items with 15 count queries; the exact minimum is unknown"
   }
 }
