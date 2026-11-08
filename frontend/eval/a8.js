@@ -969,6 +969,86 @@ export async function reconcileBudget(campaignPaths, budget, {
   return summary;
 }
 
+// The exact total cost of a run's reserves that no generation record prices,
+// such as streams cut when its runner stopped. It needs the key's usage at two
+// moments with only this run's POSTs between them: the run's first audit,
+// taken before its first POST, and the next run's first audit, taken before
+// that run's first POST. What the key spent between them, less every cost
+// the run already knows, is what the held reserves cost together. The total
+// is measured; the split over the held reserves goes by reserve size.
+const RESIDUAL_TOLERANCE_USD = 1e-6;
+
+export function keyResidual({ before, after, settledUsd, held }) {
+  if (![before, after, settledUsd].every(Number.isFinite)) throw new Error('Key residual needs both usage audits and the settled spend.');
+  const reserved = held.reduce((sum, row) => sum + Number(row.usd || 0), 0);
+  let total = after - before - settledUsd;
+  if (total < -RESIDUAL_TOLERANCE_USD) {
+    throw new Error(`The key spent $${(after - before).toFixed(9)} but the run settled $${settledUsd.toFixed(9)}: something else is missing from the run's ledger.`);
+  }
+  if (total > reserved + RESIDUAL_TOLERANCE_USD) {
+    throw new Error(`The key spent $${total.toFixed(9)} more than the run settled, above its $${reserved.toFixed(9)} of held reserves: another client used the key.`);
+  }
+  // Below the tolerance the difference is float noise of the summed costs.
+  if (Math.abs(total) <= RESIDUAL_TOLERANCE_USD) total = 0;
+  const shares = held.map((row) => ({
+    attemptId: row.attemptId,
+    cost: reserved > 0 ? (total * Number(row.usd || 0)) / reserved : 0,
+  }));
+  return { total, reserved, shares };
+}
+
+// The first usage audit of a budget journal and whether it came before the
+// journal's first POST.
+function firstUsageAudit(file) {
+  const events = readJsonl(file);
+  const auditAt = events.findIndex((event) => event.kind === 'audit' && event.usage != null);
+  const reserveAt = events.findIndex((event) => event.kind === 'reserve');
+  if (auditAt < 0) return null;
+  return { ...events[auditAt], beforeFirstPost: reserveAt < 0 || auditAt < reserveAt };
+}
+
+// Called under the run's own lock, so no runner of this run is streaming.
+export async function reconcileByKeyResidual(campaignPaths, budget, nextRunId, { log = console.log, nextPaths = null } = {}) {
+  const runId = path.basename(campaignPaths.dir);
+  if (!nextRunId || nextRunId === runId) throw new Error('--key-residual-until needs the run that used the key next.');
+  const next = nextPaths || pathsFor(nextRunId);
+  const open = Object.entries(budget.state.reservations).filter(([, row]) => row && !row.settled);
+  if (!open.length && !budget.unresolvedAttempts().length) {
+    log('key residual: no held reserves');
+    return { total: 0, reserved: 0, shares: [] };
+  }
+  const start = firstUsageAudit(campaignPaths.budget);
+  const end = firstUsageAudit(next.budget);
+  if (!start?.beforeFirstPost) throw new Error(`${runId} has no usage audit before its first POST.`);
+  if (!end?.beforeFirstPost) throw new Error(`${nextRunId} has no usage audit before its first POST.`);
+  // Audits of the phases that post; a reconcile only reads.
+  const posting = readJsonl(campaignPaths.budget)
+    .filter((event) => event.kind === 'audit' && event.usage != null && event.phase !== 'reconcile');
+  const last = posting[posting.length - 1];
+  if (last && (last.at > end.at || Number(last.usage) > Number(end.usage) + RESIDUAL_TOLERANCE_USD)) {
+    throw new Error(`${runId} has an audit after ${nextRunId} started, so the two runs overlap on the key.`);
+  }
+  // A stream cut when the runner stopped never settled; it is settled here as
+  // an attempt without usage, and then priced with the others.
+  for (const [attemptId] of open) budget.settle({ attemptId, incomplete: true });
+  const held = budget.unresolvedAttempts();
+  const own = ledgerOf(campaignPaths.budget, readJson(campaignPaths.campaign, {}));
+  const result = keyResidual({
+    before: Number(start.usage),
+    after: Number(end.usage),
+    settledUsd: own.state.settledUsd,
+    held,
+  });
+  const source = `key-residual:${start.at}..${end.at}`;
+  for (const share of result.shares) budget.resettle({ attemptId: share.attemptId, cost: share.cost, source });
+  log(
+    `key residual: key usage $${Number(start.usage).toFixed(9)} -> $${Number(end.usage).toFixed(9)}, `
+    + `${runId} settled $${own.state.settledUsd.toFixed(9)}; ${held.length} held reserves ($${result.reserved.toFixed(4)}) `
+    + `cost $${result.total.toFixed(9)} together, split by reserve; held now $${budget.state.unresolvedUsd.toFixed(4)}`,
+  );
+  return result;
+}
+
 const CREDITS_URL = 'https://openrouter.ai/api/v1/credits';
 const CURABLE_PAUSES = ['auth', 'key_budget', 'insufficient_funds'];
 
@@ -1860,6 +1940,8 @@ async function runReconcile(campaignPaths, argv) {
     await reconcileSelfTest(campaignPaths, campaign, preflightDoc, budget, flagValue(argv, '--model'));
   }
   await reconcileBudget(campaignPaths, budget);
+  const until = flagValue(argv, '--key-residual-until');
+  if (until) await reconcileByKeyResidual(campaignPaths, budget, until);
   await auditKey(budget, 'reconcile', 'end');
   console.log(
     `budget: settled $${budget.state.settledUsd.toFixed(4)}, held $${budget.state.unresolvedUsd.toFixed(4)}, `
@@ -1978,6 +2060,21 @@ function ledgerOf(files, campaign) {
   return ledger;
 }
 
+// Reserves priced from the key's usage across a run rather than by their own
+// generation record.
+function residualLine(files) {
+  let count = 0;
+  let total = 0;
+  for (const file of files) {
+    for (const event of readJsonl(file)) {
+      if (event.kind !== 'resettle' || !String(event.source || '').startsWith('key-residual')) continue;
+      count += 1;
+      total += Number(event.cost || 0);
+    }
+  }
+  return count ? { count, total } : null;
+}
+
 // What a replaying campaign took from its sources and what it posted itself.
 function replayLine(campaign, slots, ownBudgetFile) {
   if (!campaign.replayFrom?.length) return null;
@@ -2048,6 +2145,7 @@ async function reportV5(campaignPaths, campaign, argv) {
   const sourceBudgets = (campaign.replayFrom || []).map((id) => pathsFor(id).budget);
   const ledger = ledgerOf([...sourceBudgets, campaignPaths.budget], campaign);
   const replay = replayLine(campaign, [...readSlotJournal(path.join(dir, 'events.jsonl')).values()], campaignPaths.budget);
+  const residual = residualLine([...sourceBudgets, campaignPaths.budget]);
   const testBlocks = campaign.counts?.blocks || {};
   const plannedPrimary = primaryBlocks.reduce((sum, block) => sum + (testBlocks[block]?.test || 0), 0);
   const planned = campaign.counts?.test ?? rows.length;
@@ -2099,6 +2197,7 @@ async function reportV5(campaignPaths, campaign, argv) {
     },
     armCost: armCosts(ledger.state.reservations, selection.b),
     replay,
+    residual,
     maxUsd: campaign.maxUsd,
     maxPosts: campaign.maxPosts,
     gold: goldLines.join(' '),

@@ -645,6 +645,13 @@ export function renderV5Report(input) {
         + 'Money and counters cover both runs: their answers are this report\'s answers, and their POSTs count against the same cap.',
       );
     }
+    if (input.residual) {
+      lines.push(
+        `${input.residual.count} reserves had no generation record (streams cut when a runner stopped). Together they cost ${money(input.residual.total)}: `
+        + 'what the key spent across that run less every cost the run knew, between usage audits taken before its first POST and before the next run\'s first POST. '
+        + 'The total is measured; its split over those attempts, and so over the arms, goes by reserve size.',
+      );
+    }
     if (spend.audit) {
       lines.push(`Key usage at the last audit: ${spend.audit.usage ?? 'n/a'} (an audit only; it never releases a reserve).`);
     }

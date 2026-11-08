@@ -13,6 +13,8 @@ import {
   durablePauseCure,
   extendedReplay,
   gitState,
+  keyResidual,
+  reconcileByKeyResidual,
   interleave,
   loopReview,
   pilotForecast,
@@ -459,6 +461,80 @@ describe('v5 accounting', () => {
       { kind: 'http', phase: 'finished', key: 'elsewhere', cancelReason: 'loop' },
     ].map((event) => JSON.stringify(event)).join('\n'));
     expect(stageCounters(file, [source]).judges.loopStops).toBe(3);
+  });
+
+  it('prices held reserves from the key usage across the run, split by reserve', () => {
+    const held = [{ attemptId: 'a#1', usd: 0.2 }, { attemptId: 'b#1', usd: 0.6 }];
+    const out = keyResidual({ before: 3, after: 4, settledUsd: 0.7, held });
+    expect(out.total).toBeCloseTo(0.3, 12);
+    expect(out.shares[0].cost).toBeCloseTo(0.075, 12);
+    expect(out.shares[1].cost).toBeCloseTo(0.225, 12);
+    expect(keyResidual({ before: 3, after: 3.7, settledUsd: 0.7, held }).total).toBe(0);
+    expect(() => keyResidual({ before: 3, after: 3.6, settledUsd: 0.7, held })).toThrow('missing from the run');
+    expect(() => keyResidual({ before: 3, after: 5, settledUsd: 0.7, held })).toThrow('another client');
+  });
+
+  it('settles cut streams and prices every held reserve between the two first audits', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'a8-residual-'));
+    dirs.push(dir);
+    const runDir = path.join(dir, 'run');
+    const nextDir = path.join(dir, 'next');
+    mkdirSync(runDir);
+    mkdirSync(nextDir);
+    const write = (file, events) => writeFileSync(file, `${events.map((event) => JSON.stringify(event)).join('\n')}\n`);
+    const own = path.join(runDir, 'budget.jsonl');
+    write(own, [
+      { kind: 'audit', at: '2026-01-01T00:00:00.000Z', phase: 'probe', usage: 1 },
+      { kind: 'reserve', attemptId: 'a#1', model: 'm', usd: 0.5 },
+      { kind: 'settle', attemptId: 'a#1', cost: 0.2, unresolved: false },
+      { kind: 'reserve', attemptId: 'b#1', model: 'm', usd: 0.4 },
+      { kind: 'reserve', attemptId: 'c#1', model: 'm', usd: 0.1 },
+      { kind: 'settle', attemptId: 'c#1', cost: null, unresolved: true },
+    ]);
+    const nextBudget = path.join(nextDir, 'budget.jsonl');
+    write(nextBudget, [
+      { kind: 'audit', at: '2026-01-01T01:00:00.000Z', phase: 'probe', usage: 1.45 },
+      { kind: 'reserve', attemptId: 'x#1', model: 'm', usd: 0.3 },
+    ]);
+    const open = () => {
+      const budget = createCampaignBudget({ maxUsd: 10, maxPosts: 10, prices: {}, onEvent: (event) => writeFileSync(own, `${JSON.stringify(event)}\n`, { flag: 'a' }) });
+      budget.applyJournal(readFileSync(own, 'utf8').trim().split('\n').map((line) => JSON.parse(line)));
+      return budget;
+    };
+    const paths = { dir: runDir, budget: own, campaign: path.join(runDir, 'campaign.json') };
+    const budget = open();
+    const result = await reconcileByKeyResidual(paths, budget, 'next', { log() {}, nextPaths: { budget: nextBudget } });
+    expect(result.total).toBeCloseTo(0.25, 12);
+    expect(budget.state.unresolvedUsd).toBeCloseTo(0, 12);
+    expect(budget.state.settledUsd).toBeCloseTo(0.45, 12);
+    // The journal alone gives the same ledger, and a second pass changes nothing.
+    const again = open();
+    expect(again.state.unresolvedUsd).toBeCloseTo(0, 12);
+    expect(again.state.settledUsd).toBeCloseTo(0.45, 12);
+    expect((await reconcileByKeyResidual(paths, again, 'next', { log() {}, nextPaths: { budget: nextBudget } })).total).toBe(0);
+    const priced = readFileSync(own, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+      .filter((event) => event.kind === 'resettle');
+    expect(priced.map((event) => [event.attemptId, Number(event.cost.toFixed(12))])).toEqual([['b#1', 0.2], ['c#1', 0.05]]);
+    expect(priced.every((event) => event.source.startsWith('key-residual:'))).toBe(true);
+  });
+
+  it('refuses a key residual when the run posted after the next run started', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'a8-residual-overlap-'));
+    dirs.push(dir);
+    const own = path.join(dir, 'own.jsonl');
+    const nextBudget = path.join(dir, 'next.jsonl');
+    writeFileSync(own, [
+      { kind: 'audit', at: '2026-01-01T00:00:00.000Z', phase: 'probe', usage: 1 },
+      { kind: 'reserve', attemptId: 'b#1', model: 'm', usd: 0.4 },
+      { kind: 'audit', at: '2026-01-01T02:00:00.000Z', phase: 'test', usage: 1.3 },
+    ].map((event) => JSON.stringify(event)).join('\n'));
+    writeFileSync(nextBudget, JSON.stringify({ kind: 'audit', at: '2026-01-01T01:00:00.000Z', phase: 'probe', usage: 1.2 }));
+    const budget = createCampaignBudget({ maxUsd: 10, maxPosts: 10, prices: {} });
+    budget.applyJournal(readFileSync(own, 'utf8').split('\n').map((line) => JSON.parse(line)));
+    await expect(reconcileByKeyResidual({ dir, budget: own, campaign: path.join(dir, 'c.json') }, budget, 'next', {
+      log() {},
+      nextPaths: { budget: nextBudget },
+    })).rejects.toThrow('overlap');
   });
 
   it('continues a v5 campaign only from a source with the same routes, bank, blocks, caps and budget', () => {
