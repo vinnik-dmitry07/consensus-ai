@@ -101,15 +101,30 @@ export function networkOutageCount(file) {
 export function readSlotJournal(file) {
   const slots = readSlotMap(file);
   const reserved = new Map();
+  const ended = new Map();
   for (const event of readJsonl(file)) {
-    if (event.kind === 'http' && event.phase === 'reserved' && event.key) {
-      reserved.set(event.key, (reserved.get(event.key) || 0) + 1);
-    }
+    if (event.kind !== 'http' || !event.key) continue;
+    if (event.phase === 'reserved') reserved.set(event.key, (reserved.get(event.key) || 0) + 1);
+    if (event.phase === 'finished' || event.phase === 'error') ended.set(event.key, (ended.get(event.key) || 0) + 1);
   }
   for (const [key, slot] of slots) {
     slot.httpAttempts = Math.max(slot.httpAttempts || 0, reserved.get(key) || 0);
+    slot.cutAttempts = cutCount(reserved.get(key), ended.get(key));
   }
   return slots;
+}
+
+// POSTs a journal reserved but never closed: the runner stopped while they
+// streamed. The model gave no answer and no error, so such a POST is not one
+// of the call's attempts. It is read only from a journal no runner is writing.
+function cutCount(reserved = 0, ended = 0) {
+  return Math.max(0, reserved - ended);
+}
+
+// Attempts a call has used: every POST except refusals before generation and
+// POSTs cut off by a stopped runner.
+export function spentAttempts(slot) {
+  return Math.max(0, (slot?.httpAttempts || 0) - (slot?.limitedAttempts || 0) - (slot?.cutAttempts || 0));
 }
 
 function readJsonl(file) {
@@ -152,6 +167,7 @@ export function createSession({
   maxInFlight = null,
   maxInFlightPerModel = null,
   priorAttempts = null,
+  priorFreeAttempts = null,
   retainRoster = false,
   retryAfterCooldown = false,
 }) {
@@ -181,15 +197,26 @@ export function createSession({
     const saved = JSON.parse(readFileSync(cooldownPath, 'utf8'));
     for (const [id, until] of Object.entries(saved)) cooldowns.set(id, until);
   }
+  // POSTs this journal opened and closed, counted apart from the slot records
+  // so a slot event cannot overwrite them.
+  const reservedHere = new Map();
+  const endedHere = new Map();
   for (const event of readJsonl(journalPath)) applyEvent(event);
-  for (const slot of slots.values()) {
+  for (const [key, slot] of slots) {
     if (slot.state === 'running') slot.state = 'unknown';
+    // Nothing is in flight while the journal loads, so an open POST was cut
+    // off when an earlier runner stopped.
+    slot.cutAttempts = cutCount(reservedHere.get(key), endedHere.get(key));
   }
 
   function applyEvent(event) {
     if (event.kind === 'cooldown') {
       cooldowns.set(event.model, event.until);
       return;
+    }
+    if (event.kind === 'http' && event.key) {
+      if (event.phase === 'reserved') reservedHere.set(event.key, (reservedHere.get(event.key) || 0) + 1);
+      if (event.phase === 'finished' || event.phase === 'error') endedHere.set(event.key, (endedHere.get(event.key) || 0) + 1);
     }
     if (event.kind === 'http') {
       const slot = slots.get(event.key) || { key: event.key, httpAttempts: 0, serviceMs: 0 };
@@ -360,9 +387,13 @@ export function createSession({
       key = slotKey(slotMeta);
       const existing = slots.get(key);
       const cooling = cooldowns.get(catalogueId(model)) || 0;
-      const cooled = retryAfterCooldown && existing?.state === 'skipped' && cooling <= Date.now();
+      // With retryAfterCooldown a skip is never final: the call is asked again,
+      // or skipped again with a fresh time while its route still cools. A stored
+      // skip handed back as it was looked like an old skip whose cooldown had
+      // ended, so the question went on without that call.
+      const askAgain = retryAfterCooldown && existing?.state === 'skipped';
       const retrySkip = existing?.state === 'skipped' && (slotMeta.attempt || 0) > 0;
-      if (existing && TERMINAL.has(existing.state) && !retrySkip && !cooled) return existing.result;
+      if (existing && TERMINAL.has(existing.state) && !retrySkip && !askAgain) return existing.result;
       const reused = reusedSource(model, messages, options, slotMeta);
       if (reused) {
         writeSlot(key, {
@@ -386,6 +417,35 @@ export function createSession({
       if (budget.state.paused) {
         throw new BudgetPaused(budget.state.pauseReason, budget.state.resumeAfter);
       }
+      const attemptBudget = retryLimit ?? ENGINE_RETRY_LIMIT;
+      // Attempts already spent on this exact request in a replay source count
+      // against the same per-call limit. `raw` numbers every POST, so attempt
+      // ids stay unique; refusals before generation and POSTs cut off by a
+      // stopped runner do not count as spent, here or in the source.
+      const raw = Math.max(existing?.httpAttempts || 0, priorAttempts?.get(key) || 0);
+      const limitedBefore = Math.max(existing?.limitedAttempts || 0, priorFreeAttempts?.get(key) || 0);
+      const cutBefore = existing?.cutAttempts || 0;
+      const spent = Math.max(0, raw - limitedBefore - cutBefore);
+      const remaining = attemptBudget - spent;
+      // The attempt budget is checked before the cooldown. A call with no
+      // attempt left is a failure now; checked the other way round, it came
+      // back skipped on every pass and held its question forever.
+      if (remaining <= 0) {
+        const last = existing?.result && !existing.result.skipped ? existing.result : null;
+        const exhausted = last || {
+          ok: false,
+          error: { message: 'Retry budget exhausted', kind: 'retries', last: existing?.result?.error || null },
+        };
+        writeSlot(key, {
+          ...(existing || {}),
+          key,
+          meta: slotMeta,
+          request,
+          state: 'failed',
+          result: exhausted,
+        });
+        return exhausted;
+      }
       if (cooling > Date.now()) {
         const skipped = {
           ok: false,
@@ -402,29 +462,6 @@ export function createSession({
           skippedAt: Date.now(),
         });
         return skipped;
-      }
-      const attemptBudget = retryLimit ?? ENGINE_RETRY_LIMIT;
-      // Attempts already spent on this exact request in a replay source count
-      // against the same per-call limit. `raw` numbers every POST, so attempt
-      // ids stay unique; refusals before generation do not count as spent.
-      const raw = Math.max(existing?.httpAttempts || 0, priorAttempts?.get(key) || 0);
-      const limitedBefore = existing?.limitedAttempts || 0;
-      const spent = Math.max(0, raw - limitedBefore);
-      const remaining = attemptBudget - spent;
-      if (remaining <= 0) {
-        const exhausted = existing?.result || {
-          ok: false,
-          error: { message: 'Retry budget exhausted', kind: 'retries' },
-        };
-        writeSlot(key, {
-          ...(existing || {}),
-          key,
-          meta: slotMeta,
-          request,
-          state: 'failed',
-          result: exhausted,
-        });
-        return exhausted;
       }
       inFlight.add(key);
       writeSlot(key, {
@@ -497,7 +534,7 @@ export function createSession({
       if (transportDrop) {
         // With every allowed attempt spent there is nothing left to retry, so
         // the drop is the slot's final outcome instead of an endless unknown.
-        const exhausted = (current.httpAttempts || 0) - (current.limitedAttempts || 0) >= attemptBudget;
+        const exhausted = spentAttempts(current) >= attemptBudget;
         const dropState = exhausted ? 'failed' : 'unknown';
         writeSlot(key, {
           ...current,
@@ -518,6 +555,32 @@ export function createSession({
       }
       if (result && result.finishReason == null && current.finishReason) {
         result = { ...result, finishReason: current.finishReason };
+      }
+      // A POST that failed without an answer (a provider error, a stream the
+      // provider closed early, a deadline) while the call still has an attempt
+      // left. The engine does not retry these, so the slot is skipped with a
+      // fresh time: its question waits and the next pass asks again. Only the
+      // last allowed attempt can fail for good.
+      if (
+        retryAfterCooldown
+        && result && !result.ok && !result.skipped
+        && (current.httpAttempts || 0) > raw
+        && spentAttempts(current) < attemptBudget
+      ) {
+        const retry = { ...result, ok: false, skipped: true, retryable: true };
+        writeSlot(key, {
+          ...current,
+          key,
+          meta: slotMeta,
+          request,
+          state: 'skipped',
+          result: retry,
+          skippedAt: Date.now(),
+          finishReason: result.finishReason ?? current.finishReason ?? null,
+          occupiedMs: Date.now() - started,
+        });
+        emit(`${slotMeta.branch} ${slotMeta.stage} ${slotMeta.model} sample ${slotMeta.sample}${attemptLabel(slotMeta)} failed (${result.error?.kind || result.error?.message || 'error'}); asked again on a later pass`);
+        return retry;
       }
       ordinal += 1;
       const state = result?.skipped ? 'skipped' : result?.ok ? 'completed' : 'failed';

@@ -10,7 +10,7 @@ import { settings } from '../src/engine/browser/settings.js';
 import { taskPublicId } from './datasets.js';
 import { answerPrompt, canonAnswer, gradeResponse, failureKind, LENIENT_RULES } from './grade.js';
 import { BudgetPaused, createCampaignBudget } from './budget.js';
-import { createSession, readSlotJournal, snapshotLocal } from './runtime.js';
+import { createSession, readSlotJournal, snapshotLocal, spentAttempts } from './runtime.js';
 import { runIsolated } from './questionScope.js';
 import { installTransport } from './transport.js';
 import { COMPARISON_BRANCHES, runComparison } from './a8Variants.js';
@@ -355,10 +355,13 @@ function journalsOf(runId) {
 // which carries the hash of the full request, so a different prompt, route,
 // cap, or order never matches. Answered slots are reused whatever they say.
 // A slot that used every allowed attempt is reused as a failure. Any other
-// slot is called again here, and the attempts it already spent count.
+// slot is called again here, and the attempts it already spent count. Spent
+// means real attempts: a refusal before generation and a POST cut off when the
+// source's runner stopped are carried in `free`, so they are not counted.
 export function loadReplaySources(runIds, { maxAttempts = MAX_ATTEMPTS, journals = journalsOf } = {}) {
   const reuse = new Map();
   const prior = new Map();
+  const free = new Map();
   for (const id of runIds) {
     for (const file of journals(id)) {
       for (const [key, slot] of readSlotJournal(file)) {
@@ -366,17 +369,20 @@ export function loadReplaySources(runIds, { maxAttempts = MAX_ATTEMPTS, journals
         if (reuse.has(key)) continue;
         const attempts = slot.httpAttempts || 0;
         const answered = slot.state === 'completed' && slot.result?.ok === true;
-        const exhausted = slot.state === 'failed' && attempts >= maxAttempts;
+        const exhausted = slot.state === 'failed' && spentAttempts(slot) >= maxAttempts;
         if (answered || exhausted) {
           reuse.set(key, { ...slot, sourceRun: id });
           prior.delete(key);
+          free.delete(key);
         } else if (attempts > 0) {
           prior.set(key, Math.max(prior.get(key) || 0, attempts));
+          const unspent = attempts - spentAttempts(slot);
+          if (unspent > 0) free.set(key, Math.max(free.get(key) || 0, unspent));
         }
       }
     }
   }
-  return { reuse, prior };
+  return { reuse, prior, free };
 }
 
 function replaySources(campaign) {
@@ -433,6 +439,7 @@ function sessionBudget(replay = null) {
     ...(replay ? {
       replayFrom: replay.reuse,
       priorAttempts: replay.prior,
+      priorFreeAttempts: replay.free,
       aliasOf: (model) => model,
       replayTerminal: true,
     } : {}),
@@ -612,10 +619,14 @@ export async function routesPreflight(campaignPaths, runId, options) {
     blocks: requested = [],
     maxUsd = MAX_USD,
     maxPosts = MAX_POSTS,
+    replayFrom: fromIds = null,
   } = options;
   const existing = readJson(campaignPaths.campaign);
   if (existing) {
     if (existing.routesInheritedFrom !== routesFrom) throw new Error('This campaign already exists with other routes.');
+    if ((existing.replayFrom || []).join(',') !== (fromIds || []).join(',')) {
+      throw new Error('This campaign already exists with other replay sources.');
+    }
     sameSource(existing.sourceHash, 'Campaign');
     console.log(`preflight already done on routes from ${existing.routesInheritedFrom}`);
     return 0;
@@ -668,6 +679,11 @@ export async function routesPreflight(campaignPaths, runId, options) {
     inheritedAt: new Date().toISOString(),
   });
   const profile = profileDocument(caps, { ...v5Policy(), smokeCount: counts.smoke });
+  const replay = fromIds?.length
+    ? extendedReplay(runId, fromIds, {
+      profile, blocks, routesFrom, maxUsd, maxPosts, digest: loaded.digest, extensionDigest: loaded.extensionDigest,
+    })
+    : null;
   writeJson(campaignPaths.campaign, {
     id: runId,
     ...profile,
@@ -693,15 +709,64 @@ export async function routesPreflight(campaignPaths, runId, options) {
     sourceHash: sourceHash(),
     gitHead: git.head,
     createdAt: new Date().toISOString(),
+    ...(replay ? { replayFrom: fromIds, carriedSpend: replay.carriedSpend } : {}),
   });
   console.log(`preflight: commit ${git.head.slice(0, 12)}, source hash ${sourceHash().slice(0, 12)}`);
-  console.log(`preflight: routes from ${routesFrom}, ${candidateRoutes.length} candidates, no replay, no carried spend`);
+  if (replay) {
+    const carried = replay.carriedSpend;
+    console.log(
+      `preflight: routes from ${routesFrom}, ${candidateRoutes.length} candidates; replays every identical request of ${fromIds.join(', ')}; `
+      + `carried spend $${carried.settledUsd.toFixed(4)} settled, $${carried.unresolvedUsd.toFixed(4)} unresolved, ${carried.posts} posts`,
+    );
+  } else {
+    console.log(`preflight: routes from ${routesFrom}, ${candidateRoutes.length} candidates, no replay, no carried spend`);
+  }
   console.log(`preflight caps: one cap of ${largest} tokens on every stage; stream deadline ${profile.streamTimeoutSeconds}s`);
   console.log(`preflight blocks: ${blocks.join(', ')}; primary ${primaryBlocksOf(blocks).join(', ')}`);
   console.log(`preflight counts: smoke ${counts.smoke}, dev ${counts.dev}, test ${counts.test}; budget $${maxUsd} / ${maxPosts} POSTs`);
   const primaryTest = primaryBlocksOf(blocks).reduce((sum, block) => sum + (counts.blocks[block]?.test || 0), 0);
   console.log(`preflight test: ${primaryTest} primary questions (${primaryBlocksOf(blocks).join(', ')}), then ${counts.test - primaryTest} legacy (${LEGACY_BLOCKS.join(', ')})`);
   return 0;
+}
+
+// A v5 campaign that continues another v5 campaign under a fixed runtime. It
+// replays every slot whose request is identical, so the source must agree on
+// everything that shapes a request or a score: routes, bank, blocks, caps and
+// the profile. Its spend and POSTs count against the same caps, which must be
+// the source's caps. No network calls.
+export function extendedReplay(
+  runId,
+  fromIds,
+  expected,
+  { readCampaign = (id) => readJson(pathsFor(id).campaign), readSpend = journalSpend, assertSource = assertReplaySource } = {},
+) {
+  const runs = [];
+  for (const id of fromIds) {
+    assertSource(id, runId);
+    const source = readCampaign(id);
+    if (!source) throw new Error(`Replay source ${id} has no campaign.json.`);
+    const mismatch = [
+      ['routes', source.routesInheritedFrom, expected.routesFrom],
+      ['bank', source.bankDigest, expected.digest],
+      ['bank extension', source.bankExtension?.digest, expected.extensionDigest],
+      ['blocks', (source.blocks || []).join(','), expected.blocks.join(',')],
+      ['maxUsd', source.maxUsd, expected.maxUsd],
+      ['maxPosts', source.maxPosts, expected.maxPosts],
+    ].find(([, theirs, ours]) => stableStringify(theirs ?? null) !== stableStringify(ours ?? null));
+    if (mismatch) throw new Error(`Replay source ${id} differs on ${mismatch[0]}.`);
+    const differences = compareReplayProfile(id, source, expected.profile);
+    if (Object.keys(differences).length) {
+      throw new Error(`Replay source ${id} differs on ${Object.keys(differences).join(', ')}; nothing would be reused.`);
+    }
+    runs.push({ run: id, ...readSpend(pathsFor(id).budget, source) });
+  }
+  const carriedSpend = runs.reduce((sum, row) => ({
+    settledUsd: sum.settledUsd + row.settledUsd,
+    unresolvedUsd: sum.unresolvedUsd + row.unresolvedUsd,
+    posts: sum.posts + row.posts,
+    runs: sum.runs,
+  }), { settledUsd: 0, unresolvedUsd: 0, posts: 0, runs });
+  return { carriedSpend };
 }
 
 async function preflight(campaignPaths, live, caps = STAGE_CAPS) {
@@ -1832,8 +1897,9 @@ function stageName(meta) {
 
 // Per-stage counts from one phase journal: calls, cap hits, loop stops (every
 // aborted attempt), answers kept after a second loop, context refusals, and
-// failed slots.
-export function stageCounters(file) {
+// failed slots. A replaying campaign passes its sources' journals too: a
+// reused slot's loop stops and credit retries happened there.
+export function stageCounters(file, sourceFiles = []) {
   const counters = {};
   const slots = readSlotJournal(file);
   for (const slot of slots.values()) {
@@ -1854,8 +1920,9 @@ export function stageCounters(file) {
     if (slot.result?.error?.kind === 'context') row.context += 1;
     if (slot.state === 'failed') row.failed += 1;
   }
-  if (existsSync(file)) {
-    for (const line of readFileSync(file, 'utf8').split('\n')) {
+  for (const journal of [...sourceFiles, file]) {
+    if (!existsSync(journal)) continue;
+    for (const line of readFileSync(journal, 'utf8').split('\n')) {
       const loop = line.includes('"cancelReason":"loop"');
       const credit = line.includes('"credit":"in_flight_budget"');
       if (!loop && !credit) continue;
@@ -1902,10 +1969,21 @@ export function armCosts(reservations, bModel) {
   return out;
 }
 
-function ledgerOf(file, campaign) {
+// One ledger over several budget journals. A replaying campaign's attempts
+// carry on the numbering of its source's attempts, so their ids never clash
+// and the union is every POST paid for these questions.
+function ledgerOf(files, campaign) {
   const ledger = createCampaignBudget({ maxUsd: campaign.maxUsd || MAX_USD, maxPosts: campaign.maxPosts || MAX_POSTS, prices: {} });
-  ledger.applyJournal(readJsonl(file));
+  for (const file of [].concat(files)) ledger.applyJournal(readJsonl(file));
   return ledger;
+}
+
+// What a replaying campaign took from its sources and what it posted itself.
+function replayLine(campaign, slots, ownBudgetFile) {
+  if (!campaign.replayFrom?.length) return null;
+  const reused = slots.filter((slot) => slot.reusedFrom).length;
+  const fresh = readJsonl(ownBudgetFile).filter((event) => event.kind === 'reserve').length;
+  return { from: campaign.replayFrom, reused, fresh };
 }
 
 function goldOverridesFrom(argv, byId) {
@@ -1965,7 +2043,11 @@ async function reportV5(campaignPaths, campaign, argv) {
   for (const row of rows) {
     for (const key of Object.keys(tailApplied)) tailApplied[key] += row.tailApplied?.[key] || 0;
   }
-  const ledger = ledgerOf(campaignPaths.budget, campaign);
+  // A replaying campaign reports the money of its sources too: their answers
+  // are its answers, and their POSTs count against the same cap.
+  const sourceBudgets = (campaign.replayFrom || []).map((id) => pathsFor(id).budget);
+  const ledger = ledgerOf([...sourceBudgets, campaignPaths.budget], campaign);
+  const replay = replayLine(campaign, [...readSlotJournal(path.join(dir, 'events.jsonl')).values()], campaignPaths.budget);
   const testBlocks = campaign.counts?.blocks || {};
   const plannedPrimary = primaryBlocks.reduce((sum, block) => sum + (testBlocks[block]?.test || 0), 0);
   const planned = campaign.counts?.test ?? rows.length;
@@ -2004,7 +2086,10 @@ async function reportV5(campaignPaths, campaign, argv) {
     lenientRules: LENIENT_RULES,
     listings,
     coverage: campaign.bankExtension?.coverage,
-    counters: stageCounters(path.join(dir, 'events.jsonl')),
+    counters: stageCounters(
+      path.join(dir, 'events.jsonl'),
+      (campaign.replayFrom || []).map((id) => path.join(pathsFor(id).comparison, 'test', 'events.jsonl')),
+    ),
     tailApplied,
     spend: {
       settledUsd: ledger.state.settledUsd,
@@ -2013,6 +2098,7 @@ async function reportV5(campaignPaths, campaign, argv) {
       audit: ledger.state.lastAudit || null,
     },
     armCost: armCosts(ledger.state.reservations, selection.b),
+    replay,
     maxUsd: campaign.maxUsd,
     maxPosts: campaign.maxPosts,
     gold: goldLines.join(' '),
@@ -2264,7 +2350,8 @@ export async function runA8Command(argv) {
   } else if (!routesFrom && maxPosts != null && Number(maxPosts) !== MAX_POSTS) {
     throw new Error(`This profile locks maxPosts at ${MAX_POSTS}. A new extended campaign (--routes-from) sets its own.`);
   }
-  if (routesFrom && flagValue(argv, '--from')) throw new Error('Use either --from (replay) or --routes-from (routes only).');
+  // With --routes-from, --from adds a replay of another extended campaign that
+  // used the same routes (extendedReplay checks it).
   const fromFlag = flagValue(argv, '--from');
   const from = fromFlag ? fromFlag.split(',').map((id) => id.trim()).filter(Boolean) : null;
   if (from && phase !== 'preflight') {
@@ -2287,6 +2374,7 @@ export async function runA8Command(argv) {
           blocks: blocksFlag ? blocksFlag.split(',').map((block) => block.trim()).filter(Boolean) : [],
           maxUsd: maxUsd != null ? positiveFlag(argv, '--max-usd', MAX_USD) : MAX_USD,
           maxPosts: maxPosts != null ? positiveFlag(argv, '--max-posts', MAX_POSTS) : MAX_POSTS,
+          replayFrom: from,
         });
       }
       if (capsMode) throw new Error('--caps max needs --routes-from.');

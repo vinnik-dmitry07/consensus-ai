@@ -639,6 +639,12 @@ export function renderV5Report(input) {
       '',
       `Campaign: settled ${money(spend.settledUsd)}, still held ${money(spend.unresolvedUsd)}, ${spend.posts} POSTs of ${input.maxPosts}; cap $${input.maxUsd}.`,
     );
+    if (input.replay) {
+      lines.push(
+        `Replayed from ${input.replay.from.join(', ')}: ${input.replay.reused} test calls taken by exact request; ${input.replay.fresh} POSTs made by this run. `
+        + 'Money and counters cover both runs: their answers are this report\'s answers, and their POSTs count against the same cap.',
+      );
+    }
     if (spend.audit) {
       lines.push(`Key usage at the last audit: ${spend.audit.usage ?? 'n/a'} (an audit only; it never releases a reserve).`);
     }

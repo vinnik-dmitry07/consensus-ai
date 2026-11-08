@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { queryModelResult } from '../src/engine/browser/openrouter.js';
 import { settings } from '../src/engine/browser/settings.js';
 import { loopReview } from './a8.js';
+import { questionWaits } from './a8Variants.js';
 import { createCampaignBudget } from './budget.js';
 import { createSession } from './runtime.js';
 import { attemptStore, generationIdFrom, installTransport } from './transport.js';
@@ -68,6 +69,25 @@ function finishedStream(id) {
 function upstream429() {
   const error = { message: 'Provider returned error', code: 429, metadata: { raw: `${MODEL} is temporarily rate-limited upstream. Please retry shortly.` } };
   return new Response(JSON.stringify({ error }), { status: 429, headers: { 'content-type': 'application/json', 'Retry-After': '0' } });
+}
+
+// A stream the provider closes mid-answer: text, then no finish and no [DONE].
+function cutStream(id) {
+  const encoder = new TextEncoder();
+  const events = [{ reasoning: prose(800) }, { reasoning: prose(800, 7) }]
+    .map((delta) => `data: ${JSON.stringify({ id, choices: [{ delta }] })}\n\n`);
+  let index = 0;
+  const body = new ReadableStream({
+    pull(controller) {
+      if (index >= events.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(encoder.encode(events[index]));
+      index += 1;
+    },
+  });
+  return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
 }
 
 function capacityStream(id) {
@@ -230,6 +250,82 @@ describe('loop guard through the eval session', () => {
     expect(done.ok).toBe(true);
     expect(posts).toHaveLength(2);
     expect(session.slots()[0]).toMatchObject({ state: 'completed', httpAttempts: 2, limitedAttempts: 1 });
+  });
+
+  it('asks a call again after the provider closes its stream early', async () => {
+    const { posts } = open((n) => (n === 1 ? cutStream('gen-cut') : finishedStream('gen-ok')));
+    const first = await queryModelResult(MODEL, MESSAGES);
+    expect(first).toMatchObject({ ok: false, skipped: true, retryable: true });
+    expect(first.error.kind).toBe('protocol');
+    expect(session.slots()[0]).toMatchObject({ state: 'skipped', httpAttempts: 1 });
+    expect(session.slots()[0].skippedAt).toBeGreaterThan(0);
+    const second = await queryModelResult(MODEL, MESSAGES);
+    expect(second.ok).toBe(true);
+    expect(second.content).toBe('ANSWER: 12');
+    expect(posts).toHaveLength(2);
+    expect(session.slots()[0]).toMatchObject({ state: 'completed', httpAttempts: 2 });
+  });
+
+  it('fails a call for good when its last allowed attempt is cut too', async () => {
+    const { posts } = open(() => cutStream('gen-cut'));
+    expect((await queryModelResult(MODEL, MESSAGES)).skipped).toBe(true);
+    const last = await queryModelResult(MODEL, MESSAGES);
+    expect(last.ok).toBe(false);
+    expect(last.skipped).toBeFalsy();
+    expect(session.slots()[0].state).toBe('failed');
+    const stored = await queryModelResult(MODEL, MESSAGES);
+    expect(stored.skipped).toBeFalsy();
+    expect(posts).toHaveLength(2);
+  });
+
+  it('skips a stored skip again with a fresh time while its route still cools', async () => {
+    const { posts } = open((n) => (n === 1 ? capacityStream('gen-cap') : finishedStream('gen-ok')));
+    expect((await queryModelResult(MODEL, MESSAGES)).skipped).toBe(true);
+    const firstSkip = session.slots()[0].skippedAt;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const since = Date.now();
+    expect((await queryModelResult(MODEL, MESSAGES)).skipped).toBe(true);
+    expect(posts).toHaveLength(1);
+    expect(firstSkip).toBeLessThan(since);
+    expect(session.slots()[0].skippedAt).toBeGreaterThanOrEqual(since);
+    // The cooldown ends before the stage does. The fresh skip still holds the
+    // question, so the call is asked on the next pass instead of being lost.
+    for (const id of session.cooldowns.keys()) session.cooldowns.set(id, 0);
+    expect(questionWaits(session, 'q1', since)).toBe(true);
+    const done = await queryModelResult(MODEL, MESSAGES);
+    expect(done.ok).toBe(true);
+    expect(posts).toHaveLength(2);
+  });
+
+  it('fails a call with no attempt left instead of skipping it again while its route cools', async () => {
+    const { runDir, posts } = open(() => cutStream('gen-cut'));
+    expect((await queryModelResult(MODEL, MESSAGES)).skipped).toBe(true);
+    // The same journal under a limit of one attempt: the call is spent.
+    const again = open(() => finishedStream('gen-ok'), { runDir, retryLimit: 1 });
+    for (const id of ['alpha/one']) session.cooldowns.set(id, Date.now() + 1_000_000);
+    const result = await queryModelResult(MODEL, MESSAGES);
+    expect(result.ok).toBe(false);
+    expect(result.skipped).toBeFalsy();
+    expect(result.error.kind).toBe('retries');
+    expect(session.slots()[0].state).toBe('failed');
+    expect(posts).toHaveLength(1);
+    expect(again.posts).toHaveLength(0);
+  });
+
+  it('does not count a POST cut off by a stopped runner as an attempt', async () => {
+    const first = open(() => finishedStream('gen-a'));
+    expect((await queryModelResult(MODEL, MESSAGES)).ok).toBe(true);
+    // The journal as it stood while that POST streamed: reserved, never closed.
+    const events = journal(first.runDir);
+    const closed = events.findIndex((event) => event.kind === 'http' && event.phase === 'finished');
+    const dir = mkdtempSync(path.join(tmpdir(), 'a8-cut-'));
+    dirs.push(dir);
+    writeFileSync(path.join(dir, 'events.jsonl'), `${events.slice(0, closed).map((event) => JSON.stringify(event)).join('\n')}\n`, 'utf8');
+    const second = open(() => finishedStream('gen-b'), { runDir: dir, retryLimit: 1 });
+    const result = await queryModelResult(MODEL, MESSAGES);
+    expect(result.ok).toBe(true);
+    expect(second.posts).toHaveLength(1);
+    expect(session.slots()[0]).toMatchObject({ state: 'completed', httpAttempts: 2, cutAttempts: 1 });
   });
 
   it('refuses an oversized prompt before any post', async () => {

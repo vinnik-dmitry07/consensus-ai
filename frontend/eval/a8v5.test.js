@@ -11,6 +11,7 @@ import {
   bankCounts,
   confirmsCap,
   durablePauseCure,
+  extendedReplay,
   gitState,
   interleave,
   loopReview,
@@ -450,6 +451,54 @@ describe('v5 accounting', () => {
       judges: { ...zero, calls: 3, cap: 2, belowCap: 1, loopStops: 2, loopCut: 1, creditRetries: 1 },
       'A8 synthesis': { ...zero, calls: 1, context: 1, failed: 1 },
     });
+    // A replay source's loop stop on a slot this run reused counts as well;
+    // one on a slot this run does not hold does not.
+    const source = path.join(dir, 'source.jsonl');
+    writeFileSync(source, [
+      { kind: 'http', phase: 'finished', key: 'k4', cancelReason: 'loop' },
+      { kind: 'http', phase: 'finished', key: 'elsewhere', cancelReason: 'loop' },
+    ].map((event) => JSON.stringify(event)).join('\n'));
+    expect(stageCounters(file, [source]).judges.loopStops).toBe(3);
+  });
+
+  it('continues a v5 campaign only from a source with the same routes, bank, blocks, caps and budget', () => {
+    const profile = profileDocument(capsFrom({ stage1: 32768, stage2: 32768, stage3: 32768 }), v5Policy());
+    const expected = {
+      profile,
+      blocks: ['rgym', 'amc', 'aime', 'gpqa', 'mmlu'],
+      routesFrom: 'a8-open-v4',
+      maxUsd: 100,
+      maxPosts: 6000,
+      digest: 'bank',
+      extensionDigest: 'ext',
+    };
+    const source = {
+      ...profile,
+      routesInheritedFrom: 'a8-open-v4',
+      bankDigest: 'bank',
+      bankExtension: { digest: 'ext' },
+      blocks: expected.blocks,
+      maxUsd: 100,
+      maxPosts: 6000,
+    };
+    const deps = (campaign) => ({
+      readCampaign: () => campaign,
+      readSpend: () => ({ settledUsd: 41.5, unresolvedUsd: 0.25, posts: 2900 }),
+      assertSource: () => {},
+    });
+    const ok = extendedReplay('v5e', ['v5d'], expected, deps(source));
+    expect(ok.carriedSpend).toMatchObject({ settledUsd: 41.5, unresolvedUsd: 0.25, posts: 2900 });
+    expect(ok.carriedSpend.runs).toEqual([{ run: 'v5d', settledUsd: 41.5, unresolvedUsd: 0.25, posts: 2900 }]);
+    for (const [field, value, message] of [
+      ['blocks', ['rgym', 'aime', 'gpqa', 'mmlu'], 'blocks'],
+      ['maxUsd', 120, 'maxUsd'],
+      ['bankDigest', 'other', 'bank'],
+      ['routesInheritedFrom', 'a8-open-v3', 'routes'],
+      ['stageCaps', { stage1: 16384, stage2: 16384, stage3: 16384 }, 'stageCaps'],
+      ['maxAttempts', 3, 'maxAttempts'],
+    ]) {
+      expect(() => extendedReplay('v5e', ['v5d'], expected, deps({ ...source, [field]: value }))).toThrow(message);
+    }
   });
 
   it('settles a held reserve from its generation record and skips what it cannot price', async () => {

@@ -112,6 +112,19 @@ v5 — отдельная кампания со своим бюджетом. О�
 
 Кампания `a8-open-v5` остановилась на probe: OpenRouter отклонил отозванный ключ (HTTP 401 на всех маршрутах, $0, 5 POST), а постоянную паузу `auth` тогда нечем было снять. Она сохранена как прерванная запись. Затем `a8-open-v5b` прошла preflight и probe ($0.27). Probe показал, что StepFun выдаёт около 23 токенов в секунду против 128–422 у остальных маршрутов, а на вопросе ArXivMath все пять маршрутов дошли до лимита 32768 без ответа. ArXivMath по решению пользователя отложен: при потолке $100 он один стоил бы около $37 и не дал бы пройти шлюзу pilot. Затем `a8-open-v5c` с блоками rgym, amc, hmmt и livemath прошла dev и smoke, но pilot встал. Маршрут hy4 ответил 32 раза upstream 429, и вскрылись три ошибки: вопрос ждал вечно, если его вызов на поздней стадии был пропущен по охлаждению, а охлаждение уже кончилось; два отказа 429 исчерпывали обе попытки слота и делали его окончательной ошибкой; резерв отказа держался целиком. Ещё на dev провайдер StepFun отклонил 29 из 36 вызовов «temporarily at capacity», и протокол счёл их неверными ответами. v38 исправляет это, а измерение идёт под `a8-open-v5d` с теми же блоками, протоколом, банком и потолком. ArXivMath остаётся в банке для отдельной кампании.
 
+`a8-open-v5d` закончила основную часть (151 из 151), но в ней осталось пять сбоев инфраструктуры, а не метода:
+- Три вопроса закрылись с неполным советом. Вызов hy4 на Stage 1 пропускался по охлаждению. На следующем проходе рантайм вернул сохранённый пропуск, не обновив его время. Пока шёл медленный StepFun, охлаждение кончилось, и вопрос закрылся, ни разу не спросив hy4.
+- Одну генерацию B провайдер оборвал после 331 с потока («Stream ended before [DONE]»). Ошибка внутри потока стала окончательной, хотя у слота оставалась вторая попытка.
+- Ещё одну генерацию B оборвал перезапуск раннера, и обрыв засчитался как попытка. Этот слот закрыт ручной поправкой.
+
+v39 исправляет четыре места рантайма:
+- пропуск во время охлаждения пишется заново, со свежим временем, и держит вопрос;
+- исчерпание попыток проверяется раньше охлаждения;
+- POST, который не дал ответа при оставшейся попытке, ждёт следующего прохода; окончательно может упасть только последняя разрешённая попытка;
+- POST, который раннер начал и не закрыл, не считается попыткой ни в своей кампании, ни в источнике повтора. Отказы до генерации в источнике тоже не считаются.
+
+Запросы от этого не меняются. Поэтому `a8-open-v5e` (`--from a8-open-v5d`) переиспользует каждый слот v5d с тем же запросом и вызывает заново только недостающие. Источник обязан совпадать с ней по маршрутам, банку, блокам, лимитам, профилю и потолку. Расход и POST v5d входят в тот же потолок $100 / 6000 POST, а отчёт считает деньги и счётчики по обеим кампаниям. Неразобранный ответ на лимите 32768 — ответ модели при заданном лимите; он не повторяется и считается неверным.
+
 **Вопрос.** Как различается точность двух замороженных конвейеров, A8 v5 и S8 v5, на выбранной смеси новых задач при заданных лимитах, маршрутах и правилах повторов и разбора. Это сравнение полных систем. Эффект совета, разнообразия моделей, лимитов или детектора отдельно не измеряется, а один общий `max_tokens` не делает денежные и вычислительные бюджеты равными. Условия приёмки:
 
 - **R1.** Все новые вопросы получили терминальные исходы обеих рук, и прежние вопросы не тратили бюджет раньше этого.
@@ -212,20 +225,20 @@ Probe подтверждает, что маршрут принимает зап�
 
 ```text
 npm --prefix frontend run eval -- a8 --phase prepare
-npm --prefix frontend run eval -- a8 --phase preflight --run a8-open-v5d --routes-from a8-open-v4 --caps max --blocks rgym,amc,hmmt,livemath --max-usd 100 --max-posts 6000
-npm --prefix frontend run eval -- a8 --phase probe --run a8-open-v5d --live
-npm --prefix frontend run eval -- a8 --phase dev --run a8-open-v5d --live --jobs 36 --model-in-flight 12 --max-resumes 300
-npm --prefix frontend run eval -- a8 --phase smoke --run a8-open-v5d --live --jobs 2 --model-in-flight 10
-npm --prefix frontend run eval -- a8 --phase loops --run a8-open-v5d --of smoke
 npm --prefix frontend run eval -- a8 --phase reconcile --run a8-open-v5d
-npm --prefix frontend run eval -- a8 --phase reconcile --run a8-open-v5d --self-test --live
-npm --prefix frontend run eval -- a8 --phase pilot --run a8-open-v5d --live --jobs 12 --model-in-flight 24 --max-resumes 300
-npm --prefix frontend run eval -- a8 --phase loops --run a8-open-v5d --of pilot
-npm --prefix frontend run eval -- a8 --phase test --run a8-open-v5d --live --jobs 20 --model-in-flight 24 --max-resumes 1000
-npm --prefix frontend run eval -- a8 --phase reconcile --run a8-open-v5d
-npm --prefix frontend run eval -- a8 --phase report --run a8-open-v5d
+npm --prefix frontend run eval -- a8 --phase preflight --run a8-open-v5e --routes-from a8-open-v4 --from a8-open-v5d --caps max --blocks rgym,amc,hmmt,livemath --max-usd 100 --max-posts 6000
+npm --prefix frontend run eval -- a8 --phase probe --run a8-open-v5e --live
+npm --prefix frontend run eval -- a8 --phase dev --run a8-open-v5e --live --jobs 36 --model-in-flight 12 --max-resumes 300
+npm --prefix frontend run eval -- a8 --phase smoke --run a8-open-v5e --live --jobs 2 --model-in-flight 10
+npm --prefix frontend run eval -- a8 --phase loops --run a8-open-v5e --of smoke
+npm --prefix frontend run eval -- a8 --phase reconcile --run a8-open-v5e
+npm --prefix frontend run eval -- a8 --phase pilot --run a8-open-v5e --live --jobs 12 --model-in-flight 24 --max-resumes 300
+npm --prefix frontend run eval -- a8 --phase loops --run a8-open-v5e --of pilot
+npm --prefix frontend run eval -- a8 --phase test --run a8-open-v5e --live --jobs 24 --model-in-flight 14 --max-resumes 2000
+npm --prefix frontend run eval -- a8 --phase reconcile --run a8-open-v5e
+npm --prefix frontend run eval -- a8 --phase report --run a8-open-v5e
 ```
 
-Self-test в цепочке нужен, только если предыдущий `reconcile` не нашёл цену ни одной прерванной попытки.
+Первая строка сверяет удержанные резервы v5d, чтобы v5e перенесла её расход точно; остановленный раннер v5d перед этим больше не пишет. Dev, smoke и pilot v5e почти целиком повторяют v5d по точному запросу, поэтому их собственная цена и прогноз шлюза близки к нулю; ограничивает потолок вместе с перенесённым расходом. Self-test (`reconcile --self-test --live`) нужен, только если `reconcile` не нашёл цену ни одной прерванной попытки; в v5d он прошёл.
 
 `complete` запускается после repair на все 120 вопросов. Однозначный ответ, записанный не в строгом формате (жирный `ANSWER`, скобки, `\boxed{}`, строка `ANSWER` не последняя, последняя строка «the answer is X»), читается из уже полученного текста и не запрашивается снова. Ячейка, в которой ответа нет, рисуется заново тем же запросом и тем же endpoint, до `--attempts` раз (по умолчанию 3). Stage 2, red team и Stage 3 повторяются из журнала repair без новых вызовов: новый розыгрыш Stage 1 меняет только оценку ячеек, которые его читают. Результат пишется в `frontend/eval/.runs/<id>/complete/` и не меняет as-run и repair. `--max-usd` по умолчанию 20, `--max-posts` по умолчанию 600, `--jobs` по умолчанию 4. `--cooldown-seconds` ограничивает паузу после upstream 429 (без флага остаётся обычные 10 минут). `--deadline-minutes` держит процесс живым и повторяет охлаждённые ячейки до абсолютного срока, записанного в state; после срока ячейка, которую провайдер всё ещё не отдаёт, считается неверной с пометкой provider unavailable, а голос A4 собирается из остальных ответов. Код 2 — пауза по лимиту или сети.

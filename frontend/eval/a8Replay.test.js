@@ -86,7 +86,7 @@ describe('A8 replay by exact request', () => {
     vi.restoreAllMocks();
   });
 
-  function open({ replay = null, fetchImpl = respond } = {}) {
+  function open({ replay = null, fetchImpl = respond, retryAfterCooldown = true } = {}) {
     session?.uninstall();
     restore();
     const runDir = mkdtempSync(path.join(tmpdir(), 'a8-replay-'));
@@ -99,12 +99,13 @@ describe('A8 replay by exact request', () => {
       prepareOptions,
       retryLimit: 2,
       retainRoster: true,
-      retryAfterCooldown: true,
+      retryAfterCooldown,
       maxInFlight: 7,
       maxInFlightPerModel: 4,
       ...(replay ? {
         replayFrom: replay.reuse,
         priorAttempts: replay.prior,
+        priorFreeAttempts: replay.free,
         aliasOf: (model) => model,
         replayTerminal: true,
       } : {}),
@@ -163,7 +164,9 @@ describe('A8 replay by exact request', () => {
       }
       return respond(body);
     };
-    const first = open({ fetchImpl: failing });
+    // The source ran without the pass-to-pass retry, so its failed sample
+    // ended after one attempt, as in a8-open-v5d.
+    const first = open({ fetchImpl: failing, retryAfterCooldown: false });
     const original = await run();
     expect(original.arms.S8.reason).toBe('incomplete_samples');
     const failedPosts = first.posts.filter((post) => post.key.includes('|replicates|sample|3|')).length;
@@ -183,6 +186,117 @@ describe('A8 replay by exact request', () => {
       expect(retried).toBe(0);
       expect(again.arms.S8.reason).toBe('incomplete_samples');
     }
+  });
+
+  it('asks a failed POST again on the next pass instead of failing the arm', async () => {
+    let failures = 0;
+    const failing = (body, key) => {
+      if (key.includes('|replicates|sample|3|') && failures < 1) {
+        failures += 1;
+        return Promise.resolve(reply('', 400));
+      }
+      return respond(body);
+    };
+    const first = open({ fetchImpl: failing });
+    const waiting = await run();
+    expect(waiting.status).toBe('pending');
+    const slot = session.slots().find((item) => item.key.includes('|replicates|sample|3|'));
+    expect(slot).toMatchObject({ state: 'skipped', httpAttempts: 1 });
+    expect(slot.result.retryable).toBe(true);
+    const done = await run();
+    expect(done.status).toBe('complete');
+    expect(done.arms.S8.status).toBe('graded');
+    expect(done.arms.S8.correct).toBe(1);
+    expect(first.posts.filter((post) => post.key.includes('|replicates|sample|3|'))).toHaveLength(2);
+    expect(first.posts).toHaveLength(13);
+  });
+
+  it('fails a call for good only when its last allowed attempt fails too', async () => {
+    const failing = (body, key) => (key.includes('|replicates|sample|3|')
+      ? Promise.resolve(reply('', 400))
+      : respond(body));
+    const first = open({ fetchImpl: failing });
+    expect((await run()).status).toBe('pending');
+    const done = await run();
+    expect(done.status).toBe('complete');
+    expect(done.arms.S8.reason).toBe('incomplete_samples');
+    const slot = session.slots().find((item) => item.key.includes('|replicates|sample|3|'));
+    expect(slot.state).toBe('failed');
+    expect(slot.result.skipped).toBeFalsy();
+    const again = await run();
+    expect(again.arms.S8.reason).toBe('incomplete_samples');
+    expect(first.posts.filter((post) => post.key.includes('|replicates|sample|3|'))).toHaveLength(2);
+  });
+
+  it('keeps a question waiting when a council call was skipped in cooldown and the cooldown ends before Stage 1 does', async () => {
+    // a8-open-v5d lost three questions this way: the stored skip came back as
+    // it was, the cooldown ended while the other calls streamed, and the
+    // question closed with an incomplete council without asking that model.
+    let gammaCalls = 0;
+    let sampleCalls = 0;
+    const upstream429 = () => new Response(JSON.stringify({
+      error: { message: 'Provider returned error', code: 429, metadata: { raw: 'gamma/three is temporarily rate-limited upstream. Please retry shortly.' } },
+    }), { status: 429, headers: { 'content-type': 'application/json', 'Retry-After': '0' } });
+    const fetchImpl = (body, key) => {
+      if (key.includes('|council|stage1|') && body.model === 'gamma/three') {
+        gammaCalls += 1;
+        if (gammaCalls === 1) return Promise.resolve(upstream429());
+      }
+      if (key.includes('|replicates|sample|2|')) {
+        sampleCalls += 1;
+        if (sampleCalls === 1) return Promise.resolve(reply('', 400));
+        return new Promise((resolve) => setTimeout(() => resolve(reply('ANSWER: 7')), 150));
+      }
+      return respond(body);
+    };
+    const first = open({ fetchImpl });
+    expect((await run()).status).toBe('pending');
+    // The route cools for 60 ms more; the slow sample takes 150 ms.
+    session.cooldowns.set('gamma/three', Date.now() + 60);
+    const passStart = Date.now();
+    const second = await run();
+    expect(second.status).toBe('pending');
+    const gamma = session.slots().find((item) => item.meta?.stage === 'stage1' && item.meta.model === 'gamma/three');
+    expect(gamma.state).toBe('skipped');
+    expect(gamma.skippedAt).toBeGreaterThanOrEqual(passStart);
+    expect(gammaCalls).toBe(1);
+    const done = await run();
+    expect(done.status).toBe('complete');
+    expect(gammaCalls).toBe(2);
+    expect(done.arms.A8.status).toBe('graded');
+    expect(done.arms.A8.reason).toBeUndefined();
+    expect(done.arms.P8.status).toBe('graded');
+    expect(done.arms.P8.correct).toBe(1);
+    expect(first.posts.filter((post) => post.model === 'gamma/three' && post.key.includes('|stage1|'))).toHaveLength(2);
+  });
+
+  it('counts only real attempts of a replay source: refusals and POSTs cut by a stopped runner are free', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'a8-replay-free-'));
+    dirs.push(dir);
+    const meta = (name) => ({ questionId: 'q', branch: 'council', stage: 'stage1', sample: 1, model: 'alpha/one', requestHash: name });
+    const keyOf = (name) => slotKey(meta(name));
+    const events = [];
+    const http = (name, phase) => events.push({ kind: 'http', phase, key: keyOf(name) });
+    const slot = (name, body) => events.push({ kind: 'slot', key: keyOf(name), slot: { key: keyOf(name), meta: meta(name), ...body } });
+    // One refusal, then a POST the runner never closed.
+    http('refused', 'reserved'); http('refused', 'finished');
+    slot('refused', { state: 'skipped', httpAttempts: 1, limitedAttempts: 1, result: { ok: false, skipped: true } });
+    http('refused', 'reserved');
+    slot('refused', { state: 'running', httpAttempts: 1, limitedAttempts: 1, result: null });
+    // Two real attempts that both failed: the call is spent.
+    http('spent', 'reserved'); http('spent', 'error'); http('spent', 'reserved'); http('spent', 'finished');
+    slot('spent', { state: 'failed', httpAttempts: 2, result: { ok: false, error: { kind: 'protocol' } } });
+    // One real attempt, then a retry the operator's restart cut off.
+    http('cut', 'reserved'); http('cut', 'finished'); http('cut', 'reserved');
+    slot('cut', { state: 'failed', httpAttempts: 2, result: { ok: false, error: { kind: 'retries' } } });
+    for (const event of events) appendFileSync(path.join(dir, 'events.jsonl'), `${JSON.stringify(event)}\n`, 'utf8');
+
+    const replay = loadReplaySources(['source'], { journals: journalOf(dir) });
+    expect([...replay.reuse.keys()]).toEqual([keyOf('spent')]);
+    expect(replay.prior.get(keyOf('refused'))).toBe(2);
+    expect(replay.free.get(keyOf('refused'))).toBe(2);
+    expect(replay.prior.get(keyOf('cut'))).toBe(2);
+    expect(replay.free.get(keyOf('cut'))).toBe(1);
   });
 
   it('does not lend a slot whose request differs from the one about to be sent', async () => {
