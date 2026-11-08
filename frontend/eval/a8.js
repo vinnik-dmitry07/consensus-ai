@@ -2158,7 +2158,10 @@ async function reportV5(campaignPaths, campaign, argv) {
   const legacyAll = rows.filter((row) => row.set === 'legacy');
   const primaryComplete = primaryAll.length === plannedPrimary && primaryAll.every(isDone);
   const legacyComplete = legacyAll.length === plannedLegacy && legacyAll.every(isDone);
-  const moneyFinal = Number(ledger.state.unresolvedUsd || 0) === 0;
+  // Final when no reserve is held: counted by rows, since the held sum keeps
+  // float noise after many releases.
+  const moneyFinal = !Object.values(ledger.state.reservations || {})
+    .some((row) => row && (!row.settled || row.unresolved));
   const complete = primaryComplete && legacyComplete;
   const amc = (campaign.blocks || []).includes('amc');
   const goldLines = [];
