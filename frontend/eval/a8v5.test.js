@@ -13,6 +13,7 @@ import {
   durablePauseCure,
   extendedReplay,
   gitState,
+  goldOverridesFrom,
   keyResidual,
   reconcileByKeyResidual,
   interleave,
@@ -461,6 +462,22 @@ describe('v5 accounting', () => {
       { kind: 'http', phase: 'finished', key: 'elsewhere', cancelReason: 'loop' },
     ].map((event) => JSON.stringify(event)).join('\n'));
     expect(stageCounters(file, [source]).judges.loopStops).toBe(3);
+  });
+
+  it('reads gold corrections and exclusions, and refuses an unknown question or an unreadable gold', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'a8-gold-'));
+    dirs.push(dir);
+    const file = path.join(dir, 'gold.json');
+    const byId = new Map([['a', { id: 'a', kind: 'number' }], ['b', { id: 'b', kind: 'number' }]]);
+    const read = (body) => {
+      writeFileSync(file, JSON.stringify(body));
+      return goldOverridesFrom(['--gold-overrides', file], byId);
+    };
+    const out = read({ a: { gold: '3/6', reason: 'x' }, b: { exclude: true, reason: 'y' } });
+    expect(out.canonical).toEqual({ a: '1/2' });
+    expect(out.excluded).toEqual(['b']);
+    expect(() => read({ c: { gold: '1' } })).toThrow('unknown question');
+    expect(() => read({ a: { gold: 'two' } })).toThrow('does not read');
   });
 
   it('prices held reserves from the key usage across the run, split by reserve', () => {

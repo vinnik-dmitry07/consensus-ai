@@ -2083,20 +2083,27 @@ function replayLine(campaign, slots, ownBudgetFile) {
   return { from: campaign.replayFrom, reused, fresh };
 }
 
-function goldOverridesFrom(argv, byId) {
+// Each entry corrects a gold ({ gold, reason }) or removes an ill-posed
+// question from the scored set ({ exclude: true, reason }).
+export function goldOverridesFrom(argv, byId) {
   const file = flagValue(argv, '--gold-overrides');
   if (!file) return null;
   const raw = readJson(path.resolve(file));
   if (!raw || typeof raw !== 'object') throw new Error(`Cannot read gold overrides from ${file}`);
   const canonical = {};
+  const excluded = [];
   for (const [id, entry] of Object.entries(raw)) {
     const task = byId.get(id);
     if (!task) throw new Error(`Gold override for unknown question ${id}`);
+    if (entry?.exclude === true) {
+      excluded.push(id);
+      continue;
+    }
     const gold = canonAnswer(String(entry?.gold ?? entry), task);
     if (gold == null) throw new Error(`Gold override for ${id} does not read as a ${task.kind} answer`);
     canonical[id] = gold;
   }
-  return { file, sha: sha256(readFileSync(path.resolve(file), 'utf8')), canonical, raw };
+  return { file, sha: sha256(readFileSync(path.resolve(file), 'utf8')), canonical, excluded, raw };
 }
 
 async function reportV5(campaignPaths, campaign, argv) {
@@ -2114,7 +2121,8 @@ async function reportV5(campaignPaths, campaign, argv) {
   const selection = readJson(campaignPaths.selection) || {};
   const listings = Object.fromEntries((selection.council || []).map((id) => [id, campaign.modelListings?.dates?.[id] ?? null]));
   const overrides = goldOverridesFrom(argv, byId);
-  if (overrides) rows = applyGoldOverrides(rows, overrides.canonical).rows;
+  const excluded = new Set(overrides?.excluded || []);
+  if (overrides) rows = applyGoldOverrides(rows.filter((row) => !excluded.has(row.id)), overrides.canonical).rows;
   const primaryBlocks = campaign.primaryBlocks || [];
   rows = rows.map((row) => ({
     ...row,
@@ -2147,8 +2155,9 @@ async function reportV5(campaignPaths, campaign, argv) {
   const replay = replayLine(campaign, [...readSlotJournal(path.join(dir, 'events.jsonl')).values()], campaignPaths.budget);
   const residual = residualLine([...sourceBudgets, campaignPaths.budget]);
   const testBlocks = campaign.counts?.blocks || {};
-  const plannedPrimary = primaryBlocks.reduce((sum, block) => sum + (testBlocks[block]?.test || 0), 0);
-  const planned = campaign.counts?.test ?? rows.length;
+  const excludedPrimary = [...excluded].filter((id) => primaryBlocks.includes(byId.get(id)?.block)).length;
+  const plannedPrimary = primaryBlocks.reduce((sum, block) => sum + (testBlocks[block]?.test || 0), 0) - excludedPrimary;
+  const planned = (campaign.counts?.test ?? rows.length + excluded.size) - excluded.size;
   const plannedLegacy = planned - plannedPrimary;
   // The primary set, the legacy blocks, and the money each have a status of
   // their own: a budget stop on the legacy blocks does not make the primary
@@ -2166,7 +2175,7 @@ async function reportV5(campaignPaths, campaign, argv) {
   const amc = (campaign.blocks || []).includes('amc');
   const goldLines = [];
   if (amc) goldLines.push('AMC 2026 gold: unofficial key published by Think Academy on 2026-11-06; rescore with --gold-overrides once the official key is out.');
-  if (overrides) goldLines.push(`Gold overrides from ${overrides.file} (sha ${overrides.sha.slice(0, 12)}) applied to ${Object.keys(overrides.canonical).length} questions; the uncorrected report is kept apart.`);
+  if (overrides) goldLines.push(`Gold overrides from ${overrides.file} (sha ${overrides.sha.slice(0, 12)}) applied: ${Object.keys(overrides.canonical).length} golds corrected, ${excluded.size} ill-posed questions excluded; the uncorrected report is kept apart.`);
   const text = renderV5Report({
     rows,
     planned,

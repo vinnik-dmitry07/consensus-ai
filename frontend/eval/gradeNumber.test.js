@@ -49,17 +49,37 @@ describe('exact number answers', () => {
   it.each([
     '5/0',
     '2 3',
-    '1,000',
     '(0,1)',
     String.raw`4\pi`,
-    String.raw`\frac 12`,
     'x=5',
+    'IIII',
+    'xiv',
+    'VX',
+    '2,3',
+    '4, 6, 8',
+    '12,34',
+    '2^x',
     '3/4 or 1',
     '',
     String.raw`\sqrt{2}`,
     '1e3',
   ])('rejects %s', (raw) => {
     expect(canonNumber(raw)).toBeNull();
+  });
+
+  it.each([
+    ['XIV', '14'],
+    ['MMXXV', '2025'],
+    ['$IX$', '9'],
+    ['1,000', '1000'],
+    ['-12,345', '-12345'],
+    [String.raw`\frac12`, '1/2'],
+    [String.raw`\frac 12`, '1/2'],
+    [String.raw`\dfrac34`, '3/4'],
+    ['2^{10}-1', '1023'],
+    ['2^10 + 1', '1025'],
+  ])('reads the form %s as %s', (raw, canon) => {
+    expect(canonNumber(raw)).toBe(canon);
   });
 
   it('grades from the ANSWER line only', () => {

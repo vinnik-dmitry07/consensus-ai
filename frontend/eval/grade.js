@@ -89,11 +89,39 @@ function rational(sign, numerator, denominator) {
 // Exact canonical form of one number: an integer of any size and sign, or a
 // reduced fraction with a positive denominator. Expressions, several values,
 // and division by zero give null.
+const ROMAN = /^M{0,3}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$/;
+const ROMAN_VALUE = { I: 1, V: 5, X: 10, L: 50, C: 100, D: 500, M: 1000 };
+const MAX_POWER_EXPONENT = 100000;
+
+// One capital Roman numeral in standard form; anything else gives null.
+function romanValue(text) {
+  if (!ROMAN.test(text)) return null;
+  let total = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const value = ROMAN_VALUE[text[i]];
+    total += value < (ROMAN_VALUE[text[i + 1]] || 0) ? -value : value;
+  }
+  return total;
+}
+
 export function canonNumber(raw) {
   const text = unwrapNumber(raw);
   if (!text) return null;
   let match = text.match(/^([+-]?)(\d+)$/);
   if (match) return rational(match[1], match[2], '1');
+  // Thousands in groups of exactly three; "2,3" and "4, 6, 8" stay lists.
+  match = text.match(/^([+-]?)(\d{1,3}(?:,\d{3})+)$/);
+  if (match) return rational(match[1], match[2].replace(/,/g, ''), '1');
+  match = text.match(/^([+-]?)\\[dt]?frac\s*(\d)(\d)$/);
+  if (match) return rational(match[1], match[2], match[3]);
+  // An integer power, optionally shifted: 2^{2025} - 1.
+  match = text.match(/^(\d+)\s*\^\s*\{?\s*(\d+)\s*\}?(?:\s*([+-])\s*(\d+))?$/);
+  if (match && Number(match[2]) <= MAX_POWER_EXPONENT) {
+    const shift = BigInt(match[4] || '0') * (match[3] === '-' ? -1n : 1n);
+    return (BigInt(match[1]) ** BigInt(match[2]) + shift).toString();
+  }
+  const roman = romanValue(text);
+  if (roman) return String(roman);
   match = text.match(/^([+-]?)(\d+)\/(\d+)$/);
   if (match) return rational(match[1], match[2], match[3]);
   match = text.match(/^([+-]?)\\[dt]?frac\{([+-]?)(\d+)\}\{(\d+)\}$/);
