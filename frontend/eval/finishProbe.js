@@ -591,7 +591,7 @@ function loadRows(paths) {
   return rows;
 }
 
-function loadSource(sourceRunId) {
+export function loadSource(sourceRunId) {
   const paths = sourceRun(sourceRunId);
   const selection = readJson(paths.selection);
   const campaign = readJson(paths.campaign);
@@ -626,7 +626,7 @@ function rowContexts(rows, sources, slots, { councilModels, bModel, chairmanMode
   return out;
 }
 
-function sourceHashes(paths) {
+export function sourceHashes(paths) {
   const list = { events: paths.events, devEvents: paths.devEvents, selection: paths.selection, campaign: paths.campaign, corrected: paths.corrected, gold: path.join(EVAL_ROOT, GOLD_FILE) };
   return Object.fromEntries(Object.entries(list).map(([name, file]) => [name, fileSha(file)]));
 }
@@ -646,7 +646,7 @@ function expectedBaseline(file) {
   return { A8: cell('A8'), S8: cell('S8'), P8: cell('P8'), B8: cell('B8'), voteOfFive: cell("Vote of B's five samples"), leader: cell('Stage 2 leader') };
 }
 
-function inspectSource(source, runId) {
+export function inspectSource(source, runId) {
   const { rows, sources, campaign, tasks, ctx, paths } = source;
   const primary = new Set(campaign.primaryBlocks);
   const isPrimary = (row) => primary.has(row.block);
@@ -733,7 +733,7 @@ function paidKey() {
   return key;
 }
 
-async function audit(budget, phase, moment) {
+export async function audit(budget, phase, moment) {
   try {
     const response = await fetch(KEY_URL, { headers: { Authorization: `Bearer ${paidKey()}` } });
     const body = await response.json().catch(() => null);
@@ -780,7 +780,7 @@ function assertFrozen(paths, source) {
   return next;
 }
 
-function lock(dir) {
+export function lock(dir) {
   mkdirSync(dir, { recursive: true });
   const file = path.join(dir, 'runner.lock');
   if (existsSync(file)) {
@@ -1077,7 +1077,7 @@ export function analyse({ rows, ctx, sources, outcomes, labels, agreed, models, 
 
 const pct = (value) => (value == null ? 'n/a' : `${(value * 100).toFixed(1)}%`);
 
-function renderReport(result, meta) {
+export function renderReport(result, meta) {
   const lines = ['# Finishing cut answers: diagnostic probe', ''];
   lines.push(`Source: ${meta.sourceRun}. Diagnostic only: the test set had been read, the golds and grader changed after the run, and the rule was written after reading these texts.`, '');
   lines.push(`Spend: settled $${meta.budget.settledUsd.toFixed(4)}, held $${meta.budget.unresolvedUsd.toFixed(4)}, ${meta.budget.posts} POSTs. Key usage moved by ${meta.keyDelta == null ? 'n/a' : `$${meta.keyDelta.toFixed(4)}`} between the first and last audit.`, '');

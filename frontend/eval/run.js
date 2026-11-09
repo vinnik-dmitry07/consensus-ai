@@ -1452,6 +1452,10 @@ export async function main(argv) {
     const { runFinishProbeCommand } = await import('./finishProbe.js');
     return runFinishProbeCommand(argv);
   }
+  if (command === 'finish-probe-v2') {
+    const { runFinishProbeV2Command } = await import('./finishProbeV2.js');
+    return runFinishProbeV2Command(argv);
+  }
   if (command === 'a8') {
     const { runA8Command } = await import('./a8.js');
     return runA8Command(argv);
