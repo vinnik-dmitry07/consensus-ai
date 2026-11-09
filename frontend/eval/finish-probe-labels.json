@@ -1,0 +1,1115 @@
+{
+  "version": 1,
+  "sourceRun": "a8-open-v5e",
+  "goldFile": "gold-corrections-a8-open-v5e.json",
+  "goldSha": "6b5459056d96dee43e14fd86bfc4f594cd23b40598819f505e0ee4aeeb610186",
+  "items": [
+    {
+      "cell": "test:aime2026:11|council:deepseek/deepseek-v4.1-flash-1017",
+      "textSha": "dc47149a3d742f2c3c66565fa22e5ea4e937d3e9b515bc229e65356388fec13b",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "896"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "896"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "896"
+    },
+    {
+      "cell": "test:aime2026:11|sample:3",
+      "textSha": "63bdcf160b6205e784554954481732e7fe293a9be0bd46f9fb1f5a31ab652518",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "896"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "896"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "896"
+    },
+    {
+      "cell": "test:aime2026:11|sample:4",
+      "textSha": "0d1a52ef673b5d27041da97de5c4fdbd196b5cbf8b4bb9b255fdf95eb5c3075b",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "896"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "896"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "896"
+    },
+    {
+      "cell": "test:aime2026:29|sample:4",
+      "textSha": "96e967317425defa9d1f033187ec8581bcae51717d1bf29661a1489a5534bdb2",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "157"
+        ],
+        "earlier": [
+          "145"
+        ]
+      },
+      "passB": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "none",
+      "group": "candidate",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:hmmt_feb_2026:17|council:deepseek/deepseek-v4.1-flash-1017",
+      "textSha": "6a3ec743596be67a7cd733fd2e6348569fccb6ec06b27213025eace6a905e369",
+      "passA": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "passB": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:hmmt_feb_2026:17|council:stepfun/step-5-preview",
+      "textSha": "0ba6b74de563a217abd2f00c82d6ad9a365c5886d0501d8d965dc6596f844be8",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "1574"
+        ],
+        "earlier": [
+          "833"
+        ]
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "1574"
+        ],
+        "earlier": [
+          "833"
+        ]
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "1574"
+    },
+    {
+      "cell": "test:hmmt_feb_2026:17|council:tencent/hy4-preview",
+      "textSha": "e71b7e2426a764f6c681962007e8694a6af8b21dcb1f4fd948d7fadf39b41109",
+      "passA": {
+        "status": "leading",
+        "values": [
+          "1574",
+          "1572"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "leading",
+        "values": [
+          "1574",
+          "1572"
+        ],
+        "earlier": []
+      },
+      "groupA": "candidate",
+      "groupB": "candidate",
+      "group": "candidate",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:hmmt_feb_2026:17|sample:2",
+      "textSha": "bcabb8c9c3739fff4c853c85be07c5a6b9786f0dd4ce6a3d20e984bc9927274f",
+      "passA": {
+        "status": "leading",
+        "values": [
+          "2784",
+          "2782"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "leading",
+        "values": [
+          "2784",
+          "2782"
+        ],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:hmmt_feb_2026:17|sample:3",
+      "textSha": "907dfe51fcf445098740c6aee9f2e77cad5f7301cdceede3c2f82d305602ceea",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "1574"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "1574"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "1574"
+    },
+    {
+      "cell": "test:hmmt_feb_2026:17|sample:4",
+      "textSha": "38a65be3b293bc312ed7a1c9b9c0f2e936fc964f11154dfe26aa582f01d2e592",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "1574"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "1574"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "1574"
+    },
+    {
+      "cell": "test:hmmt_feb_2026:17|sample:5",
+      "textSha": "6879a44a4cec878f83c653453eee24b83998a99e5c9271bcdd446480250b6a6f",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "1574"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "1574"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "1574"
+    },
+    {
+      "cell": "test:hmmt_feb_2026:18|council:stepfun/step-5-preview",
+      "textSha": "604ad0dd12ab95d0899508b81142575f3329b5cd951c05c77e80f0429f706572",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "7118"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "7118"
+        ],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": "7118"
+    },
+    {
+      "cell": "test:hmmt_feb_2026:18|council:tencent/hy4-preview",
+      "textSha": "90a27efdd382e35a9bf7e2d3f808015d7d4d7b4f879ca91c6c52d2537f457c45",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "31832"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "31832"
+        ],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": "31832"
+    },
+    {
+      "cell": "test:hmmt_feb_2026:18|sample:2",
+      "textSha": "00710f2e5e312ce7709178400fe08e947ec34acfc841e7fa15bf82511ccf31e6",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "6992"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "6992"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "6992"
+    },
+    {
+      "cell": "test:hmmt_feb_2026:18|sample:5",
+      "textSha": "5801359660afec9507e7acc3a0a8eca33a0efb84602925f5003272f91450247c",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "6992"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "6992"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "6992"
+    },
+    {
+      "cell": "test:hmmt_feb_2026:19|council:tencent/hy4-preview",
+      "textSha": "40624de5c6b134982d66544877e84cc7b056ac85efd6c06fb75938a6637269e2",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "499"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "499"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "499"
+    },
+    {
+      "cell": "test:hmmt_feb_2026:19|sample:3",
+      "textSha": "190763cbd4beb2df74585b1be3b0bc5a1d745b5997bf7e65ced941155c51b4c6",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "499"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "499"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "499"
+    },
+    {
+      "cell": "test:hmmt_feb_2026:20|council:deepseek/deepseek-v4.1-flash-1017",
+      "textSha": "126a24ed74999a3e1c88df290e38a9f77f5679f1a5f76a84c22ec2302df762d8",
+      "passA": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "passB": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:hmmt_feb_2026:20|council:stepfun/step-5-preview",
+      "textSha": "8ae27874f13f9dde8dcf63b95158a2c2ecca65715c2d422e80b5fa453a324776",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "20460"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "20460"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "20460"
+    },
+    {
+      "cell": "test:hmmt_feb_2026:20|council:tencent/hy4-preview",
+      "textSha": "4b9d1be5a6d22708ad066f8d6d4aa35f4851c1d9ca7d8b2472ca8adeed4cd33a",
+      "passA": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "40940"
+        ],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:hmmt_feb_2026:20|sample:2",
+      "textSha": "058be4eeb871f56195f1c6a6683bd2aec415547c254f9a912c334ec57b4574bb",
+      "passA": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "passB": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:hmmt_feb_2026:20|sample:3",
+      "textSha": "41d8bee36a5679d298e103cd39d46b168852a6733677a888d2acdc30ecb29371",
+      "passA": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "passB": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:hmmt_feb_2026:20|sample:4",
+      "textSha": "1db6e3aa94d26bf95f5f494ded8990038c9528a60dddc462ed402beddc8ec15c",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "20460"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "20460"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "20460"
+    },
+    {
+      "cell": "test:hmmt_feb_2026:20|sample:5",
+      "textSha": "775ecc6f4bc83bb7080320f4328cfd0b05c15fab5b21398522dad150132424dd",
+      "passA": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "passB": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:hmmt_feb_2026:33|sample:3",
+      "textSha": "f3a81d5225a896fd9d417d114a368ba34e5721bfaeb2e6e566993f01673b604b",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "3037"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "3037"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "3037"
+    },
+    {
+      "cell": "test:hmmt_feb_2026:33|sample:4",
+      "textSha": "87aac68c004b4f31c980f8b7f6b843a92086a5eb1477b1dbec22c331dd3d0eb6",
+      "passA": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "3037"
+        ],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "firm",
+      "group": "candidate",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:hmmt_feb_2026:33|sample:5",
+      "textSha": "927475a9131c86e52fccefcecb8c0e991c5a61814770cffc0c4c11067cf4d1be",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "3037"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "3037"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "3037"
+    },
+    {
+      "cell": "test:livemath-202505:q0f82e3c1061a|council:deepseek/deepseek-v4.1-flash-1017",
+      "textSha": "1696d267862fa0976ac95c8d149db7fb3cdf695549d4f0c727220d6eacc1a3c3",
+      "passA": {
+        "status": "none",
+        "values": [],
+        "earlier": [
+          "100"
+        ]
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "198"
+        ],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:livemath-202505:q0f82e3c1061a|council:stepfun/step-5-preview",
+      "textSha": "281de742a8bd78a25e3ae1c7139fee6345e08358d44071cf164938fe2df35405",
+      "passA": {
+        "status": "leading",
+        "values": [
+          "198",
+          "197"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "leading",
+        "values": [
+          "197",
+          "196"
+        ],
+        "earlier": [
+          "198"
+        ]
+      },
+      "groupA": "candidate",
+      "groupB": "candidate",
+      "group": "candidate",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:livemath-202505:q0f82e3c1061a|council:tencent/hy4-preview",
+      "textSha": "c7f28cfd86e5908c2f08f881067c9b609e8183e01619ef9d779493e7285c62a2",
+      "passA": {
+        "status": "leading",
+        "values": [
+          "198",
+          "197"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "leading",
+        "values": [
+          "198",
+          "197"
+        ],
+        "earlier": []
+      },
+      "groupA": "candidate",
+      "groupB": "candidate",
+      "group": "candidate",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:livemath-202505:q0f82e3c1061a|sample:2",
+      "textSha": "9e8ad8fe2c977dcf410f02d0349cf77425462c6714946f17e3ce776da82096b7",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "197"
+        ],
+        "earlier": [
+          "100",
+          "99"
+        ]
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "197"
+        ],
+        "earlier": [
+          "100",
+          "99"
+        ]
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "197"
+    },
+    {
+      "cell": "test:livemath-202505:q0f82e3c1061a|sample:3",
+      "textSha": "a444165c0ec8816c10b202f2d74adabba30eaed040b034d8f25b3d76cbf437ed",
+      "passA": {
+        "status": "leading",
+        "values": [
+          "198",
+          "197"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "leading",
+        "values": [
+          "198",
+          "197"
+        ],
+        "earlier": []
+      },
+      "groupA": "candidate",
+      "groupB": "candidate",
+      "group": "candidate",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:livemath-202505:q0f82e3c1061a|sample:4",
+      "textSha": "53c52704372bc313c12dd7c73f326972f76dc9cb4f420b1a9462a7b5873e936b",
+      "passA": {
+        "status": "leading",
+        "values": [
+          "148"
+        ],
+        "earlier": [
+          "100"
+        ]
+      },
+      "passB": {
+        "status": "leading",
+        "values": [
+          "148",
+          "149"
+        ],
+        "earlier": [
+          "100"
+        ]
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:livemath-202505:q0f82e3c1061a|sample:5",
+      "textSha": "5f72bd9905e595e67c5356057a2850b04c386a98c0b1d17eb5677d2bd0107b7a",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "197"
+        ],
+        "earlier": [
+          "100"
+        ]
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "197"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "197"
+    },
+    {
+      "cell": "test:livemath-202505:q69bbd425dbba|council:deepseek/deepseek-v4.1-flash-1017",
+      "textSha": "26f6ab85b9c334d147fcb959a08f724b026b5a48aabce7d95459776538c07eec",
+      "passA": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "passB": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:livemath-202505:q69bbd425dbba|council:stepfun/step-5-preview",
+      "textSha": "5b677ac20c8b3df5ed6309ca6fc2766e7d6601ae81c40d39f21987a660b8aede",
+      "passA": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "passB": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:livemath-202505:q69bbd425dbba|council:tencent/hy4-preview",
+      "textSha": "3b982a78de9e2e416d590774dc4257b3f7114737a3aa40cd81c520082403ae51",
+      "passA": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "passB": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:livemath-202505:q69bbd425dbba|sample:2",
+      "textSha": "4ac78cf400088bc6070d614f54ebe601310f099c8819fa8417e60e6403b6d66d",
+      "passA": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "passB": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:livemath-202505:q69bbd425dbba|sample:3",
+      "textSha": "78917a18fc01471f88ec1c61aa10c4af17ba887ecd93b417029e47a34798edf6",
+      "passA": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "passB": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:livemath-202505:q69bbd425dbba|sample:4",
+      "textSha": "c401880c026717cbc970fcf6dca33b9b68f813f16af5718069ec672c13691d7d",
+      "passA": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "passB": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:livemath-202505:q69bbd425dbba|sample:5",
+      "textSha": "356b8b9d3d9fdd3f64eded89216f8bbe8306da7ae676ab112006d50ae2b47eba",
+      "passA": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "passB": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:livemath-202505:q881f8a23b3eb|council:stepfun/step-5-preview",
+      "textSha": "ce1810ccf3897bef6dcfb74e545e22ad15fb2e230afee3182887a9e78aa69322",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "104"
+        ],
+        "earlier": [
+          "110"
+        ]
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "104"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "104"
+    },
+    {
+      "cell": "test:livemath-202505:q881f8a23b3eb|council:tencent/hy4-preview",
+      "textSha": "17802b9c96db901f626a0664441bfbf08656c3e9007e77e005c94839ec463cff",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "104"
+        ],
+        "earlier": [
+          "110"
+        ]
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "104"
+        ],
+        "earlier": [
+          "110"
+        ]
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "104"
+    },
+    {
+      "cell": "test:livemath-202505:q881f8a23b3eb|sample:3",
+      "textSha": "cbf56469df96f513d7e6a6c375e69cee4b784f07f98127474f141961ac75f212",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "104"
+        ],
+        "earlier": [
+          "110"
+        ]
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "104"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "104"
+    },
+    {
+      "cell": "test:livemath-202505:q88a9a08bda99|council:deepseek/deepseek-v4.1-flash-1017",
+      "textSha": "6559dffb4299095be7b4ce16162c85f9198378a0a58cd6860306a0e1c199112e",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "2^{2025}-1"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "2^{2025}-1"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "3852487334169269478406295381625885005050194581713138107315343073311406986578451501512193848076214011155214066615330936848416275876819005143056887672716174497679576559937119018048071593092638505315310673521049924883460070925071210403661500732717057522604661685471094255791613565867074228359169053926936433973540584253033201983056661461182185351235410694518842942485547740379694246376569308537275623424551143255942297425086719674777788061177926767397367669729386238006010733212330366340298307147852340158185785124380194894676923426193356351639691015051536242430639521531251621800103006196612375759310228062994431"
+    },
+    {
+      "cell": "test:livemath-202505:q88a9a08bda99|council:stepfun/step-5-preview",
+      "textSha": "18d18f1598696e7150f6bccbb8ccff798c64ea5eec0acf75f9be42e0837a4c78",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "2025"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "2025"
+        ],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": "2025"
+    },
+    {
+      "cell": "test:livemath-202505:q88a9a08bda99|council:tencent/hy4-preview",
+      "textSha": "96ca11f5ad4eb1116bb70b456fb43558acf679a46f4d7c6aa13cb492ed14f04e",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "2^{2025}-1"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "2^{2025}-1"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "3852487334169269478406295381625885005050194581713138107315343073311406986578451501512193848076214011155214066615330936848416275876819005143056887672716174497679576559937119018048071593092638505315310673521049924883460070925071210403661500732717057522604661685471094255791613565867074228359169053926936433973540584253033201983056661461182185351235410694518842942485547740379694246376569308537275623424551143255942297425086719674777788061177926767397367669729386238006010733212330366340298307147852340158185785124380194894676923426193356351639691015051536242430639521531251621800103006196612375759310228062994431"
+    },
+    {
+      "cell": "test:livemath-202505:q88a9a08bda99|sample:2",
+      "textSha": "d48b004c0c676f0b393ed2d5dda08ed253be78f3676a070d993eae5b5f4e3723",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "2^{2025}-1"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "2^{2025}-1"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "3852487334169269478406295381625885005050194581713138107315343073311406986578451501512193848076214011155214066615330936848416275876819005143056887672716174497679576559937119018048071593092638505315310673521049924883460070925071210403661500732717057522604661685471094255791613565867074228359169053926936433973540584253033201983056661461182185351235410694518842942485547740379694246376569308537275623424551143255942297425086719674777788061177926767397367669729386238006010733212330366340298307147852340158185785124380194894676923426193356351639691015051536242430639521531251621800103006196612375759310228062994431"
+    },
+    {
+      "cell": "test:livemath-202505:q88a9a08bda99|sample:3",
+      "textSha": "46e5c6310929b2119bcb9a16ac86437db8650b19ac1e53c01028be1cfff0888a",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "2^{2025}-1"
+        ],
+        "earlier": []
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "2^{2025}-1"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "3852487334169269478406295381625885005050194581713138107315343073311406986578451501512193848076214011155214066615330936848416275876819005143056887672716174497679576559937119018048071593092638505315310673521049924883460070925071210403661500732717057522604661685471094255791613565867074228359169053926936433973540584253033201983056661461182185351235410694518842942485547740379694246376569308537275623424551143255942297425086719674777788061177926767397367669729386238006010733212330366340298307147852340158185785124380194894676923426193356351639691015051536242430639521531251621800103006196612375759310228062994431"
+    },
+    {
+      "cell": "test:livemath-202505:q88a9a08bda99|sample:4",
+      "textSha": "5dafce8d385794f697262b8306ad0a11990e6e860dc46bfed9639273df20400c",
+      "passA": {
+        "status": "none",
+        "values": [],
+        "earlier": [
+          "2034"
+        ]
+      },
+      "passB": {
+        "status": "none",
+        "values": [],
+        "earlier": []
+      },
+      "groupA": "none",
+      "groupB": "none",
+      "group": "none",
+      "agreedAccepted": null
+    },
+    {
+      "cell": "test:livemath-202505:q88a9a08bda99|sample:5",
+      "textSha": "137652d9f3f1a3f2e6aef200b47314bc29009fa701c15547f87a0f4993c8372c",
+      "passA": {
+        "status": "accepted",
+        "values": [
+          "2^{2025}-1"
+        ],
+        "earlier": [
+          "4049"
+        ]
+      },
+      "passB": {
+        "status": "accepted",
+        "values": [
+          "2^{2025}-1"
+        ],
+        "earlier": []
+      },
+      "groupA": "firm",
+      "groupB": "firm",
+      "group": "firm",
+      "agreedAccepted": "3852487334169269478406295381625885005050194581713138107315343073311406986578451501512193848076214011155214066615330936848416275876819005143056887672716174497679576559937119018048071593092638505315310673521049924883460070925071210403661500732717057522604661685471094255791613565867074228359169053926936433973540584253033201983056661461182185351235410694518842942485547740379694246376569308537275623424551143255942297425086719674777788061177926767397367669729386238006010733212330366340298307147852340158185785124380194894676923426193356351639691015051536242430639521531251621800103006196612375759310228062994431"
+    }
+  ]
+}

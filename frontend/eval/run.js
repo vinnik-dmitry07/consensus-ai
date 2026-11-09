@@ -1448,6 +1448,10 @@ export async function main(argv) {
   if (command === 'test') return testSplit(runId);
   if (command === 'repair') return repair(runId, argv);
   if (command === 'complete') return complete(runId, argv);
+  if (command === 'finish-probe') {
+    const { runFinishProbeCommand } = await import('./finishProbe.js');
+    return runFinishProbeCommand(argv);
+  }
   if (command === 'a8') {
     const { runA8Command } = await import('./a8.js');
     return runA8Command(argv);
