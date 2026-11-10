@@ -178,7 +178,10 @@ describe('finish probe v2 report: texts', () => {
     expect(text).toContain('в списке не появился');
     expect(text).toContain('Из 80 вызовов F не принято 30, из них 29 оборваны на лимите 2048');
     expect(text).toContain('в 78 случаях из 80');
-    expect(text).not.toContain('У tencent рассуждение отключить нельзя');
+    expect(text).not.toContain('Маршрут tencent обязан рассуждать');
+    expect(text).toContain('Маршрут stepfun обязан рассуждать (наименьшее усилие low)');
+    expect(text).not.toMatch(/не успевает ответить|Что дал бы больший лимит/);
+    expect(text).toContain('его написала одна модель OpenRouter, а числа в нём сверила с отчётом другая');
     expect(text).toContain('удержано $0.20');
     expect(text).toContain('$1.60 числится в резерве');
     expect(text).not.toMatch(/undefined|NaN/);

@@ -250,9 +250,10 @@ export function renderReadme(result, written, meta, extra) {
     const control = formRow(model, 'C');
     if (!f || !control) return [];
     const refused = f.n - f.accepted - f['not measured'] - f['not finished'];
+    // Counts only; what they mean is left to the analysis written by OpenRouter models.
     return [
-      `У ${short(model)} рассуждение отключить нельзя. Из ${f.n} вызовов F не принято ${refused}, из них ${f['cut at the cap']} оборваны на лимите ${meta.caps?.[model]}. Пилот из четырёх текстов на маршрут такого не показал, а план поднимает лимит только в пилоте. Что дал бы больший лимит, опыт не говорит.`,
-      `Контроль C у ${short(model)} оборван на том же лимите в ${control['cut at the cap']} случаях из ${control.n}. Для этого маршрута критерий 4 сравнивает F с вызовом, который не успевает ответить, а не со знанием модели.`,
+      `Маршрут ${short(model)} обязан рассуждать (наименьшее усилие ${meta.reasoning[model].effort}). Из ${f.n} вызовов F не принято ${refused}, из них ${f['cut at the cap']} оборваны на лимите ${meta.caps?.[model]}.`,
+      `Контроль C у ${short(model)} оборван на том же лимите в ${control['cut at the cap']} случаях из ${control.n}.`,
     ];
   });
   const notes = [
@@ -264,6 +265,7 @@ export function renderReadme(result, written, meta, extra) {
     'Test просмотрен, эталоны и грейдер менялись после прогона, правила v2 и дополнение написаны после промежуточных чисел v1. По одной генерации на условие.',
   ].filter(Boolean);
   lines.push('', 'Ограничения:', '', ...notes.map((note) => `- ${note}`));
+  lines.push('', 'Этот блок собран кодом из чисел отчёта. Толкование результата — в разделе «Анализ» ниже: его написала одна модель OpenRouter, а числа в нём сверила с отчётом другая. Пояснения в тексте дополнения 7624a5e писала сессия Claude во время аудита, до сборки отчёта.');
   const s = result.sensitivity;
   lines.push('', `Без HMMT 17 и q752d: критерий 2 — ${s.c2.correct} из ${s.c2.n}, ${VERDICT_RU[s.c2.verdict]}; критерий 3 — ${s.c3.correct} из ${s.c3.n}, ${VERDICT_RU[s.c3.verdict]}; критерий 4 — ${VERDICT_RU[s.c4.verdict]}. Если считать ячейки с 404 как «нет ответа» (первая редакция правил v2), решение: ${DECISION_RU[written.criteria.decision] || written.criteria.decision}.`);
   lines.push('', `Расход опыта (v1 и v2): подтверждено ${usd2(meta.budget.settledUsd)}, удержано ${usd2(meta.v1.heldUsd + extra.held.otherUsd)} за вызовы без итога, ${meta.budget.posts} POST из 500. Ещё ${usd2(extra.held.routeUnavailableUsd)} числится в резерве за вызовы с 404, которые до модели не дошли. Разметка — ${usd2(meta.labels.knownUsd)} сверх лимита опыта. Счётчик ключа за всё время вырос на ${meta.keyDelta == null ? 'n/a' : usd2(meta.keyDelta)}.`);
