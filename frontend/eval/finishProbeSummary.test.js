@@ -3,8 +3,8 @@ import { describe, expect, it } from 'vitest';
 import { writeAndCheck, writerMessages } from './evalAnalysis.js';
 import { outcomeOf } from './finishProbeV3.js';
 import {
-  AFTER_V3, ANALYSIS_END, ANALYSIS_START, GROUPS, README_END, README_START, SUMMARY_INSTRUCTION,
-  byGroup, median, pricePerCorrect, summaryAnalysisSection, transitions,
+  AFTER_V3, ANALYSIS_END, ANALYSIS_START, GROUPS, README_END, README_START, STATUSES, SUMMARY_INSTRUCTION,
+  byGroup, byStatus, changedCells, correctnessTransitions, median, pricePerCorrect, summaryAnalysisSection, transitions,
 } from './finishProbeSummary.js';
 import { placeBlock } from './finishProbeV3.js';
 
@@ -47,6 +47,39 @@ describe('finish probe summary: tables', () => {
     expect(table.firm).toEqual({ n: 2, accepted: 1, correct: 1, wrong: 0, rejected: 1, unconfirmed: 0 });
     expect(table.none).toEqual({ n: 1, accepted: 1, correct: 0, wrong: 1, rejected: 0, unconfirmed: 0 });
     expect(table.unlabelled).toEqual({ n: 1, accepted: 0, correct: 0, wrong: 0, rejected: 0, unconfirmed: 1 });
+  });
+
+  it('splits by the status both passes gave the text, and keeps differing passes apart', () => {
+    const inputs = [{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'd' }];
+    const items = new Map([
+      ['a', { passA: { status: 'none' }, passB: { status: 'none' } }],
+      ['b', { passA: { status: 'accepted' }, passB: { status: 'leading' } }],
+      ['c', { passA: { status: 'leading' }, passB: { status: 'leading' } }],
+    ]);
+    const outcome = new Map([['a|F', row('accepted', { correct: 1 })], ['b|F', row('rejected')], ['c|F', row('accepted')], ['d|F', row('accepted', { correct: 1 })]]);
+    const table = byStatus(inputs, outcome, items);
+    expect(Object.keys(table)).toEqual([...STATUSES]);
+    expect(table.none).toEqual({ n: 1, accepted: 1, correct: 1, rejected: 0, unconfirmed: 0 });
+    expect(table.differ).toEqual({ n: 1, accepted: 0, correct: 0, rejected: 1, unconfirmed: 0 });
+    expect(table.leading).toMatchObject({ n: 1, accepted: 1, correct: 0 });
+    expect(table.unlabelled).toMatchObject({ n: 1, accepted: 1, correct: 1 });
+  });
+
+  it('crosses correctness at both caps and lists the cells whose acceptance changed', () => {
+    const list = [
+      { id: 'c0|F', sourceId: 'c0' }, { id: 'c1|F', sourceId: 'c1' }, { id: 'c2|F', sourceId: 'c2' }, { id: 'c3|F', sourceId: 'c3' },
+    ];
+    const low = new Map([['c0|F', row('accepted', { correct: 1 })], ['c1|F', row('accepted')], ['c2|F', row('rejected', { completionTokens: 2048 })], ['c3|F', row('rejected')]]);
+    const high = new Map([['c0|F', row('accepted', { correct: 1 })], ['c1|F', row('rejected')], ['c2|F', row('accepted', { correct: 1, completionTokens: 7667 })], ['c3|F', row('pending', { posts: 0 })]]);
+    const table = correctnessTransitions(list, low, high);
+    expect(table.right).toEqual({ right: 1, wrong: 0, cut: 0 });
+    expect(table.wrong).toEqual({ right: 0, wrong: 0, cut: 1 });
+    expect(table.cut).toEqual({ right: 1, wrong: 0, cut: 0 });
+    const changed = changedCells(list, low, high, new Map([['c2', { passA: { status: 'none' }, passB: { status: 'none' } }]]));
+    expect(changed).toEqual([
+      { cell: 'c1', status: 'unlabelled', at2048: { form: 'wrong', tokens: 100 }, at8192: { form: 'cut', tokens: 100 } },
+      { cell: 'c2', status: 'none', at2048: { form: 'cut', tokens: 2048 }, at8192: { form: 'right', tokens: 7667 } },
+    ]);
   });
 
   it('prices a correct answer from the known costs of every posted call', () => {

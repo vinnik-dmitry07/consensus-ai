@@ -121,6 +121,66 @@ export function byGroup(inputs, outcome, groups) {
   return out;
 }
 
+// The status both labelling passes gave the text (accepted, leading, none),
+// without the gold. Texts where the passes differ are kept apart.
+export const STATUSES = Object.freeze(['accepted', 'leading', 'none', 'differ', 'unlabelled']);
+
+export function statusOf(item) {
+  if (!item) return 'unlabelled';
+  const a = item.passA?.status;
+  const b = item.passB?.status;
+  return a && a === b ? a : 'differ';
+}
+
+export function byStatus(inputs, outcome, labelItems) {
+  const out = {};
+  for (const status of STATUSES) {
+    const list = inputs.filter((item) => statusOf(labelItems.get(item.id)) === status);
+    const rows = list.map((item) => outcome.get(`${item.id}|F`));
+    out[status] = {
+      n: list.length,
+      accepted: rows.filter((row) => row?.v3 === 'accepted').length,
+      correct: rows.filter((row) => row?.v3 === 'accepted' && row.correct === 1).length,
+      rejected: rows.filter((row) => row?.v3 === 'rejected').length,
+      unconfirmed: rows.filter((row) => !isConfirmed(row)).length,
+    };
+  }
+  return out;
+}
+
+// right (accepted and correct), wrong (accepted, not correct), cut (rejected).
+export const FORMS = Object.freeze(['right', 'wrong', 'cut']);
+
+function formOf(row) {
+  if (row?.v3 === 'accepted') return row.correct === 1 ? 'right' : 'wrong';
+  return row?.v3 === 'rejected' ? 'cut' : 'unconfirmed';
+}
+
+export function correctnessTransitions(cells, at2048, at8192) {
+  const keys = [...FORMS, 'unconfirmed'];
+  const table = Object.fromEntries(keys.map((from) => [from, Object.fromEntries(FORMS.map((to) => [to, 0]))]));
+  for (const cell of cells.filter((entry) => isConfirmed(at8192.get(entry.id)))) {
+    table[formOf(at2048.get(cell.id))][formOf(at8192.get(cell.id))] += 1;
+  }
+  return table;
+}
+
+// Every cell whose acceptance differs between the caps.
+export function changedCells(cells, at2048, at8192, labelItems) {
+  return cells
+    .filter((cell) => isConfirmed(at8192.get(cell.id)) && stateOf(at2048.get(cell.id)) !== stateOf(at8192.get(cell.id)))
+    .map((cell) => {
+      const low = at2048.get(cell.id);
+      const high = at8192.get(cell.id);
+      return {
+        cell: cell.sourceId,
+        status: statusOf(labelItems.get(cell.sourceId)),
+        at2048: { form: formOf(low), tokens: low?.completionTokens ?? null },
+        at8192: { form: formOf(high), tokens: high?.completionTokens ?? null },
+      };
+    });
+}
+
 // What a correct recovered answer cost, per route and condition F.
 export function pricePerCorrect(inputs, outcome, models, condition = 'F') {
   return models.map((model) => {
@@ -162,7 +222,9 @@ export function buildSummary(paths, source) {
   // The 2048 reading: a v1 cell when v1 finished it, otherwise v2's, as in the v2 report.
   const at2048 = outcomesFor(cells, tasks, stageIndex(mergedSlots(cells, idx1, idx2)));
   const at8192 = outcomesFor(cells, tasks, idx3);
-  const groups = labelsOf(path.join(EVAL_ROOT, LABELS_V2)).groups;
+  const labelData = labelsOf(path.join(EVAL_ROOT, LABELS_V2));
+  const groups = labelData.groups;
+  const labelItems = new Map((labelData.data?.items || []).map((item) => [item.cell, item]));
 
   const v1Cells = orderCells(sources);
   const v1Done = v1Cells.filter((cell) => cellState(idx1.get(cellKey(cell))) === 'done').length;
@@ -230,6 +292,10 @@ export function buildSummary(paths, source) {
     transitions: transitions(s1, at2048, at8192),
     groups2048: Object.fromEntries(COUNCIL.map((model) => [model, byGroup(inputs.filter((item) => item.model === model), at2048, groups)])),
     groups8192: byGroup(inputs.filter((item) => item.model === STEPFUN && isConfirmed(at8192.get(`${item.id}|F`))), at8192, groups),
+    status2048: byStatus(inputs.filter((item) => item.model === STEPFUN), at2048, labelItems),
+    status8192: byStatus(inputs.filter((item) => item.model === STEPFUN && isConfirmed(at8192.get(`${item.id}|F`))), at8192, labelItems),
+    correctness: correctnessTransitions(s1, at2048, at8192),
+    changed: changedCells(s1, at2048, at8192, labelItems),
     bounded,
     recount,
     v2Movement: v2Report?.result?.policies?.['fill:F']?.all?.movement ?? null,
@@ -297,7 +363,22 @@ export function renderSummaryReport({ meta, result }) {
   for (const [cap, side] of [[BASE_CAP, t.at2048], [V3_CAPS[STEPFUN], t.at8192]]) {
     lines.push(`| ${cap} | ${side.accepted} | ${side.correct} | ${side.rejected} | ${num(side.acceptedTokensMedian)} | ${side.acceptedTokensMax ?? 'n/a'} | ${usd4(side.acceptedMeanUsd)} | ${usd4(side.rejectedMeanUsd)} | ${num(side.acceptedMedianSeconds)} | ${num(side.rejectedMedianSeconds)} |`);
   }
-  lines.push('', '## F by the label group of the text', '', `Groups from the frozen v2 labels: ${JSON.stringify(meta.labels)}; the other texts are unlabelled. "correct" and "wrong" are among the accepted answers.`, '');
+  lines.push('', 'The same cells by correctness: right (accepted and correct), wrong (accepted, not correct), cut (not accepted). One generation per cell and cap.', '', `| At 2048 | ${FORMS.map((form) => `${form} at 8192`).join(' | ')} |`, `| --- | ${FORMS.map(() => '---').join(' | ')} |`);
+  for (const from of [...FORMS, 'unconfirmed']) {
+    const row = result.correctness[from];
+    if (from === 'unconfirmed' && FORMS.every((to) => row[to] === 0)) continue;
+    lines.push(`| ${from} | ${FORMS.map((to) => row[to]).join(' | ')} |`);
+  }
+  lines.push('', 'Cells whose acceptance differs between the caps (status: what both labelling passes gave the text):', '');
+  for (const row of result.changed) lines.push(`- ${row.cell}: status ${row.status}; 2048 ${row.at2048.form} (${row.at2048.tokens ?? 'n/a'} tokens), 8192 ${row.at8192.form} (${row.at8192.tokens ?? 'n/a'} tokens).`);
+  lines.push('', '## F by the status both labelling passes gave the text', '', 'Each pass marks the value the text holds as accepted, leading, or none, without the gold. "differ": the passes disagree.', '');
+  lines.push(`| Status | at 2048: accepted / correct / n | at 8192: accepted / correct / n |`, '| --- | --- | --- |');
+  for (const status of STATUSES) {
+    const low = result.status2048[status];
+    const high = result.status8192[status];
+    lines.push(`| ${status} | ${low.accepted} / ${low.correct} / ${low.n} | ${high.accepted} / ${high.correct} / ${high.n} |`);
+  }
+  lines.push('', '## F by the label group of the text', '', `Groups from the frozen v2 labels: ${JSON.stringify(meta.labels)}; the other texts are unlabelled. The groups compare the passes with the gold (finish-probe-protocol.md): firm, the accepted value equals the gold; candidate, the gold is among the leading values, or the passes give different groups; none, the gold was not treated as an answer, which includes a text that holds a wrong value. "correct" and "wrong" are among the accepted answers.`, '');
   for (const model of COUNCIL) {
     lines.push(`At 2048, ${model}:`, '', '| Group | n | accepted | correct | wrong | rejected | unconfirmed |', '| --- | --- | --- | --- | --- | --- | --- |', ...groupRows(result.groups2048[model]), '');
   }
@@ -357,11 +438,22 @@ export function renderSummaryReadme({ meta, result }) {
     if (from === 'unconfirmed' && row.accepted + row.rejected === 0) continue;
     lines.push(`| ${ru[from]} | ${row.accepted} | ${row.rejected} |`);
   }
-  lines.push('', `Принято: при ${BASE_CAP} — ${t.at2048.accepted}, при ${V3_CAPS[STEPFUN]} — ${t.at8192.accepted}; верных среди принятых ${t.at2048.correct} и ${t.at8192.correct}.`);
+  lines.push('', `Принято: при ${BASE_CAP} — ${t.at2048.accepted}, при ${V3_CAPS[STEPFUN]} — ${t.at8192.accepted}; верных среди принятых ${t.at2048.correct} и ${t.at8192.correct}. По верности (верно / неверно / не принят), строки при ${BASE_CAP}, столбцы при ${V3_CAPS[STEPFUN]}:`, '', `| При ${BASE_CAP} | верно | неверно | не принят |`, '| --- | --- | --- | --- |');
+  const formRu = { right: 'верно', wrong: 'неверно', cut: 'не принят', unconfirmed: 'без исхода' };
+  for (const from of [...FORMS, 'unconfirmed']) {
+    const row = result.correctness[from];
+    if (from === 'unconfirmed' && FORMS.every((to) => row[to] === 0)) continue;
+    lines.push(`| ${formRu[from]} | ${FORMS.map((to) => row[to]).join(' | ')} |`);
+  }
+  const statusRu = { accepted: 'оба: значение принято', leading: 'оба: значение ведущее', none: 'оба: значения нет', differ: 'проходы разошлись', unlabelled: 'не размечен' };
+  const s2 = result.status2048;
+  const s8 = result.status8192;
+  lines.push('', `StepFun F по статусу, который оба прохода разметки поставили тексту без эталона (принято / верно среди принятых / n):`, '', `| Статус текста | При ${BASE_CAP} | При ${V3_CAPS[STEPFUN]} |`, '| --- | --- | --- |');
+  for (const status of STATUSES) lines.push(`| ${statusRu[status]} | ${s2[status].accepted} / ${s2[status].correct} / ${s2[status].n} | ${s8[status].accepted} / ${s8[status].correct} / ${s8[status].n} |`);
   const g = result.groups2048[STEPFUN];
   const g8 = result.groups8192;
-  lines.push('', `StepFun F по группам разметки v2 (принято / верно среди принятых / n):`, '', `| Группа | При ${BASE_CAP} | При ${V3_CAPS[STEPFUN]} |`, '| --- | --- | --- |');
-  const groupRu = { firm: 'твёрдый ответ', candidate: 'кандидат', none: 'ответа нет', unlabelled: 'не размечен' };
+  lines.push('', `Те же тексты по группам разметки v2, которые сравнивают значение текста с эталоном (finish-probe-protocol.md):`, '', `| Группа | При ${BASE_CAP} | При ${V3_CAPS[STEPFUN]} |`, '| --- | --- | --- |');
+  const groupRu = { firm: 'firm: принятое значение равно эталону', candidate: 'candidate: эталон среди ведущих или проходы разошлись', none: 'none: эталон не выступал ответом', unlabelled: 'не размечен' };
   for (const group of GROUPS) lines.push(`| ${groupRu[group]} | ${g[group].accepted} / ${g[group].correct} / ${g[group].n} | ${g8[group].accepted} / ${g8[group].correct} / ${g8[group].n} |`);
   const rc = result.recount;
   lines.push('', `Пересчёт рук при ${BASE_CAP}, заполнение против fallback (выигрыши / потери / без изменения / неопределённо): ${ARMS.map((arm) => `${arm} ${armCell(rc.fill.overFallback[arm])}`).join('; ')}. A8 − S8 на основном наборе: исходно ${pp(rc.original.a8MinusS8)} п. п., fallback ${pp(rc.fallback.a8MinusS8)}, заполнение ${pp(rc.fill.a8MinusS8)} ${interval(rc.fill.a8MinusS8.interval)}.`);
