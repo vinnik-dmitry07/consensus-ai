@@ -275,6 +275,13 @@ export function testStages(order, items, primaryBlocks = []) {
   return [primary, legacy];
 }
 
+// The stages one launch may run. With --primary-only a test launch runs the
+// primary stage alone, so the legacy blocks are never sent by it; a later
+// launch without the flag can still run them.
+export function launchStages(stages, primaryOnly = false) {
+  return primaryOnly ? stages.slice(0, 1) : stages;
+}
+
 // Runs stages in order. A stage that stops (pause, fatal, unfinished) leaves
 // every later stage unstarted.
 export async function runStages(stages, runStage) {
@@ -1700,6 +1707,7 @@ function runnerNote(run) {
     httpInFlight: run.inFlight,
     perModelInFlight: run.modelInFlight,
     acceptForecast: run.acceptForecast === true,
+    primaryOnly: run.primaryOnly === true,
     note: 'Pacing only. Requests, caps, and retry limits are unchanged.',
   };
 }
@@ -1793,7 +1801,11 @@ async function runPipeline(campaignPaths, phase, run) {
     },
   });
   try {
-    const stages = phase === 'test' ? testStages(order, items, campaign.primaryBlocks) : [order];
+    const planned = phase === 'test' ? testStages(order, items, campaign.primaryBlocks) : [order];
+    const stages = phase === 'test' ? launchStages(planned, run.primaryOnly) : planned;
+    if (stages.length < planned.length) {
+      console.log(`test: --primary-only: ${stages[0].length} primary questions; the ${planned.slice(1).flat().length} legacy questions are not sent by this launch`);
+    }
     let code = await runStages(stages, (ids, index) => {
       if (stages.length > 1) {
         console.log(index === 0
@@ -2500,7 +2512,8 @@ export async function runA8Command(argv) {
     }
     if (!live) throw new Error(`${phase} posts only with --live`);
     if (phase === 'probe') return await runProbe(campaignPaths);
-    const run = { ...runFlags(argv), acceptForecast: argv.includes('--accept-forecast') };
+    const run = { ...runFlags(argv), acceptForecast: argv.includes('--accept-forecast'), primaryOnly: argv.includes('--primary-only') };
+    if (run.primaryOnly && phase !== 'test') throw new Error('--primary-only applies to the test phase only');
     if (phase === 'dev') return await runDev(campaignPaths, run);
     if (phase === 'smoke' || phase === 'pilot' || phase === 'test') {
       return await runPipeline(campaignPaths, phase, run);

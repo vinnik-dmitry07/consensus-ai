@@ -17,6 +17,7 @@ import {
   keyResidual,
   reconcileByKeyResidual,
   interleave,
+  launchStages,
   loopReview,
   pilotForecast,
   pilotItems,
@@ -131,6 +132,20 @@ describe('v5 scheduling', () => {
       return 0;
     })).toBe(0);
     expect(started).toEqual([0, 2]);
+  });
+
+  it('runs only the primary stage with --primary-only, and every stage without it', async () => {
+    const items = [item('p1', 'rgym'), item('l1', 'aime')];
+    const stages = testStages(['p1', 'l1'], items, ['rgym']);
+    expect(launchStages(stages, true)).toEqual([['p1']]);
+    expect(launchStages(stages, false)).toEqual(stages);
+    expect(launchStages([['a', 'b']], true)).toEqual([['a', 'b']]);
+    const started = [];
+    expect(await runStages(launchStages(stages, true), async (ids) => {
+      started.push(...ids);
+      return 0;
+    })).toBe(0);
+    expect(started).toEqual(['p1']);
   });
 
   it('runs every primary block before the legacy ones, and keeps old campaigns on one interleave', () => {
