@@ -49,3 +49,11 @@ The ArXivMath golds were not checked independently before v6. A separate check r
 - Dev has 24 legacy questions of 28, so the selection mostly reflects the legacy blocks.
 - In seven ArXivMath questions the statement admits +∞; the `number` instruction excludes it.
 - The chronology groups depend on the listing dates of the selected models.
+
+## Corrections after the paid preparation (2026-11-10, before any test POST)
+
+Added after probe, dev, smoke, the pilot, and the gate had run. The text above is unchanged and no rule changes; these lines correct statements that a check found wrong or unverified.
+
+- **Key limit mid-test.** "The campaign pauses and resumes once the limit is raised" is not verified. What OpenRouter answers when a key reaches its limit was not observed. The code lifts a pause only for a 403 that names the key limit (`key_budget`) and, by the account balance, for a recognised 402 (`insufficient_funds`); any other 402 becomes `payment_unknown`, which no code path lifts. A resume also needs the phase to be launched again. The test should therefore start only with the key funded for the stress forecast, so that the limit is not reached.
+- **Gold check.** The folder `tools/arxiv_gold_checks/` named above was created by another session and no longer exists in the repository; no correction file exists. The rule for corrections stands as written.
+- **Finishing.** "Before any v6 answer exists" means before any answer to a v6 test question. Dev and pilot answers to the four ArXivMath dev questions and the smoke question exist.
