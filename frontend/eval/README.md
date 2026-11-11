@@ -583,6 +583,116 @@ _Текст написала модель openai/gpt-6.1-sol через OpenRout
 
 <!-- a8-open-v6:end -->
 
+<!-- a8-open-v7-results:start -->
+
+### Кампания `a8-open-v7` (arxiv)
+
+Правила — в [a8-open-v7-protocol.md](a8-open-v7-protocol.md). Ниже выдержки из `.runs/a8-open-v7/reports/report.md`, собранные кодом без правки; толкование — в разделе «Анализ» под блоком.
+
+- Маршруты: снимок `a8-routes-v7`; stepfun/step-5-preview перенесён с `featherless/fp4` на `stepfun/fp8`; лимит 32768 на всех стадиях.
+- Проверка хоста `stepfun/fp8` до кампании: 12 из 12 одновременных вызовов вернулись, медиана 106.7 токена в секунду, итог `use`.
+- Состав по dev: B = H = deepseek/deepseek-v4.1-flash-1017; совет deepseek/deepseek-v4.1-flash-1017, z-ai/glm-5.3-flash, tencent/hy4-preview.
+
+Primary pair: A8 against S8 on the new blocks (ArXivMath). Strict grader.
+Primary set: 46 of 46 pairs, complete. Legacy blocks: 0 of 120, incomplete. Pending questions: 0. Cost: preliminary, some reserves are still unresolved.
+New to this campaign series does not mean unseen in training. See the chronology table.
+
+| Arm | New blocks pooled | New blocks macro | Legacy pooled | ArXivMath |
+| --- | --- | --- | --- | --- |
+| A8 | 10.9% | 10.9% | n/a | 10.9% |
+| S8 | 4.3% | 4.3% | n/a | 4.3% |
+| P8 | 4.3% | 4.3% | n/a | 4.3% |
+| B8 | 4.3% | 4.3% | n/a | 4.3% |
+
+A8 − S8 on the new blocks: 6.5 pp. Wins / losses / ties: 3 / 0 / 43; discordant pairs 3. Exact McNemar p: 0.25. Paired bootstrap resampled within blocks: 95% CI [0.0, 15.2] pp, 90% CI [2.2, 13.0] pp.
+Reading: direction: not established; this is not evidence that the two methods are equal.
+Reading: A8 ahead by more than 5 percentage points: undecided, the 95% interval crosses the threshold.
+Reading: S8 ahead by more than 5 percentage points: not supported by the 95% interval.
+Reading: practical equivalence within ±5 percentage points: not shown, the 90% interval reaches a bound.
+Reading: only 3 discordant pairs, so the bootstrap intervals are rough.
+One corrected gold moves this difference by at most 4.3 pp.
+
+Terminal method failures stay in the denominator as wrong. Pending questions are not scored and keep the primary set from being complete.
+
+#### Secondary family (one Holm correction)
+
+| Comparison | n | Δ | W / L / T | McNemar p | Holm p | 95% CI |
+| --- | --- | --- | --- | --- | --- | --- |
+| A8 - S8, group A | 0 | N/A, no questions | | kept at 1 | 1 | |
+| A8 - S8, groups B and C | 46 | 6.5 pp | 3 / 0 / 43 | 0.25 | 1 | [0.0, 15.2] pp |
+| A8 - P8 | 46 | 6.5 pp | 3 / 0 / 43 | 0.25 | 1 | [0.0, 15.2] pp |
+| S8 - P8 | 46 | 0.0 pp | 0 / 0 / 46 | 1 | 1 | [0.0, 0.0] pp |
+
+Macro accuracy, single blocks, single chronology groups, the legacy blocks, and the mechanism counts below are diagnostics.
+
+#### Dev selection
+
+B is the best of the checked candidates on this dev set under the fixed rule (accuracy, then completion, then latency). It is not shown to be the best model for the test mix. Dev questions by block: AIME 8, GPQA 8, MMLU-Pro 8, ArXivMath 4.
+
+| Candidate | Correct | Completed | Accuracy |
+| --- | --- | --- | --- |
+| deepseek/deepseek-v4.1-flash-1017 | 24 / 28 | 28 / 28 | 85.7% |
+| z-ai/glm-5.3-flash | 24 / 28 | 28 / 28 | 85.7% |
+| tencent/hy4-preview | 23 / 28 | 28 / 28 | 82.1% |
+| stepfun/step-5-preview | 22 / 28 | 28 / 28 | 78.6% |
+| minimax/minimax-m3.1-flash | 21 / 28 | 28 / 28 | 75.0% |
+
+Gap between the first and the second: 0.0 pp.
+
+#### Calls by stage
+
+| Stage | Calls | At cap | Length stop below cap | Loop stops | Kept after a second loop | Context refusals | In-flight credit retries | Failed |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| B samples | 184 | 143 | 0 | 7 | 2 | 0 | 0 | 0 |
+| Stage 1 | 138 | 122 | 0 | 5 | 1 | 0 | 0 | 1 |
+| S8 synthesis | 46 | 33 | 0 | 1 | 0 | 0 | 0 | 0 |
+| judges | 135 | 83 | 0 | 0 | 0 | 0 | 0 | 1 |
+| A8 synthesis | 45 | 25 | 0 | 2 | 1 | 0 | 0 | 0 |
+
+A length stop below the cap is a sign to check for a provider clamp, not proof of one. An in-flight credit refusal is free and comes before any provider; the transport retries it once per run of a slot, and the retry counts toward the campaign POST cap but not as a model attempt.
+
+Tail rule applied: Stage 1 answers 123, B samples 180, judges 82.
+
+| Arm | Outcome counts |
+| --- | --- |
+| A8 | correct 5, wrong 13, parse_error 27, incomplete_council 1 |
+| S8 | correct 2, parse_error 33, wrong 11 |
+| P8 | correct 2, no_answer 32, wrong 11, incomplete_council 1 |
+| B8 | correct 2, parse_error 34, wrong 9, refusal 1 |
+
+#### Cost
+
+Campaign: settled $17.0371, still held $0.2163, 858 POSTs of 4000; cap $90.
+Key usage at the last audit: 94.134437301 (an audit only; it never releases a reserve).
+Test questions, paid once: $13.7050. Standalone, with B's first answer counted in both: A8 $10.0840, S8 $4.2997. Held reserves inside these: A8 $0.2163, S8 $0.0000. Retries count toward their own arm.
+Preparation phases (probe, dev, smoke, pilot, self-test): $3.5484. No claim is made about efficiency at an equal budget.
+
+Caps: one cap of 32768 tokens on every stage. Loop guard: on. Tail rule: last 8000 characters of a cut reasoning, marked.
+
+Полный отчёт и воспроизведение без сети:
+
+```bash
+npm --prefix frontend run eval -- a8 --phase report --run a8-open-v7
+```
+
+<!-- a8-open-v7-results:end -->
+
+<!-- a8-open-v7-analysis:start -->
+
+#### Анализ
+
+_Текст написала модель openai/gpt-6.1-sol через OpenRouter по `.runs/a8-open-v7/reports/report.md` и протоколам кампании; модель google/gemini-4-argon сверила его с отчётом (замечаний: 0). Claude этот текст не писал и не правил._
+
+На всех 46 парах ArXivMath точность A8 составила 10.9%, S8 — 4.3%; разность — 6.5 п.п., победы/поражения/ничьи — 3 / 0 / 43. По заранее заданным правилам направление преимущества не установлено: точный тест Макнемара даёт p = 0.25. Превышение порога 5 п.п. остаётся неопределённым: 95% интервал [0.0, 15.2] пересекает порог. Практическая эквивалентность в пределах ±5 п.п. также не показана: 90% интервал [2.2, 13.0] выходит за границу. Это не доказательство равенства методов; при 3 несовпадающих парах бутстреп-интервалы грубы.
+
+Вторичное семейство после поправки Холма не добавляет подтверждённых различий: скорректированные p равны 1. Диагностики показывают, что председатель исправил 4 ответа относительно промежуточного лидера, ничего не испортив, а синтез S8 испортил 1 ответ относительно голосования. Это переходы между стадиями, не причинная абляция. Мягкое чтение ответов результата не изменило. Частые достижения лимита и ошибки разбора показывают, что измеряется весь конвейер, включая завершение и формат ответа.
+
+По протоколам состав выбирался заново на прежнем dev-наборе; нынешний совет включает DeepSeek, GLM и hy4, тогда как ранее StepFun занимал роли B и H. После остановки прежнего запуска из-за недоступности маршрута для StepFun предусмотрели другой хост с иной заявленной точностью; маршрут hy4 также отличается от более ранней кампании. Поэтому это не повторение прежней системы на неизменной инфраструктуре; результаты не объединяются с прежними.
+
+Основные ограничения — небольшой числовой поднабор, преобладание старых блоков при dev-отборе и отсутствие тестовой проверки регрессий на них. Даты появления моделей не исключают утечку обучающих данных. Независимая проверка эталонов не подтверждена; исправление одного эталона может сдвинуть разность на 4.3 п.п. Одинаковый токенный лимит не уравнивает расходы, часть резервов ещё не закрыта. Обобщение на другие задачи, маршруты и равные бюджеты остаётся открытым.
+
+<!-- a8-open-v7-analysis:end -->
+
 <!-- question-difficulty:start -->
 
 ### Категории вопросов и число выборок B (`question-difficulty`)
