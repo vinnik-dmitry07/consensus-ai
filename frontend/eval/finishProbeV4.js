@@ -1,6 +1,6 @@
 // finish-probe-v4: finishing cut answers on the new ArXivMath questions of
-// a8-open-v6, under finish-probe-v4-protocol.md. Written and committed before
-// the first test POST of a8-open-v6, so before any answer to a v6 test
+// a8-open-v7, under finish-probe-v4-protocol.md. Written and committed before
+// the first test POST of a8-open-v7, so before any answer to a v7 test
 // question exists. Every number, bound, verdict, and the decision come from
 // this code; the analysis text comes from OpenRouter models.
 
@@ -37,7 +37,7 @@ const MODELS_URL = 'https://openrouter.ai/api/v1/models';
 const README = path.join(EVAL_ROOT, 'README.md');
 
 export const V4_RUN = 'finish-probe-v4';
-export const SOURCE_RUN = 'a8-open-v6';
+export const SOURCE_RUN = 'a8-open-v7';
 export const V4_LIMITS = Object.freeze({ maxUsd: 15, maxPosts: 900 });
 export const V4_CAP = 2048;
 export const V4_ORDER_SEED = 'finish-probe-v4-order';

@@ -109,7 +109,7 @@ describe('finish probe v4: text and protocol', () => {
     const kw = { arms: [{ arm: 'B8', wins: 1, undetermined: 0 }], verdict: 'pass' };
     const pair = { delta: 0, interval: { low: -0.1, high: 0.1 } };
     const block = renderV4Readme({
-      meta: { sourceRun: 'a8-open-v6', rows: 46, planned: 46, limits: V4_LIMITS, money: null },
+      meta: { sourceRun: 'a8-open-v7', rows: 46, planned: 46, limits: V4_LIMITS, money: null },
       result: { decision: { code: 'confirmed_for_arms', arms: ['B8'] }, k4, kp, kw, inputs: 10, questions: 5, syntheses: 2, acceptance: [], recount: { original: { a8MinusS8: pair }, fallback: { a8MinusS8: pair }, fill: { a8MinusS8: pair } } },
     });
     expect(block).toContain('подтверждено на новых вопросах для рук с выигрышем (B8)');
