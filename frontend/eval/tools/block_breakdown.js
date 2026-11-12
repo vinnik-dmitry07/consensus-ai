@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 
 import { parseCorrectnessScores, parseRankingFromText } from '../../src/engine/browser/council.js';
 import { BLOCK_LABELS, orderBlocks } from '../a8Blocks.js';
+import { cutReasoning, forwardText } from '../a8Variants.js';
 import { loadBankTasks, placeAnalysis, placeBefore, readGold, rewriteFile } from '../noteTools.js';
 
 const EVAL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -209,11 +210,19 @@ function ownerOf(text, stage1, used) {
   return slot.meta.model;
 }
 
-function judgeView(slot, stage1) {
+// The text of a judge reply the engine parsed: with the tail rule on, a judge
+// cut in its reasoning is parsed from the end of it only (a8Variants.js).
+export function engineReply(slot, rule) {
+  const reply = slot.result?.content || '';
+  const result = slot.result ? { ...slot.result, finishReason: finishOf(slot) } : null;
+  return rule && cutReasoning(result) ? { text: forwardText(reply, rule), tail: true } : { text: reply, tail: false };
+}
+
+function judgeView(slot, stage1, rule) {
   const used = new Set();
   const shown = shownResponses(slot.request.messages[0].content).map((item) => ({ label: item.label, model: ownerOf(item.text, stage1, used) }));
   const modelOf = new Map(shown.map((item) => [item.label, item.model]));
-  const reply = slot.result?.content || '';
+  const { text: reply, tail } = engineReply(slot, rule);
   const scores = parseCorrectnessScores(reply);
   // The engine keeps the first mention of each label; with no FINAL RANKING
   // line its parser falls back to the order of mentions in the whole reply.
@@ -224,6 +233,7 @@ function judgeView(slot, stage1) {
     scores: shown.map((item) => ({ model: item.model, score: scores[item.label] ?? null })),
     order,
     rankingLine: /FINAL RANKING/i.test(reply),
+    tail,
     finish: finishOf(slot),
     tokens: tokensOf(slot),
   };
@@ -350,7 +360,7 @@ async function buildData(target = TARGET) {
         id: row.id,
         gold: mainVariant.gold(row.id),
         answers: answersOf(row),
-        views: council.map((model) => judgeView(own.judges.find((slot) => slot.meta.model === model), stage1)),
+        views: council.map((model) => judgeView(own.judges.find((slot) => slot.meta.model === model), stage1, campaign.tailRule)),
         candidates: chairmanView(own.A8, stage1),
       });
     }
@@ -403,7 +413,7 @@ async function buildData(target = TARGET) {
     config: {
       b: selection.b, h: selection.h, council,
       selfExclusion: campaign.selfExclusion, topK: campaign.topK, redTeam: campaign.redTeam ?? null,
-      cap: campaign.stageCaps?.stage1, shownToJudge: [...new Set(judges.flatMap((item) => item.views.map((view) => view.saw.length)))].sort(),
+      cap: campaign.stageCaps?.stage1, tailChars: campaign.tailRule?.chars ?? null, shownToJudge: [...new Set(judges.flatMap((item) => item.views.map((view) => view.saw.length)))].sort(),
     },
     variantTable, changes, misses, judges, blocks, checks, appendix,
   };
@@ -456,7 +466,7 @@ function renderBlock(data) {
     '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
     ...data.misses.map((row) => `| ${label(row.id)} | ${shortAnswer(row.gold)} | ${row.council.map((item) => shortAnswer(item.answer)).join(' / ')} | ${shortAnswer(row.leader)} | ${armText(row.A8)} | ${armText(row.S8)} | ${row.samples.map(shortAnswer).join(', ')} | ${stopsText(row.stops.stage1)}; ${stopsText(row.stops.samples)}; ${stopsText(row.stops.judges)} | ${synthText(row.A8)} | ${synthText(row.S8)} |`),
     '',
-    '**Судьи на вопросах, где совет дал разные разобранные ответы.** Первое место — первая метка, которую разбор движка прочёл в ответе судьи.',
+    `**Судьи на вопросах, где совет дал разные разобранные ответы.** Первое место — первая метка, которую разбор движка прочёл в ответе судьи.${data.judges.some((item) => item.views.some((view) => view.tail)) ? ` Судью, оборванного в рассуждении, движок разбирал только по последним ${config.tailChars} символам (правило хвоста); такие ячейки помечены «по хвосту».` : ''}`,
     '',
     '| Вопрос | Эталон | Судья | Видел ответы | Оценки корректности | Первое место | Ответ судьи |',
     '| --- | --- | --- | --- | --- | --- | --- |',
@@ -465,7 +475,8 @@ function renderBlock(data) {
     const answer = new Map(item.answers.map((entry) => [entry.model, entry.answer]));
     const show = (model) => `${nameOf(model)}: ${shortAnswer(answer.get(model))}`;
     for (const view of item.views) {
-      const first = view.order.length ? `${show(view.order[0])}${view.rankingLine ? '' : ' (строки FINAL RANKING нет, порядок по упоминаниям)'}` : 'не разобрано';
+      const how = [view.tail ? 'по хвосту' : null, view.rankingLine ? null : 'строки FINAL RANKING нет, порядок по упоминаниям'].filter(Boolean).join('; ');
+      const first = view.order.length ? `${show(view.order[0])}${how ? ` (${how})` : ''}` : `не разобрано${view.tail ? ' (по хвосту)' : ''}`;
       lines.push(`| ${label(item.id)} | ${shortAnswer(item.gold)} | ${nameOf(view.judge)} | ${view.saw.map(show).join('; ')} | ${view.scores.map((entry) => `${nameOf(entry.model)} ${entry.score ?? 'нет'}`).join('; ')} | ${first} | ${synthText(view)} |`);
     }
   }

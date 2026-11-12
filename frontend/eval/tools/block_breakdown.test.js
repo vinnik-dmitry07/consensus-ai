@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { placeBefore, readGold, withLineEndings } from '../noteTools.js';
 import {
-  TARGET, markers, rulesOf, scoreRow, sheepFits, shownCandidates, shownResponses, tally, variantsOf,
+  TARGET, engineReply, markers, rulesOf, scoreRow, sheepFits, shownCandidates, shownResponses, tally, variantsOf,
 } from './block_breakdown.js';
 
 const graded = (extracted) => ({ status: 'graded', extracted });
@@ -75,6 +75,24 @@ describe('block breakdown: what a judge and the chairman were shown', () => {
     expect(list.map((item) => [item.place, item.score, item.correctness])).toEqual([[1, '1.00', '10.0/10'], [2, '0.50', '9.0/10']]);
     expect(list[0].text.trim().endsWith('ANSWER: 14')).toBe(true);
     expect(list[1].text.trim().endsWith('ANSWER: 8')).toBe(true);
+  });
+});
+
+describe('block breakdown: the judge text the engine parsed', () => {
+  const rule = { chars: 12, marker: '[tail]' };
+  const judge = (finishReason, contentFromReasoning) => ({ result: { ok: true, content: 'Response 1 ... FINAL RANKING: 1. Response 2', finishReason, contentFromReasoning } });
+
+  it('reads a judge cut in its reasoning from its tail, as the tail rule does', () => {
+    const content = judge('length', true).result.content;
+    expect(engineReply(judge('length', true), rule)).toEqual({ text: `[tail]\n${content.slice(-12)}`, tail: true });
+    expect(content.slice(-12)).toBe('. Response 2');
+    expect(engineReply(judge('loop', true), rule).tail).toBe(true);
+  });
+
+  it('reads a finished judge, or any judge without the rule, whole', () => {
+    expect(engineReply(judge('stop', false), rule)).toEqual({ text: 'Response 1 ... FINAL RANKING: 1. Response 2', tail: false });
+    expect(engineReply(judge('length', false), rule).tail).toBe(false);
+    expect(engineReply(judge('length', true), null).tail).toBe(false);
   });
 });
 
