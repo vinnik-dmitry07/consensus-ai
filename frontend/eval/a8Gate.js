@@ -6,13 +6,12 @@
 //   node frontend/eval/a8Gate.js --run a8-open-v6 [--block arxiv] [--compare a8-open-v5d]
 // --block defaults to the one primary block of the campaign.
 
-import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { LEGACY_BLOCKS } from './a8Blocks.js';
-import { envKey, flagValue, readJson } from './noteTools.js';
+import { envKey, fileSha, flagValue, readJson } from './noteTools.js';
 
 const EVAL_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const RUNS_ROOT = path.join(EVAL_ROOT, '.runs');
@@ -106,10 +105,6 @@ async function keyInfo(fetchImpl = fetch) {
   }
 }
 
-function fileSha(file) {
-  return existsSync(file) ? createHash('sha256').update(readFileSync(file)).digest('hex') : 'absent';
-}
-
 export async function runGate(argv, { root = RUNS_ROOT, fetchImpl = fetch } = {}) {
   const run = flagValue(argv, '--run');
   if (!run) throw new Error('--run is required');
@@ -138,7 +133,7 @@ export async function runGate(argv, { root = RUNS_ROOT, fetchImpl = fetch } = {}
     detail: blockDetail(devRows, pilotRows, block),
     legacyDev: { compare, ...legacyDevComparison(devRows, questionRows(path.join(root, compare, 'dev'))) },
     loops: Object.fromEntries(['smoke', 'pilot'].map((of) => [of, readJson(path.join(dir, 'reports', `loops-${of}.json`))?.stops?.length ?? null])),
-    goldCorrections: { file: path.basename(goldFile), sha256: fileSha(goldFile) },
+    goldCorrections: { file: path.basename(goldFile), sha256: existsSync(goldFile) ? fileSha(goldFile) : 'absent' },
   };
   writeFileSync(path.join(dir, 'gate.json'), JSON.stringify(record, null, 2), 'utf8');
   console.log(`gate ${record.verdict}${record.failed.length ? `: ${record.failed.join(', ')}` : ''}`);

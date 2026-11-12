@@ -10,7 +10,7 @@
 //   node eval/tools/block_breakdown.js [--readme]
 //   node eval/tools/block_breakdown.js --analysis --live
 
-import { createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -18,7 +18,8 @@ import { fileURLToPath } from 'node:url';
 import { parseCorrectnessScores, parseRankingFromText } from '../../src/engine/browser/council.js';
 import { BLOCK_LABELS, orderBlocks } from '../a8Blocks.js';
 import { cutReasoning, forwardText } from '../a8Variants.js';
-import { loadBankTasks, placeAnalysis, placeBefore, readGold, rewriteFile } from '../noteTools.js';
+import { loadBankTasks, questionRecords, readGold } from '../campaignData.js';
+import { attributedSection, placeAnalysis, placeBefore, rewriteFile, sectionMarkers } from '../noteTools.js';
 
 const EVAL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const RUNS = path.join(EVAL_ROOT, '.runs');
@@ -71,24 +72,19 @@ const tokensOf = (slot) => slot?.usage?.completion_tokens ?? slot?.result?.usage
 
 export function markers(target = TARGET) {
   const tag = `${target.run}-${target.block}`;
-  return {
-    start: `<!-- ${tag}:start -->`,
-    end: `<!-- ${tag}:end -->`,
-    analysisStart: `<!-- ${tag}-analysis:start -->`,
-    analysisEnd: `<!-- ${tag}-analysis:end -->`,
-  };
+  const block = sectionMarkers(tag);
+  const analysis = sectionMarkers(`${tag}-analysis`);
+  return { start: block.start, end: block.end, analysisStart: analysis.start, analysisEnd: analysis.end };
 }
 
 // The gold variants, from the report as run to every correction at once.
 export function variantsOf(target, tasks, main, wide) {
   const base = (id) => tasks.get(id).goldCanon;
-  const fromMain = (id) => main.gold.get(id) ?? base(id);
-  const fromWide = (id) => wide.gold.get(id) ?? base(id);
   return [
     { key: 'report', label: 'Исходный отчёт, без правок', gold: base, excluded: new Set() },
-    { key: 'main', label: `Основной: правки из \`${target.goldFile}\``, gold: fromMain, excluded: new Set(main.excluded.keys()) },
-    { key: 'main-less', label: 'Основной без вопросов, которые исключает полный список', gold: fromMain, excluded: new Set([...main.excluded.keys(), ...wide.excluded.keys()]) },
-    { key: 'wide', label: `Полный список: \`${target.wideFile}\``, gold: fromWide, excluded: new Set(wide.excluded.keys()) },
+    { key: 'main', label: `Основной: правки из \`${target.goldFile}\``, gold: main.goldOf, excluded: new Set(main.excluded) },
+    { key: 'main-less', label: 'Основной без вопросов, которые исключает полный список', gold: main.goldOf, excluded: new Set([...main.excluded, ...wide.excluded]) },
+    { key: 'wide', label: `Полный список: \`${target.wideFile}\``, gold: wide.goldOf, excluded: new Set(wide.excluded) },
   ];
 }
 
@@ -117,12 +113,7 @@ export function tally(scored) {
   return out;
 }
 
-function loadRows(dir) {
-  return readdirSync(dir)
-    .filter((name) => name.startsWith('test_') && name.endsWith('.json'))
-    .map((name) => readJson(path.join(dir, name)))
-    .filter((row) => row?.id && row.status === 'complete');
-}
+const loadRows = (dir) => questionRecords(dir, 'test_').filter((row) => row.status === 'complete');
 
 // The slot journal folded as the runtime folds it (the last event of a key
 // wins). Reasoning is dropped; requests and texts are kept only where `full`
@@ -286,7 +277,7 @@ async function buildData(target = TARGET) {
   const dir = path.join(RUNS, target.run);
   const campaign = readJson(path.join(dir, 'campaign.json'));
   const selection = readJson(path.join(dir, 'selection.json'));
-  const tasks = loadBankTasks(EVAL_ROOT);
+  const tasks = loadBankTasks();
   const main = readGold(readJson(path.join(EVAL_ROOT, target.goldFile)), tasks);
   const wide = readGold(readJson(path.join(EVAL_ROOT, target.wideFile)), tasks);
   const variants = variantsOf(target, tasks, main, wide);
@@ -547,14 +538,9 @@ const INSTRUCTION = [
   'Return only the text of the section.',
 ].join('\n');
 
-function analysisSection(target, text, check, writer, checker) {
-  return [
-    '#### Анализ блока',
-    '',
-    `_Текст написала модель ${writer} через OpenRouter по \`.runs/${target.run}/reports/block-${target.block}.md\` (блок выше и сохранённые тексты ответов) и по разделам этого README о правилах и итогах кампании; модель ${checker} сверила его с ними (замечаний: ${check.problems.length}). Claude этот текст не писал и не правил._`,
-    '',
-    String(text).trim(),
-  ].join('\n');
+export function analysisSection(target, record) {
+  const basis = `\`.runs/${target.run}/reports/block-${target.block}.md\` (блок выше и сохранённые тексты ответов) и по разделам этого README о правилах и итогах кампании`;
+  return attributedSection('Анализ блока', basis, 'с ними', record);
 }
 
 // What the analysis models get as rules: the campaign section of the README
@@ -589,7 +575,7 @@ function runBlockAnalysis(target) {
     start: analysisStart,
     end: analysisEnd,
     after: end,
-    section: (record) => analysisSection(target, record.text, record.check, record.writer, record.checker),
+    section: (record) => analysisSection(target, record),
   });
 }
 

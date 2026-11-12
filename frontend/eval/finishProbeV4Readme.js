@@ -13,18 +13,17 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { markers as campaignMarkers } from './a8CampaignNote.js';
 import {
   ANALYSIS_END, ANALYSIS_LIMITS, ANALYSIS_START, PROTOCOL_V4, README_END, README_START, V4_INSTRUCTION, renderV4Readme, v4AnalysisSection,
 } from './finishProbeV4.js';
-import { placeAfter, placeAnalysis, readJson, readJsonl, rewriteFile, ruleFiles } from './noteTools.js';
+import { placeAfter, placeAnalysis, readJson, readJsonl, rewriteFile, ruleFiles, sectionMarkers } from './noteTools.js';
 
 const EVAL_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const RUN_DIR = path.join(EVAL_ROOT, '.runs', 'finish-probe-v4');
 const README = path.join(EVAL_ROOT, 'README.md');
-export const AFTER = campaignMarkers('a8-open-v7').analysisEnd;
-export const NOTE_START = '<!-- finish-probe-v4-note:start -->';
-export const NOTE_END = '<!-- finish-probe-v4-note:end -->';
+// The v4 block follows the analysis of a8-open-v7, its source campaign.
+export const AFTER = sectionMarkers('a8-open-v7-analysis').end;
+export const { start: NOTE_START, end: NOTE_END } = sectionMarkers('finish-probe-v4-note');
 const VERDICT_RU = Object.freeze({ pass: 'выполнен', fail: 'не выполнен', not_evaluable: 'не определён' });
 // Each decision code and the criteria its frozen text calls "held".
 export const CLAIMED_HELD = Object.freeze({ accepted_often_wrong: ['k4'], no_use_for_arms: ['k4', 'kp'], confirmed_for_arms: ['k4', 'kp', 'kw'] });

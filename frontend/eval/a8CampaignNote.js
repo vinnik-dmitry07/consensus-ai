@@ -10,8 +10,9 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { markers as runNoteMarkers } from './a8RunNote.js';
-import { ANALYSIS_LIMITS, flagValue, placeAfter, placeAnalysis, readJson, rewriteFile, ruleFiles } from './noteTools.js';
+import {
+  ANALYSIS_LIMITS, attributedSection, flagValue, placeAfter, placeAnalysis, readJson, rewriteFile, ruleFiles, sectionMarkers,
+} from './noteTools.js';
 
 const EVAL_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const RUNS_ROOT = path.join(EVAL_ROOT, '.runs');
@@ -19,12 +20,9 @@ const README = path.join(EVAL_ROOT, 'README.md');
 export const SECTIONS = Object.freeze(['Secondary family', 'Dev selection', 'Calls by stage', 'Cost']);
 
 export function markers(run) {
-  return {
-    start: `<!-- ${run}-results:start -->`,
-    end: `<!-- ${run}-results:end -->`,
-    analysisStart: `<!-- ${run}-analysis:start -->`,
-    analysisEnd: `<!-- ${run}-analysis:end -->`,
-  };
+  const results = sectionMarkers(`${run}-results`);
+  const analysis = sectionMarkers(`${run}-analysis`);
+  return { start: results.start, end: results.end, analysisStart: analysis.start, analysisEnd: analysis.end };
 }
 
 // The report split at its "## " headings: the opening part, then each section.
@@ -87,14 +85,8 @@ export const CAMPAIGN_INSTRUCTION = [
   'Return only the text of the section.',
 ].join('\n');
 
-export function analysisSection(run, text, check, writer, checker) {
-  return [
-    '#### Анализ',
-    '',
-    `_Текст написала модель ${writer} через OpenRouter по \`.runs/${run}/reports/report.md\` и протоколам кампании; модель ${checker} сверила его с отчётом (замечаний: ${check.problems.length}). Claude этот текст не писал и не правил._`,
-    '',
-    String(text).trim(),
-  ].join('\n');
+export function analysisSection(run, record) {
+  return attributedSection('Анализ', `\`.runs/${run}/reports/report.md\` и протоколам кампании`, 'с отчётом', record);
 }
 
 function runCampaignAnalysis(run) {
@@ -111,7 +103,7 @@ function runCampaignAnalysis(run) {
     start: analysisStart,
     end: analysisEnd,
     after: end,
-    section: (record) => analysisSection(run, record.text, record.check, record.writer, record.checker),
+    section: (record) => analysisSection(run, record),
   });
 }
 
@@ -127,7 +119,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     writeFileSync(path.join(RUNS_ROOT, run, 'readme-block.md'), `${block}\n`, 'utf8');
     if (argv.includes('--readme')) {
       const { start, end } = markers(run);
-      rewriteFile(README, (text) => placeAfter(text, start, end, block, flagValue(argv, '--after') || runNoteMarkers('a8-open-v6').end));
+      rewriteFile(README, (text) => placeAfter(text, start, end, block, flagValue(argv, '--after') || sectionMarkers('a8-open-v6').end));
     }
     console.log(block);
   }

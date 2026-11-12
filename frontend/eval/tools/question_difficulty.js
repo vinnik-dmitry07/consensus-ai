@@ -16,12 +16,13 @@
 //   borderline everything else
 // slack is 0 unless --slack says otherwise.
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gradeResponse } from '../grade.js';
 import { BLOCK_LABELS, BLOCK_ORDER, LEGACY_BLOCKS, orderBlocks } from '../a8Blocks.js';
-import { flagValue, loadBankTasks, mdTable as table, readGold } from '../noteTools.js';
+import { loadBankTasks, questionRecords, readGold } from '../campaignData.js';
+import { flagValue, mdTable as table } from '../noteTools.js';
 import { readSlotMap } from '../runtime.js';
 
 const EVAL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -55,12 +56,13 @@ const isRight = (answer, gold) => answer != null && answer === gold;
 const isPrimary = (row) => !LEGACY_BLOCKS.includes(row.block);
 const isLegacy = (row) => !isPrimary(row);
 
-function recordsIn(dir, prefix) {
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir)
-    .filter((name) => name.startsWith(prefix) && name.endsWith('.json'))
-    .map((name) => readJson(path.join(dir, name)))
-    .filter((row) => row?.id);
+// The completed test questions of a campaign with their task and gold in force.
+function testRows(run, tasks, goldInForce) {
+  return questionRecords(path.join(RUNS, run, 'comparison', 'test'), 'test_').filter((row) => row.status === 'complete').map((row) => {
+    const task = tasks.get(row.id);
+    if (!task) throw new Error(`${run}: ${row.id} is not in the bank`);
+    return { row, task, gold: goldInForce.goldOf(row.id), diagnostics: row.diagnostics || {} };
+  });
 }
 
 function selectionOf(run) {
@@ -124,13 +126,8 @@ function regradeArm(grade, gold) {
 function fromStoredAnswers(run, tasks, goldInForce, slack, checks) {
   const selection = selectionOf(run);
   const bIndex = selection.council.indexOf(selection.b);
-  const rows = recordsIn(path.join(RUNS, run, 'comparison', 'test'), 'test_').filter((row) => row.status === 'complete');
   const out = [];
-  for (const row of rows) {
-    const task = tasks.get(row.id);
-    if (!task) throw new Error(`${run}: ${row.id} is not in the bank`);
-    const gold = goldInForce.gold.get(row.id) ?? task.goldCanon;
-    const diagnostics = row.diagnostics || {};
+  for (const { row, task, gold, diagnostics } of testRows(run, tasks, goldInForce)) {
     const samples = diagnostics.replicateAnswers;
     const council = diagnostics.councilAnswers;
     if (!Array.isArray(samples) || !Array.isArray(council)) throw new Error(`${run}: ${row.id} has no stored answers`);
@@ -172,13 +169,8 @@ function fromStoredAnswers(run, tasks, goldInForce, slack, checks) {
 // models' answers are the tally minus B's own Stage 1 answer (sample 1).
 function fromTexts(run, tasks, goldInForce, slack, checks) {
   const selection = selectionOf(run);
-  const rows = recordsIn(path.join(RUNS, run, 'comparison', 'test'), 'test_').filter((row) => row.status === 'complete');
   const out = [];
-  for (const row of rows) {
-    const task = tasks.get(row.id);
-    if (!task) throw new Error(`${run}: ${row.id} is not in the bank`);
-    const gold = goldInForce.gold.get(row.id) ?? task.goldCanon;
-    const diagnostics = row.diagnostics || {};
+  for (const { row, task, gold, diagnostics } of testRows(run, tasks, goldInForce)) {
     const attempts = [];
     let first = null;
     (diagnostics.replicateTexts || []).forEach((text, index) => {
@@ -249,7 +241,7 @@ function slotAttempts(run, tasks, goldOf) {
 // Adds to each question how its attempts ended, and checks that the journal
 // holds the same answers as the question record.
 function withFinishReasons(run, rows, tasks, goldInForce, checks) {
-  const { perQuestion } = slotAttempts(run, tasks, (id, task) => goldInForce.gold.get(id) ?? task.goldCanon);
+  const { perQuestion } = slotAttempts(run, tasks, goldInForce.goldOf);
   const key = (list) => list.map((item) => String(item)).sort().join('\u0001');
   return rows.map((row) => {
     const attempts = perQuestion.get(row.id) || [];
@@ -287,7 +279,7 @@ function fromSlots(run, tasks, slack) {
 // Dev: every candidate model answered once.
 function fromDev(run, blocks, slack) {
   const out = [];
-  for (const row of recordsIn(path.join(RUNS, run, 'dev'), 'dev_')) {
+  for (const row of questionRecords(path.join(RUNS, run, 'dev'), 'dev_')) {
     if (blocks && !blocks.includes(row.block)) continue;
     const attempts = (row.answers || [])
       .filter((item) => item.success)
@@ -304,6 +296,8 @@ const pct = (part, whole) => (whole ? `${((100 * part) / whole).toFixed(1)}%` : 
 const short = (value, max = 18) => (String(value).length > max ? `${String(value).slice(0, max)}…` : String(value));
 const mark = (value) => (value === 1 || value === true ? '✓' : value === 0 || value === false ? '✗' : '—');
 const blockRank = (block) => (BLOCK_ORDER.indexOf(block) + 1) || 99;
+// The answers of a question with their counts, e.g. "12×5, ∅×2".
+const tallyText = (row) => row.tally.map(([answer, count]) => `${short(answer)}×${count}`).join(', ');
 const bare = (id) => id.replace(/^test:/, '');
 const blocksOf = (rows) => orderBlocks(rows.map((row) => row.block));
 
@@ -349,12 +343,16 @@ function crossTab(left, right) {
 }
 
 // What report.md and the README part are both built from.
-function viewOf({ main, sensitivity }) {
+function viewOf({ main, arxiv, sensitivity }) {
   const scored = main.rows.filter((row) => !row.excluded);
   const sorted = (rows) => [...rows].sort((left, right) => blockRank(left.block) - blockRank(right.block) || left.id.localeCompare(right.id));
+  const arxivN = arxiv.rows.map((row) => row.n);
   return {
     scored,
     sorted,
+    // ArXivMath: the questions with an answer, and the attempts that came back.
+    answered: arxiv.rows.filter((row) => row.n > 0),
+    arxivAttempts: { total: arxivN.reduce((sum, n) => sum + n, 0), min: Math.min(...arxivN), max: Math.max(...arxivN), cut: arxiv.finish.length || 0 },
     others: main.selection.council.filter((model) => model !== main.selection.b),
     size: scored[0]?.n || 0,
     borderline: scored.filter((row) => row.category === 'borderline'),
@@ -398,7 +396,7 @@ function armTable(scored, cell) {
 
 function buildReport(data) {
   const { main, arxiv, dev, pools, slack, checks } = data;
-  const { scored, sorted, others, size, borderline, unsolved, noteOf } = viewOf(data);
+  const { scored, sorted, others, size, borderline, unsolved, noteOf, answered, arxivAttempts } = viewOf(data);
   const lines = [];
   const push = (...items) => lines.push(...items);
 
@@ -457,13 +455,11 @@ function buildReport(data) {
   push(...armTable(scored, (count, n) => `${count} (${pct(count, n)})`));
 
   // ArXivMath
-  const answered = arxiv.rows.filter((row) => row.n > 0);
-  const attemptsTotal = arxiv.rows.reduce((sum, row) => sum + row.n, 0);
   push(
     '',
     `## ArXivMath: тест ${ARXIV_RUN} остановлен, данные неполные`,
     '',
-    `Ни один из ${arxiv.rows.length} вопросов не дошёл до конца. Посчитаны ответы, которые успели прийти: ${attemptsTotal} попыток, от ${Math.min(...arxiv.rows.map((row) => row.n))} до ${Math.max(...arxiv.rows.map((row) => row.n))} на вопрос. Из них обрезано на лимите ${arxiv.caps?.sample ?? '?'} токенов: ${arxiv.finish.length || 0}; без читаемого ответа: ${arxiv.rows.reduce((sum, row) => sum + row.noAnswer, 0)}. Эталоны ArXivMath не перепроверялись. Категории здесь предварительные.`,
+    `Ни один из ${arxiv.rows.length} вопросов не дошёл до конца. Посчитаны ответы, которые успели прийти: ${arxivAttempts.total} попыток, от ${arxivAttempts.min} до ${arxivAttempts.max} на вопрос. Из них обрезано на лимите ${arxiv.caps?.sample ?? '?'} токенов: ${arxivAttempts.cut}; без читаемого ответа: ${arxiv.rows.reduce((sum, row) => sum + row.noAnswer, 0)}. Эталоны ArXivMath не перепроверялись. Категории здесь предварительные.`,
     '',
     ...table(
       ['Попыток на вопрос', 'Вопросов', ...CATEGORIES.map((name) => CATEGORY_RU[name])],
@@ -481,7 +477,7 @@ function buildReport(data) {
       ['Вопрос', 'Верно / попыток', 'Без ответа', 'Обрезано на лимите', 'Ответы (эталон)', 'Категория'],
       arxiv.rows.map((row) => [
         `\`${row.id}\``, `${row.right}/${row.n}`, row.noAnswer, row.cutAtCap,
-        `${row.tally.map(([answer, count]) => `${short(answer)}×${count}`).join(', ')} (${short(row.gold)})`,
+        `${tallyText(row)} (${short(row.gold)})`,
         CATEGORY_RU[row.category] || '—',
       ]),
     ),
@@ -522,7 +518,7 @@ function buildReport(data) {
       ['Вопрос', 'Блок', 'Ответы (число попыток)', 'Эталон', 'Без ответа', 'Обрезано на лимите', 'A8', 'S8', 'P8', 'Пометка'],
       unsolved.map((row) => [
         `\`${row.id}\``, BLOCK_LABELS[row.block] || row.block,
-        row.tally.map(([answer, count]) => `${short(answer)}×${count}`).join(', '), short(row.gold),
+        tallyText(row), short(row.gold),
         row.noAnswer, row.cutAtCap, mark(row.arms.A8), mark(row.arms.S8), mark(row.arms.P8), noteOf(row),
       ]),
     ),
@@ -556,7 +552,7 @@ function buildReport(data) {
     '',
     `### Исключены из счёта (${excludedRows.length})`,
     '',
-    ...excludedRows.map((row) => `- \`${row.id}\`: ${data.goldInForce.excluded.get(row.id)}`),
+    ...excludedRows.map((row) => `- \`${row.id}\`: ${data.goldInForce.reasons.get(row.id)}`),
     '',
     '## Проверки и ограничения',
     '',
@@ -577,8 +573,7 @@ function buildReport(data) {
 // its own part and places the whole block.
 function buildReadme(data) {
   const { main, arxiv, dev, pools, slack } = data;
-  const { scored, sorted, others, size, borderline, unsolved, noteOf } = viewOf(data);
-  const answered = arxiv.rows.filter((row) => row.n > 0);
+  const { scored, sorted, others, size, borderline, unsolved, noteOf, answered, arxivAttempts } = viewOf(data);
   const count = (rows, name) => rows.filter((row) => row.category === name).length;
   const lines = [
     '#### Категории вопросов',
@@ -606,7 +601,7 @@ function buildReadme(data) {
     ...table(
       ['Вопрос', 'Ответы попыток', 'Эталон', 'Обрезано на лимите', 'A8', 'S8', 'Пометка'],
       unsolved.map((row) => [
-        `\`${bare(row.id)}\``, row.tally.map(([answer, total]) => `${short(answer)}×${total}`).join(', '), short(row.gold),
+        `\`${bare(row.id)}\``, tallyText(row), short(row.gold),
         row.cutAtCap, mark(row.arms.A8), mark(row.arms.S8), noteOf(row),
       ]),
     ),
@@ -615,7 +610,7 @@ function buildReadme(data) {
     '',
     `Остальные ${count(scored, 'easy')} из ${scored.length} вопросов легко-решаемые. Вопросов, исключённых тем же файлом исправлений и не вошедших в счёт: ${main.rows.length - scored.length}.`,
     '',
-    `ArXivMath, тест ${ARXIV_RUN}: ни один из ${arxiv.rows.length} вопросов не закончен, поэтому категории предварительные. Пришло ${arxiv.rows.reduce((sum, row) => sum + row.n, 0)} попыток, от ${Math.min(...arxiv.rows.map((row) => row.n))} до ${Math.max(...arxiv.rows.map((row) => row.n))} на вопрос, из них обрезано на лимите ${arxiv.finish.length || 0}. Не-решаемых ${count(answered, 'unsolved')}, пограничных ${count(answered, 'borderline')}, легко-решаемых ${count(answered, 'easy')}. Эталоны ArXivMath не перепроверялись.`,
+    `ArXivMath, тест ${ARXIV_RUN}: ни один из ${arxiv.rows.length} вопросов не закончен, поэтому категории предварительные. Пришло ${arxivAttempts.total} попыток, от ${arxivAttempts.min} до ${arxivAttempts.max} на вопрос, из них обрезано на лимите ${arxivAttempts.cut}. Не-решаемых ${count(answered, 'unsolved')}, пограничных ${count(answered, 'borderline')}, легко-решаемых ${count(answered, 'easy')}. Эталоны ArXivMath не перепроверялись.`,
     '',
     `Dev (пять моделей-кандидатов по одной попытке, ${dev.length} вопросов): легко-решаемых ${count(dev, 'easy')}, пограничных ${count(dev, 'borderline')}, не-решаемых ${count(dev, 'unsolved')}.`,
     '',
@@ -647,7 +642,7 @@ function main(argv) {
   const slack = Number(flagValue(argv, '--slack') ?? '0');
   if (!Number.isInteger(slack) || slack < 0) throw new Error('--slack takes a whole number, 0 or more');
   const outDir = path.resolve(flagValue(argv, '--out') ?? path.join(RUNS, 'question-difficulty'));
-  const tasks = loadBankTasks(EVAL_ROOT);
+  const tasks = loadBankTasks();
   const goldOf = (file) => readGold(readJson(path.join(EVAL_ROOT, file)), tasks);
   const goldInForce = goldOf(GOLD_FILE);
   const sensitivity = goldOf(GOLD_SENSITIVITY_FILE);

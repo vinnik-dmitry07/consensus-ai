@@ -12,6 +12,7 @@ import { EvalInvariantError } from './invariant.js';
 import { finalOrder, runComparison } from './a8Variants.js';
 import { compareReplayProfile, policyFrom, prepareFor } from './a8.js';
 import { capsFrom, profileDocument, STAGE_CAPS, streamTimeoutFor } from './a8Profile.js';
+import { FROZEN } from './a8TestFixtures.js';
 
 function stubSession() {
   return createSession({
@@ -20,12 +21,6 @@ function stubSession() {
     log() {},
   });
 }
-
-const FROZEN = {
-  councilModels: ['alpha/one', 'beta/two', 'gamma/three'],
-  chairmanModel: 'alpha/one',
-  bModel: 'alpha/one',
-};
 
 function taskWithGold(id, goldCanon) {
   return { id, split: 'dev', block: 'aime', stem: 'What is 1?', kind: 'integer', goldCanon, choiceCount: 0 };

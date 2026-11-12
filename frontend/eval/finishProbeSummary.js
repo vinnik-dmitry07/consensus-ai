@@ -13,10 +13,10 @@ import { budgetTotals, labelSpend, mergedSlots, stageIndex } from './finishProbe
 import {
   ARMS, COUNCIL, HY4, STAGE1, STEPFUN, V3_CAPS, allCells, handRecount, labelsOf, moneyOf, outcomesFor, stageCells, v3Paths,
 } from './finishProbeV3.js';
-import { ANALYSIS_LIMITS, median, placeAfter, placeAnalysis, readJson, readJsonl, rewriteFile, ruleFiles } from './noteTools.js';
+import {
+  ANALYSIS_LIMITS, attributedSection, median, placeAfter, placeAnalysis, readJson, readJsonl, rewriteFile, ruleFiles,
+} from './noteTools.js';
 import { readSlotJournal } from './runtime.js';
-
-export { median };
 
 const EVAL_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const RUNS_ROOT = path.join(EVAL_ROOT, '.runs');
@@ -462,14 +462,8 @@ export const SUMMARY_INSTRUCTION = [
   'Return only the text of the section.',
 ].join('\n');
 
-export function summaryAnalysisSection(text, check, writer, checker) {
-  return [
-    '#### Анализ серии',
-    '',
-    `_Текст написала модель ${writer} через OpenRouter по \`.runs/finish-probe-summary/report.md\` и правилам трёх раундов; модель ${checker} сверила его со сводкой (замечаний: ${check.problems.length}). Claude этот текст не писал и не правил._`,
-    '',
-    String(text).trim(),
-  ].join('\n');
+export function summaryAnalysisSection(record) {
+  return attributedSection('Анализ серии', '`.runs/finish-probe-summary/report.md` и правилам трёх раундов', 'со сводкой', record);
 }
 
 export function runSummaryAnalysis(paths = summaryPaths()) {
@@ -484,7 +478,7 @@ export function runSummaryAnalysis(paths = summaryPaths()) {
     start: ANALYSIS_START,
     end: ANALYSIS_END,
     after: README_END,
-    section: (record) => summaryAnalysisSection(record.text, record.check, record.writer, record.checker),
+    section: summaryAnalysisSection,
     showHeld: true,
   });
 }

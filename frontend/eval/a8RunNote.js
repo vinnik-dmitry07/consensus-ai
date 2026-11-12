@@ -4,26 +4,23 @@
 //
 //   node frontend/eval/a8RunNote.js --run a8-open-v6 [--readme]
 
-import { existsSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createCampaignBudget } from './budget.js';
-import { ANALYSIS_END as SUMMARY_ANALYSIS_END } from './finishProbeSummary.js';
-import { flagValue, placeAfter, readJson, readJsonl, rewriteFile } from './noteTools.js';
+import { questionRecords } from './campaignData.js';
+import { flagValue, placeAfter, readJson, readJsonl, rewriteFile, sectionMarkers } from './noteTools.js';
 import { readSlotJournal } from './runtime.js';
 
 const EVAL_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const RUNS_ROOT = path.join(EVAL_ROOT, '.runs');
 const README = path.join(EVAL_ROOT, 'README.md');
-export const AFTER = SUMMARY_ANALYSIS_END;
+// The note follows the analysis of the finish-probe summary.
+const AFTER = sectionMarkers('finish-probe-summary-analysis').end;
 
 const usd2 = (value) => `$${Number(value || 0).toFixed(2)}`;
 const short = (model) => String(model).split('/')[0];
-
-export function markers(run) {
-  return { start: `<!-- ${run}:start -->`, end: `<!-- ${run}:end -->` };
-}
 
 // Counts of the test journal by slot state; no field of a result is read.
 export function testCounts(slots) {
@@ -49,9 +46,7 @@ export function buildNote(run, root = RUNS_ROOT) {
   const testDir = path.join(dir, 'comparison', 'test');
   const slots = existsSync(path.join(testDir, 'events.jsonl')) ? [...readSlotJournal(path.join(testDir, 'events.jsonl')).values()] : [];
   // A question file holds the status of the question; only that field is read.
-  const questions = existsSync(testDir)
-    ? readdirSync(testDir).filter((name) => name.startsWith('test_') && name.endsWith('.json')).filter((name) => readJson(path.join(testDir, name))?.status === 'complete').length
-    : 0;
+  const questions = questionRecords(testDir, 'test_').filter((row) => row.status === 'complete').length;
   const budget = createCampaignBudget({ maxUsd: campaign.maxUsd, maxPosts: campaign.maxPosts, prices: {} });
   const events = readJsonl(path.join(dir, 'budget.jsonl'));
   budget.applyJournal(events);
@@ -101,7 +96,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const body = renderNote(note);
   writeFileSync(path.join(RUNS_ROOT, run, 'readme-note.md'), `${body}\n`, 'utf8');
   if (argv.includes('--readme')) {
-    const { start, end } = markers(run);
+    const { start, end } = sectionMarkers(run);
     rewriteFile(README, (text) => placeAfter(text, start, end, body, flagValue(argv, '--after') || AFTER));
   }
   console.log(body);

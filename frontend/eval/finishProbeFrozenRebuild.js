@@ -11,10 +11,11 @@
 //   node frontend/eval/finishProbeFrozenRebuild.js
 
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import { fileSha } from './noteTools.js';
 
 const EVAL_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const RUNS_ROOT = path.join(EVAL_ROOT, '.runs');
@@ -22,8 +23,6 @@ const LIVE = path.join(RUNS_ROOT, 'a8-open-v5e', 'reports', 'report-corrected.md
 const FROZEN = path.join(RUNS_ROOT, 'frozen-inputs', 'a8-open-v5e', 'report-corrected.md');
 const REDIRECT = path.join(EVAL_ROOT, 'frozenInputRedirect.mjs');
 const RUNS = Object.freeze(['finish-probe-v2', 'finish-probe-v3']);
-
-const fileSha = (file) => createHash('sha256').update(readFileSync(file)).digest('hex');
 
 // A node child that reads `live` as `frozen`.
 export function runRedirected(args, pairs, options = {}) {

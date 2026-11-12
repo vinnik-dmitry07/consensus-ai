@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { flagValue, mdTable, median, placeAfter, placeAnalysis, rewriteFile } from './noteTools.js';
+import { questionRecords } from './campaignData.js';
+import { attributedSection, flagValue, mdTable, median, placeAfter, placeAnalysis, rewriteFile, sectionMarkers } from './noteTools.js';
 
 let dir;
 afterEach(() => {
@@ -33,6 +34,21 @@ describe('note tools', () => {
     expect(readFileSync(file, 'utf8')).toBe('a\r\nc\r\n');
     expect(rewriteFile(file, (text) => text)).toBe(false);
     expect(mdTable(['x', 'y'], [[1, 2]])).toEqual(['| x | y |', '|---|---|', '| 1 | 2 |']);
+  });
+
+  it('names README markers by id and writes the attribution line of an analysis', () => {
+    expect(sectionMarkers('a8-open-v6')).toEqual({ start: '<!-- a8-open-v6:start -->', end: '<!-- a8-open-v6:end -->' });
+    const section = attributedSection('Анализ', '`r.md`', 'с отчётом', { text: ' body \n', check: { problems: [1] }, writer: 'w/m', checker: 'c/m' });
+    expect(section).toBe('#### Анализ\n\n_Текст написала модель w/m через OpenRouter по `r.md`; модель c/m сверила его с отчётом (замечаний: 1). Claude этот текст не писал и не правил._\n\nbody');
+  });
+
+  it('reads the question records of a phase by prefix, skipping files with no id', () => {
+    dir = mkdtempSync(path.join(tmpdir(), 'notes-'));
+    writeFileSync(path.join(dir, 'test_a.json'), JSON.stringify({ id: 'a', status: 'complete' }));
+    writeFileSync(path.join(dir, 'test_b.json'), JSON.stringify({ status: 'complete' }));
+    writeFileSync(path.join(dir, 'dev_c.json'), JSON.stringify({ id: 'c' }));
+    expect(questionRecords(dir, 'test_').map((row) => row.id)).toEqual(['a']);
+    expect(questionRecords(path.join(dir, 'missing'), 'test_')).toEqual([]);
   });
 
   it('writes analysis.md and places the section, or returns 2 when no text came back', async () => {

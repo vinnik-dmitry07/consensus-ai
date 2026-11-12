@@ -1,17 +1,15 @@
-// Helpers shared by the README-block, gate, route, and offline tools that sit
-// outside the frozen finish-probe files (V2_FILES, V3_FILES, V4_FILES) and
-// outside the a8 method hash (SOURCE_FILES in a8.js). Changing this file
-// changes no frozen hash.
+// README, flag, and analysis helpers shared by the tools that sit outside the
+// frozen finish-probe files (V2_FILES, V3_FILES, V4_FILES) and outside the a8
+// method hash (SOURCE_FILES in a8.js). Changing this file changes no frozen
+// hash. Readers of campaign data are in campaignData.js.
 
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
-import { canonAnswer } from './grade.js';
 import { replaceSection } from './report.js';
 
-const EVAL_ROOT = path.dirname(fileURLToPath(import.meta.url));
-
+export const fileSha = (file) => createHash('sha256').update(readFileSync(file)).digest('hex');
 export const readJson = (file, fallback = null) => (existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : fallback);
 export const readJsonl = (file) => (existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)) : []);
 export const envKey = () => String(process.env.or_key || process.env.OR_KEY || '').trim();
@@ -33,6 +31,11 @@ export function median(values) {
 // A markdown table: header row, separator, one row per list of cells.
 export function mdTable(header, body) {
   return [`| ${header.join(' | ')} |`, `|${header.map(() => '---').join('|')}|`, ...body.map((cells) => `| ${cells.join(' | ')} |`)];
+}
+
+// The markers of a README section; every section of the eval README has this form.
+export function sectionMarkers(id) {
+  return { start: `<!-- ${id}:start -->`, end: `<!-- ${id}:end -->` };
 }
 
 // The section between start and end replaced, or placed right after `after`.
@@ -78,6 +81,18 @@ export function ruleFiles(root, names) {
   return names.map((name) => `# File ${name}\n\n${readFileSync(path.join(root, name), 'utf8')}`).join('\n\n');
 }
 
+// The text of an analysis section with the line on who wrote and checked it:
+// `basis` is what the writer read, `against` what the checker compared it with.
+export function attributedSection(heading, basis, against, { text, check, writer, checker }) {
+  return [
+    `#### ${heading}`,
+    '',
+    `_Текст написала модель ${writer} через OpenRouter по ${basis}; модель ${checker} сверила его ${against} (замечаний: ${check.problems.length}). Claude этот текст не писал и не правил._`,
+    '',
+    String(text).trim(),
+  ].join('\n');
+}
+
 // One OpenRouter model writes the analysis, another checks it (evalAnalysis.js);
 // the section is then saved as analysis.md and placed in the README after
 // `after`. `section(record)` turns the record into the text of the section.
@@ -97,38 +112,4 @@ export async function placeAnalysis({ dir, instruction, rules, report, limits, r
   rewriteFile(readme, (text) => placeAfter(text, start, end, body, after));
   console.log('analysis placed in README');
   return 0;
-}
-
-// The bank of questions by id: the base bank and the a8 extension.
-export function loadBankTasks(root = EVAL_ROOT) {
-  const byId = new Map();
-  for (const name of ['bank.json', 'bank-a8x.json']) {
-    for (const item of JSON.parse(readFileSync(path.join(root, '.cache', name), 'utf8')).items) {
-      byId.set(`${item.split}:${item.dataset}:${item.sourceId}`, item);
-    }
-  }
-  return byId;
-}
-
-// Same reading of a corrections file as the campaign report: an entry either
-// replaces the gold or removes the question from the scored set. Keys that
-// start with $ are notes.
-export function readGold(entries, tasks) {
-  const gold = new Map();
-  const excluded = new Map();
-  const reasons = new Map();
-  for (const [id, entry] of Object.entries(entries)) {
-    if (id.startsWith('$')) continue;
-    const task = tasks.get(id);
-    if (!task) throw new Error(`Gold override for unknown question ${id}`);
-    reasons.set(id, entry?.reason || '');
-    if (entry?.exclude === true) {
-      excluded.set(id, entry.reason || '');
-      continue;
-    }
-    const canon = canonAnswer(String(entry?.gold ?? entry), task);
-    if (canon == null) throw new Error(`Gold override for ${id} does not read as a ${task.kind} answer`);
-    gold.set(id, canon);
-  }
-  return { gold, excluded, reasons };
 }

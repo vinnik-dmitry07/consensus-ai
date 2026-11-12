@@ -26,11 +26,9 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { LEGACY_BLOCKS } from '../a8Blocks.js';
-import { plurality } from '../grade.js';
+import { voteOf } from '../finishProbe.js';
 import { mdTable as table, placeAfter, rewriteFile } from '../noteTools.js';
-import { PLURALITY_SEED } from '../protocol.js';
 import { holm, mcnemarExact } from '../report.js';
-import { compareHash } from '../util.js';
 
 const EVAL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const DIR = path.join(EVAL_ROOT, '.runs', 'question-difficulty');
@@ -71,12 +69,10 @@ function credit(answers, gold) {
   return tied.includes(gold) ? 1 / tied.length : 0;
 }
 
-// The campaign's own vote over a fixed list of answers, and whether a tie
-// decided it.
+// The P8 vote over a fixed list of answers (seeded tie break, as the
+// campaign), and whether a tie decided it.
 function fixedVote(row, answers) {
-  const grades = answers.map((answer) => ({ status: answer == null ? 'parse_error' : 'graded', extracted: answer }));
-  const pick = (tied) => [...tied].sort((left, right) => compareHash(`${PLURALITY_SEED}\n${row.id}`, left, right))[0];
-  const vote = plurality(grades, pick);
+  const vote = voteOf(row.id, answers);
   return { right: vote.status === 'graded' && vote.extracted === row.gold ? 1 : 0, tie: Boolean(vote.tie) };
 }
 

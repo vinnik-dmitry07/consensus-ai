@@ -4,7 +4,7 @@ import { writeAndCheck, writerMessages } from './evalAnalysis.js';
 import { outcomeOf, placeBlock } from './finishProbeV3.js';
 import {
   AFTER_V3, ANALYSIS_END, ANALYSIS_START, GROUPS, README_END, README_START, STATUSES, SUMMARY_INSTRUCTION,
-  byGroup, byStatus, changedCells, correctnessTransitions, median, pricePerCorrect, summaryAnalysisSection, transitions,
+  byGroup, byStatus, changedCells, correctnessTransitions, pricePerCorrect, summaryAnalysisSection, transitions,
 } from './finishProbeSummary.js';
 
 const row = (v3, extra = {}) => ({ v3, correct: 0, posts: 1, cost: 0.01, completionTokens: 100, serviceMs: 1000, ...extra });
@@ -90,7 +90,6 @@ describe('finish probe summary: tables', () => {
     expect(price).toMatchObject({ n: 3, posted: 3, withoutCost: 1, accepted: 1, correct: 1 });
     expect(price.usd).toBeCloseTo(0.08, 10);
     expect(price.usdPerCorrect).toBeCloseTo(0.08, 10);
-    expect(median([3, 1, 2, 10])).toBe(2.5);
   });
 });
 
@@ -103,7 +102,7 @@ describe('finish probe summary: README', () => {
     const twice = placeBlock(once, README_START, README_END, 'two', AFTER_V3);
     expect(twice).not.toContain('one');
     expect(twice.split(README_START).length).toBe(2);
-    const section = summaryAnalysisSection('text', { problems: [] }, 'w/m', 'c/m');
+    const section = summaryAnalysisSection({ text: 'text', check: { problems: [] }, writer: 'w/m', checker: 'c/m' });
     const withAnalysis = placeBlock(twice, ANALYSIS_START, ANALYSIS_END, section, README_END);
     expect(withAnalysis.indexOf(ANALYSIS_START)).toBeGreaterThan(withAnalysis.indexOf(README_END));
     expect(section).toContain('замечаний: 0');

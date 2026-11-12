@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
-import { placeBefore, readGold, withLineEndings } from '../noteTools.js';
+import { readGold } from '../campaignData.js';
+import { placeBefore, withLineEndings } from '../noteTools.js';
 import {
   TARGET, engineReply, markers, rulesOf, scoreRow, sheepFits, shownCandidates, shownResponses, tally, variantsOf,
 } from './block_breakdown.js';
@@ -43,6 +44,8 @@ describe('block breakdown: gold variants', () => {
     expect(main.gold.get('test:set:a')).toBe('6');
     expect([...main.excluded.keys()]).toEqual(['test:set:b']);
     expect(main.reasons.get('test:set:b')).toBe('ill-posed');
+    expect(main.goldOf('test:set:a')).toBe('6');
+    expect(main.goldOf('test:set:c')).toBe(tasks.get('test:set:c').goldCanon);
     expect(() => readGold({ 'test:set:zzz': { gold: '1' } }, tasks)).toThrow(/unknown question/);
   });
 
