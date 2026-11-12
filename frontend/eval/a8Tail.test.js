@@ -10,10 +10,7 @@ import { createCampaignBudget } from './budget.js';
 import { runIsolated } from './questionScope.js';
 import { createSession, snapshotLocal } from './runtime.js';
 import { attemptStore, installTransport } from './transport.js';
-
-const COUNCIL = ['alpha/one', 'beta/two', 'gamma/three'];
-const FROZEN = { councilModels: COUNCIL, chairmanModel: COUNCIL[0], bModel: COUNCIL[0] };
-const PRICES = Object.fromEntries(COUNCIL.map((id) => [id, { prompt: '0.000001', completion: '0.000001' }]));
+import { COUNCIL, FROZEN, PRICES, stage2Answer } from './a8TestFixtures.js';
 const TASK = { id: 'test:arxiv:tail', split: 'test', block: 'arxiv', stem: 'What is 3/4 + 0?', kind: 'number', goldCanon: '3/4', choiceCount: 0 };
 
 const HEAD_SENTINEL = 'HEAD-OF-REASONING-SHOULD-NOT-PASS';
@@ -48,14 +45,6 @@ function done(content) {
     choices: [{ message: { content }, finish_reason: 'stop' }],
     usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30, cost: 0.0001 },
   }), { status: 200, headers: { 'content-type': 'application/json' } });
-}
-
-function stage2Answer(prompt) {
-  const head = prompt.split('Your task:')[0];
-  const labels = [...new Set([...head.matchAll(/Response (\d+)/g)].map((match) => `Response ${match[1]}`))];
-  const reviews = labels.map((label, index) => `${label}:\nReviewed.\nCorrectness: ${9 - index}/10\nIssues: none`);
-  const ranking = labels.map((label, index) => `${index + 1}. ${label}`).join('\n');
-  return `${reviews.join('\n\n')}\n\nDISPUTED CLAIMS:\nnone\n\nFINAL RANKING:\n${ranking}`;
 }
 
 describe('tail rule', () => {

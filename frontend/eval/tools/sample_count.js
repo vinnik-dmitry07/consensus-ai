@@ -25,7 +25,9 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { LEGACY_BLOCKS } from '../a8Blocks.js';
 import { plurality } from '../grade.js';
+import { mdTable as table, placeAfter, rewriteFile } from '../noteTools.js';
 import { PLURALITY_SEED } from '../protocol.js';
 import { holm, mcnemarExact } from '../report.js';
 import { compareHash } from '../util.js';
@@ -37,28 +39,12 @@ const README_START = '<!-- question-difficulty:start -->';
 const README_END = '<!-- question-difficulty:end -->';
 // The block goes after the last block of the README at the time it was added.
 const README_AFTER = '<!-- a8-open-v6:end -->';
-const LEGACY = ['aime', 'gpqa', 'mmlu'];
 const THEORY_P = [0.55, 0.6, 0.7, 0.8, 0.9];
 const THEORY_K = [1, 3, 5, 7, 9, 15, 25, 51, 101];
 const TARGET = 0.95;
 const POWER = 0.8;
 
 const pct = (value) => `${(100 * value).toFixed(1)}%`;
-const table = (header, body) => [
-  `| ${header.join(' | ')} |`, `|${header.map(() => '---').join('|')}|`, ...body.map((cells) => `| ${cells.join(' | ')} |`),
-];
-
-// Same placement as the other README blocks: replace the text between the
-// markers, or add the block after `after`, or at the end.
-function placeBlock(readme, start, end, body, after) {
-  const from = readme.indexOf(start);
-  const to = readme.indexOf(end);
-  if (from >= 0 && to > from) return `${readme.slice(0, from + start.length)}\n\n${body}\n\n${readme.slice(to)}`;
-  const at = readme.indexOf(after);
-  if (at < 0) return `${readme.replace(/\s*$/, '')}\n\n${start}\n\n${body}\n\n${end}\n`;
-  const cut = at + after.length;
-  return `${readme.slice(0, cut)}\n\n${start}\n\n${body}\n\n${end}${readme.slice(cut)}`;
-}
 
 function subsets(size, pick) {
   const out = [];
@@ -106,11 +92,29 @@ function majority(p, k) {
   return sum;
 }
 
+// The most wins the weaker arm can have among `pairs` discordant questions
+// while the exact two-sided McNemar test still gives p < 0.05 (-1: never).
+// p only grows with those wins, so a binary search finds the cut a scan from
+// zero would; it does not depend on the share, so it is kept per count.
+const cuts = new Map();
+function mcnemarCut(pairs) {
+  if (!cuts.has(pairs)) {
+    let low = -1;
+    let high = Math.floor(pairs / 2);
+    while (low < high) {
+      const mid = Math.floor((low + high + 1) / 2);
+      if (mcnemarExact(mid, pairs - mid).p < 0.05) low = mid;
+      else high = mid - 1;
+    }
+    cuts.set(pairs, low);
+  }
+  return cuts.get(pairs);
+}
+
 // Exact power of the two-sided McNemar test at 0.05 when `pairs` questions
 // disagree and the weaker arm takes the share `share` of them.
 function mcnemarPower(pairs, share) {
-  let cut = -1;
-  while (cut + 1 <= pairs / 2 && mcnemarExact(cut + 1, pairs - cut - 1).p < 0.05) cut += 1;
+  const cut = mcnemarCut(pairs);
   if (cut < 0) return 0;
   let power = 0;
   let mass = (1 - share) ** pairs;
@@ -190,12 +194,12 @@ function main() {
   const rows = report.test.filter((row) => !row.excluded).map((row) => {
     const answers = row.bAnswers;
     const byK = {};
+    const first = {};
     for (let k = 1; k <= answers.length; k += 1) {
       const sets = subsets(answers.length, k);
       byK[k] = sets.reduce((sum, set) => sum + credit(set.map((index) => answers[index]), row.gold), 0) / sets.length;
+      first[k] = fixedVote(row, answers.slice(0, k));
     }
-    const first = {};
-    for (let k = 1; k <= answers.length; k += 1) first[k] = fixedVote(row, answers.slice(0, k));
     return { ...row, byK, first, otherAnswers: row.others.map((item) => item.answer) };
   });
 
@@ -206,13 +210,14 @@ function main() {
   };
 
   const whole = [
-    ['Новые блоки', rows.filter((row) => !LEGACY.includes(row.block))],
-    ['Прежние блоки', rows.filter((row) => LEGACY.includes(row.block))],
+    ['Новые блоки', rows.filter((row) => !LEGACY_BLOCKS.includes(row.block))],
+    ['Прежние блоки', rows.filter((row) => LEGACY_BLOCKS.includes(row.block))],
     ['Все вопросы', rows],
   ];
   const borderline = rows.filter((row) => row.category === 'borderline');
   const mean = (list, valueOf) => list.reduce((sum, row) => sum + valueOf(row), 0) / list.length;
   const ks = [1, 2, 3, 4, 5];
+  const accuracyHeader = ['Набор', 'Вопросов', ...ks.map((k) => (k === 1 ? 'одна выборка' : `голос ${k}`)), 'S8 (синтез 5)', 'A8'];
   const accuracyRow = ([label, list]) => [
     label, list.length, ...ks.map((k) => pct(mean(list, (row) => row.byK[k]))),
     pct(mean(list, (row) => row.arms.S8)), pct(mean(list, (row) => row.arms.A8)),
@@ -220,8 +225,10 @@ function main() {
 
   // Borderline by attempts that are not scored.
   const size = rows[0].bAnswers.length;
+  const everything = Array.from({ length: size }, (_, index) => index);
+  const triples = subsets(size, 3);
   const heldOut = (scored) => {
-    const pickers = Array.from({ length: size }, (_, index) => index).filter((index) => !scored.includes(index));
+    const pickers = everything.filter((index) => !scored.includes(index));
     const group = { borderline: [], easy: [], unsolved: [] };
     for (const row of rows) {
       const picking = pickers.map((index) => row.bAnswers[index]).concat(row.otherAnswers);
@@ -245,8 +252,9 @@ function main() {
       unsolvedN: group.unsolved.length, unsolvedSingle: single(group.unsolved),
     };
   };
-  const fixedSplit = heldOut([0, 1, 2]);
-  const allSplits = subsets(size, 3).map((scored) => heldOut(scored));
+  // The first of the splits scores samples 1, 2, 3: the fixed split.
+  const allSplits = triples.map((scored) => heldOut(scored));
+  const fixedSplit = allSplits[0];
   const average = (valueOf) => allSplits.reduce((sum, item) => sum + valueOf(item), 0) / allSplits.length;
 
   const lines = [
@@ -265,15 +273,12 @@ function main() {
     '',
     'Голос k — среднее по всем наборам из k выборок (ничья даёт долю 1/t). S8 и A8 — сохранённые руки.',
     '',
-    ...table(
-      ['Набор', 'Вопросов', ...ks.map((k) => (k === 1 ? 'одна выборка' : `голос ${k}`)), 'S8 (синтез 5)', 'A8'],
-      whole.map(accuracyRow),
-    ),
+    ...table(accuracyHeader, whole.map(accuracyRow)),
     '',
     'Те же числа на пограничных вопросах. Эти вопросы отобраны по тем же выборкам, поэтому строка только описывает данные: вопросы, где голос пяти неверен, почти все ушли в не-решаемые, а где верны все выборки — в легко-решаемые.',
     '',
     ...table(
-      ['Набор', 'Вопросов', ...ks.map((k) => (k === 1 ? 'одна выборка' : `голос ${k}`)), 'S8 (синтез 5)', 'A8'],
+      accuracyHeader,
       [accuracyRow(['Пограничные', borderline]), accuracyRow(['Пограничные, где выборки B расходятся', rows.filter((row) => row.subtype === 'b_split')])],
     ),
     '',
@@ -318,19 +323,17 @@ function main() {
     const adjusted = holm(family.map((item) => item.p));
     family.forEach((item, index) => tests.push({ ...item, holm: adjusted[index] }));
   }
-  const mcnemarTable = () => table(
+  const mcnemarTable = table(
     ['Набор', 'Сравнение', 'Вопросов', 'Δ', 'Выигрыши / проигрыши', 'p', 'p по Холму', 'Без ничьих: выигрыши / проигрыши', 'p без ничьих'],
     tests.map((item) => [
       item.set, item.pair, item.n, `${(100 * item.delta).toFixed(1)} п.п.`, `${item.wins} / ${item.losses}`, item.p.toFixed(4), item.holm.toFixed(4),
       `${item.winsNoTie} / ${item.lossesNoTie}`, item.pNoTie.toFixed(4),
     ]),
   );
-  lines.push(...mcnemarTable());
+  lines.push(...mcnemarTable);
 
   // The fixed samples above are one choice among several. Every other choice.
   const voteOf = (indexes) => (row) => fixedVote(row, indexes.map((index) => row.bAnswers[index]));
-  const triples = subsets(size, 3);
-  const everything = Array.from({ length: size }, (_, index) => index);
   const tripleVsMember = triples.flatMap((triple) => triple.map((member) => compare(rows, voteOf(triple), voteOf([member]))));
   const fiveVsSingle = everything.map((member) => compare(rows, voteOf(everything), voteOf([member])));
   const fiveVsTriple = triples.map((triple) => compare(rows, voteOf(everything), voteOf(triple)));
@@ -339,7 +342,7 @@ function main() {
     label, list.length, span(list, (item) => item.winsNoTie), span(list, (item) => item.lossesNoTie),
     span(list, (item) => item.pNoTie, 4), list.filter((item) => item.pNoTie < 0.05).length,
   ];
-  const robustTable = () => table(
+  const robustTable = table(
     ['Сравнение', 'Вариантов', 'Выигрыши', 'Проигрыши', 'p', 'Вариантов с p < 0,05'],
     [
       spread('голос любых трёх против одной из них', tripleVsMember),
@@ -351,7 +354,7 @@ function main() {
     '',
     'Те же сравнения при любом выборе выборок, все вопросы, вопросы с ничьей выброшены:',
     '',
-    ...robustTable(),
+    ...robustTable,
     '',
     'Сколько из пяти выборок B верны на пограничных вопросах (описание данных, не проверка):',
     '',
@@ -387,7 +390,7 @@ function main() {
   const discordant = armPair.wins + armPair.losses;
   const rate = exactInterval(discordant, rows.length);
   const powerText = `p в паре зависит от числа вопросов, где руки разошлись. В этом тесте A8 и S8 разошлись на ${discordant} из ${rows.length} вопросов (${armPair.wins} в пользу A8, ${armPair.losses} в пользу S8, p = ${armPair.p.toFixed(4)}); 95% интервал для доли расхождений ${pct(rate.low)}–${pct(rate.high)}. Ниже — число расхождений, начиная с которого точный тест Макнемара даёт p < 0,05 с вероятностью не ниже ${pct(POWER)}, если слабая рука берёт указанную долю расхождений. Доли — сценарии, а не оценки: наблюдённое разбиение ${armPair.wins} к ${armPair.losses} совместимо и с равенством рук. Число вопросов пересчитано по наблюдённой доле расхождений и по краям её интервала.`;
-  const powerTable = () => table(
+  const powerTable = table(
     ['Доля расхождений у слабой руки', 'Нужно расхождений', 'Вопросов такого же состава', 'Диапазон по интервалу'],
     [0.4, 1 / 3, 0.25, 0.2, 0.1].map((share) => {
       const need = pairsNeeded(share);
@@ -403,7 +406,7 @@ function main() {
     '',
     powerText,
     '',
-    ...powerTable(),
+    ...powerTable,
     '',
     '## Проверки',
     '',
@@ -414,7 +417,6 @@ function main() {
 
   // The README block: the categories part written by question_difficulty.js,
   // then the part about the number of samples.
-  const accuracyHeader = ['Набор', 'Вопросов', ...ks.map((k) => (k === 1 ? 'одна выборка' : `голос ${k}`)), 'S8 (синтез 5)', 'A8'];
   const readmeSamples = [
     '#### Число выборок B',
     '',
@@ -426,15 +428,15 @@ function main() {
     '',
     'Точный двусторонний тест Макнемара, один ответ на вопрос. «Голос 1–3» — выборки 1, 2, 3 в порядке кампании; «выборка 1» — это рука B8. В столбце p ничья решена seeded hash кампании, в последних столбцах вопросы с ничьей выброшены. Поправка Холма — по семи сравнениям внутри набора.',
     '',
-    ...mcnemarTable(),
+    ...mcnemarTable,
     '',
     'Те же сравнения при любом выборе выборок, все вопросы, вопросы с ничьей выброшены:',
     '',
-    ...robustTable(),
+    ...robustTable,
     '',
     powerText,
     '',
-    ...powerTable(),
+    ...powerTable,
     '',
     'Ограничения: разбор сделан после результатов кампании и не был записан заранее; сравнения по числу выборок, отбор по отложенным попыткам и объединение новых и прежних блоков выбраны после первых подсчётов; p не поправлены на число наборов; тест Макнемара считает вопросы независимыми, а вопросы одного шаблона reasoning-gym могут быть зависимы; в `a8-open-v4` и `a8-strong-v1` ответы других моделей совета восстановлены из подсчёта голосов без имён моделей; прогон `main` на бесплатных моделях не входит. Это диагностика.',
   ].join('\n');
@@ -458,10 +460,8 @@ function main() {
   mkdirSync(DIR, { recursive: true });
   writeFileSync(path.join(DIR, 'readme-block.md'), `${block}\n`);
   if (process.argv.includes('--readme')) {
-    const text = readFileSync(README, 'utf8');
-    const next = placeBlock(text, README_START, README_END, block, README_AFTER);
-    if (next !== text) writeFileSync(README, next, 'utf8');
-    console.log(next === text ? 'README block unchanged' : 'README block placed');
+    const placed = rewriteFile(README, (text) => placeAfter(text, README_START, README_END, block, README_AFTER));
+    console.log(placed ? 'README block placed' : 'README block unchanged');
   }
   writeFileSync(path.join(DIR, 'samples.md'), lines.join('\n'));
   writeFileSync(path.join(DIR, 'samples.json'), `${JSON.stringify({

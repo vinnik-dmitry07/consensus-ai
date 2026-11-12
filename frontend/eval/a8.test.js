@@ -112,27 +112,8 @@ describe('A8 comparison', () => {
       calls.push({ model, content: messages?.[0]?.content || '' });
       return { ok: true, content: 'ANSWER: 1', usage: { cost: 0.01 } };
     });
-    const runDir = mkdtempSync(path.join(tmpdir(), 'a8-'));
-    const session = createSession({
-      runDir,
-      budget: { state: { paused: false, pauseReason: null }, lockFatal() {} },
-      log() {},
-    });
-    const task = {
-      id: 'dev:aime:1',
-      split: 'dev',
-      block: 'aime',
-      stem: 'What is 1?',
-      kind: 'integer',
-      goldCanon: 'GOLD-TOKEN-99',
-      choiceCount: 0,
-    };
-    const frozen = {
-      councilModels: ['alpha/one', 'beta/two', 'gamma/three'],
-      chairmanModel: 'alpha/one',
-      bModel: 'alpha/one',
-    };
-    const outcome = await runComparison(task, session, frozen);
+    const task = taskWithGold('dev:aime:1', 'GOLD-TOKEN-99');
+    const outcome = await runComparison(task, stubSession(), FROZEN);
     expect(outcome.status).toBe('complete');
     expect(calls).toHaveLength(12);
     expect(calls.filter((call) => call.model === 'alpha/one').length).toBeGreaterThan(0);
@@ -162,26 +143,7 @@ describe('A8 comparison', () => {
       }
       return { ok: true, content: 'ANSWER: 1', usage: { cost: 0.01 } };
     });
-    const runDir = mkdtempSync(path.join(tmpdir(), 'a8-'));
-    const session = createSession({
-      runDir,
-      budget: { state: { paused: false, pauseReason: null }, lockFatal() {} },
-      log() {},
-    });
-    const task = {
-      id: 'dev:aime:2',
-      split: 'dev',
-      block: 'aime',
-      stem: 'What is 1?',
-      kind: 'integer',
-      goldCanon: '1',
-      choiceCount: 0,
-    };
-    const outcome = await runComparison(task, session, {
-      councilModels: ['alpha/one', 'beta/two', 'gamma/three'],
-      chairmanModel: 'alpha/one',
-      bModel: 'alpha/one',
-    });
+    const outcome = await runComparison(taskWithGold('dev:aime:2', '1'), stubSession(), FROZEN);
     expect(outcome.status).toBe('complete');
     expect(outcome.arms.S8.reason).toBe('incomplete_samples');
     expect(outcome.arms.S8.correct).toBe(0);

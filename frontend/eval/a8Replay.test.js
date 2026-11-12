@@ -14,10 +14,7 @@ import { runIsolated } from './questionScope.js';
 import { createGate, createSession, slotKey, snapshotLocal } from './runtime.js';
 import { attemptStore, installTransport } from './transport.js';
 import { sha256, stableStringify } from './util.js';
-
-const COUNCIL = ['alpha/one', 'beta/two', 'gamma/three'];
-const FROZEN = { councilModels: COUNCIL, chairmanModel: COUNCIL[0], bModel: COUNCIL[0] };
-const PRICES = Object.fromEntries(COUNCIL.map((id) => [id, { prompt: '0.000001', completion: '0.000001' }]));
+import { COUNCIL, FROZEN, PRICES, stage2Answer } from './a8TestFixtures.js';
 const TASK = {
   id: 'test:aime:replay',
   split: 'test',
@@ -43,14 +40,6 @@ function reply(content, status = 200) {
     choices: [{ message: { content }, finish_reason: 'stop' }],
     usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6, cost: 0.0001 },
   }), { status, headers: { 'content-type': 'application/json' } });
-}
-
-function stage2Answer(prompt) {
-  const head = prompt.split('Your task:')[0];
-  const labels = [...new Set([...head.matchAll(/Response (\d+)/g)].map((match) => `Response ${match[1]}`))];
-  const reviews = labels.map((label, index) => `${label}:\nReviewed.\nCorrectness: ${9 - index}/10\nIssues: none`);
-  const ranking = labels.map((label, index) => `${index + 1}. ${label}`).join('\n');
-  return `${reviews.join('\n\n')}\n\nDISPUTED CLAIMS:\nnone\n\nFINAL RANKING:\n${ranking}`;
 }
 
 // Models finish in a different order from the roster, so the test notices a

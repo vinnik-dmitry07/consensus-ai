@@ -4,17 +4,14 @@
 //
 //   node frontend/eval/a8RunNote.js --run a8-open-v6 [--readme]
 
-import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createCampaignBudget } from './budget.js';
 import { ANALYSIS_END as SUMMARY_ANALYSIS_END } from './finishProbeSummary.js';
-import { flagValue, placeAfter, readJson, readJsonl } from './noteTools.js';
+import { flagValue, placeAfter, readJson, readJsonl, rewriteFile } from './noteTools.js';
 import { readSlotJournal } from './runtime.js';
-
-// tools/block_breakdown.js imports placeAfter from here.
-export { placeAfter };
 
 const EVAL_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const RUNS_ROOT = path.join(EVAL_ROOT, '.runs');
@@ -105,9 +102,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   writeFileSync(path.join(RUNS_ROOT, run, 'readme-note.md'), `${body}\n`, 'utf8');
   if (argv.includes('--readme')) {
     const { start, end } = markers(run);
-    const text = readFileSync(README, 'utf8');
-    const next = placeAfter(text, start, end, body, flagValue(argv, '--after') || AFTER);
-    if (next !== text) writeFileSync(README, next, 'utf8');
+    rewriteFile(README, (text) => placeAfter(text, start, end, body, flagValue(argv, '--after') || AFTER));
   }
   console.log(body);
 }

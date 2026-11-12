@@ -17,9 +17,7 @@ import { fileURLToPath } from 'node:url';
 
 import { parseCorrectnessScores, parseRankingFromText } from '../../src/engine/browser/council.js';
 import { BLOCK_LABELS, orderBlocks } from '../a8Blocks.js';
-import { placeAfter } from '../a8RunNote.js';
-import { canonAnswer } from '../grade.js';
-import { replaceSection } from '../report.js';
+import { loadBankTasks, placeAnalysis, placeBefore, readGold, rewriteFile } from '../noteTools.js';
 
 const EVAL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const RUNS = path.join(EVAL_ROOT, '.runs');
@@ -40,12 +38,17 @@ export const TARGET = Object.freeze({
     'test:livemath-202505:q69bbd425dbba': '1023',
     'test:livemath-202505:qfa1834ca36fa': 'Мерлин',
   }),
+  // The code checks of the block, by question.
+  checks: Object.freeze({
+    composite: 'test:livemath-202505:qc3e6b97f72eb',
+    sheep: 'test:livemath-202505:qd95a2526ee6c',
+  }),
 });
 
 // Each call carries two README sections and the report with its appendix, so
 // its reserve alone is near $0.4: a $0.5 ceiling let the writer through and
 // refused the checker. A call settles at well under a tenth of that reserve.
-export const ANALYSIS_LIMITS = Object.freeze({ maxUsd: 1, maxPosts: 8 });
+const ANALYSIS_LIMITS = Object.freeze({ maxUsd: 1, maxPosts: 8 });
 // The campaign rules the analysis models get: this README section, up to the results.
 const RULES_FROM = '### a8-open-v5: общий максимальный лимит, новые блоки, защита от цикла';
 const RULES_TO = '### Итоги a8-open-v5e';
@@ -62,6 +65,7 @@ const readJson = (file) => JSON.parse(readFileSync(file, 'utf8'));
 const nameOf = (model) => MODEL_NAMES[String(model).split('/')[0]] || String(model).split('/')[0];
 const pct = (count, total) => (total ? `${(100 * count / total).toFixed(1)}%` : 'n/a');
 const finishOf = (slot) => slot?.result?.finishReason ?? slot?.finishReason ?? null;
+const finishRu = (finish) => FINISH_RU[finish] || finish;
 const tokensOf = (slot) => slot?.usage?.completion_tokens ?? slot?.result?.usage?.completion_tokens ?? null;
 
 export function markers(target = TARGET) {
@@ -72,38 +76,6 @@ export function markers(target = TARGET) {
     analysisStart: `<!-- ${tag}-analysis:start -->`,
     analysisEnd: `<!-- ${tag}-analysis:end -->`,
   };
-}
-
-function loadTasks() {
-  const byId = new Map();
-  for (const name of ['bank.json', 'bank-a8x.json']) {
-    for (const item of readJson(path.join(EVAL_ROOT, '.cache', name)).items) {
-      byId.set(`${item.split}:${item.dataset}:${item.sourceId}`, item);
-    }
-  }
-  return byId;
-}
-
-// Same reading of a corrections file as the campaign report: an entry either
-// replaces the gold or removes the question from the scored set.
-export function readGold(entries, tasks) {
-  const gold = new Map();
-  const excluded = new Map();
-  const reasons = new Map();
-  for (const [id, entry] of Object.entries(entries)) {
-    if (id.startsWith('$')) continue;
-    const task = tasks.get(id);
-    if (!task) throw new Error(`Gold override for unknown question ${id}`);
-    reasons.set(id, entry?.reason || '');
-    if (entry?.exclude === true) {
-      excluded.set(id, entry.reason || '');
-      continue;
-    }
-    const canon = canonAnswer(String(entry?.gold ?? entry), task);
-    if (canon == null) throw new Error(`Gold override for ${id} does not read as a ${task.kind} answer`);
-    gold.set(id, canon);
-  }
-  return { gold, excluded, reasons };
 }
 
 // The gold variants, from the report as run to every correction at once.
@@ -300,11 +272,11 @@ function shortId(id) {
   return String(id).split(':').pop().slice(0, 5);
 }
 
-export async function buildData(target = TARGET) {
+async function buildData(target = TARGET) {
   const dir = path.join(RUNS, target.run);
   const campaign = readJson(path.join(dir, 'campaign.json'));
   const selection = readJson(path.join(dir, 'selection.json'));
-  const tasks = loadTasks();
+  const tasks = loadBankTasks(EVAL_ROOT);
   const main = readGold(readJson(path.join(EVAL_ROOT, target.goldFile)), tasks);
   const wide = readGold(readJson(path.join(EVAL_ROOT, target.wideFile)), tasks);
   const variants = variantsOf(target, tasks, main, wide);
@@ -325,7 +297,6 @@ export async function buildData(target = TARGET) {
   const blockIds = new Set(inBlock.map((row) => row.id));
   const slots = await readSlots(path.join(testDir, 'events.jsonl'), (id) => blockIds.has(id));
   const calls = callsByQuestion(slots);
-  const blockOf = new Map(rows.map((row) => [row.id, row.block]));
   const label = (id) => (target.names[id] ? `${target.names[id]} (\`${shortId(id)}\`)` : `\`${shortId(id)}\``);
 
   const variantTable = variants.map((variant) => {
@@ -348,8 +319,9 @@ export async function buildData(target = TARGET) {
   const scoredMain = new Map(rows.filter((row) => !mainVariant.excluded.has(row.id)).map((row) => [row.id, scoreRow(row, mainVariant.gold(row.id))]));
   const answersOf = (row) => council.map((model, index) => ({ model, answer: row.diagnostics?.councilAnswers?.[index] ?? null }));
   const differ = (row) => new Set((row.diagnostics?.councilAnswers || []).filter((answer) => answer != null)).size >= 2;
-  const armCell = (row, arm) => ({ status: row.arms[arm].status, extracted: row.arms[arm].extracted ?? null });
   const synth = (slot) => ({ finish: finishOf(slot), tokens: tokensOf(slot) });
+  // The A8 or S8 arm of a row as stored, with its synthesis call.
+  const armCell = (row, arm, slot) => ({ status: row.arms[arm].status, extracted: row.arms[arm].extracted ?? null, ...synth(slot) });
 
   const misses = [];
   const judges = [];
@@ -367,8 +339,8 @@ export async function buildData(target = TARGET) {
         gold: mainVariant.gold(row.id),
         council: answersOf(row),
         leader: row.diagnostics?.leader?.extracted ?? null,
-        A8: { ...armCell(row, 'A8'), right: score.arms.A8, ...synth(own.A8) },
-        S8: { ...armCell(row, 'S8'), right: score.arms.S8, ...synth(own.S8) },
+        A8: { ...armCell(row, 'A8', own.A8), right: score.arms.A8 },
+        S8: { ...armCell(row, 'S8', own.S8), right: score.arms.S8 },
         samples: row.diagnostics?.replicateAnswers || [],
         stops: { stage1: stops(stage1), samples: stops(samples), judges: stops(own.judges) },
       });
@@ -388,8 +360,7 @@ export async function buildData(target = TARGET) {
         stem: tasks.get(row.id).stem,
         stage1: stage1.map((slot, index) => ({ model: slot.meta.model, finish: finishOf(slot), answer: row.diagnostics?.councilAnswers?.[index] ?? null, text: slot.result?.content || '' })),
         judges: own.judges.map((slot) => ({ model: slot.meta.model, finish: finishOf(slot), text: slot.result?.content || '' })),
-        A8: { finish: finishOf(own.A8), tokens: tokensOf(own.A8), status: row.arms.A8.status, text: own.A8.result?.content || '' },
-        S8: { finish: finishOf(own.S8), tokens: tokensOf(own.S8), status: row.arms.S8.status, text: own.S8.result?.content || '' },
+        ...Object.fromEntries(['A8', 'S8'].map((arm) => [arm, { ...synth(own[arm]), status: row.arms[arm].status, text: own[arm].result?.content || '' }])),
       });
     }
   }
@@ -397,11 +368,10 @@ export async function buildData(target = TARGET) {
   // The same counts for every primary block, under the main variant.
   const blocks = orderBlocks(primary).map((block) => {
     const kept = rows.filter((row) => row.block === block && scoredMain.has(row.id));
-    const out = { block, n: kept.length, wins: 0, losses: 0, differ: 0, differLeader: 0, differA8: 0, differS8: 0, missedRight: 0, fixed: 0, broke: 0 };
+    const { wins, losses } = tally(kept.map((row) => scoredMain.get(row.id)));
+    const out = { block, n: kept.length, wins, losses, differ: 0, differLeader: 0, differA8: 0, differS8: 0, missedRight: 0, fixed: 0, broke: 0 };
     for (const row of kept) {
       const score = scoredMain.get(row.id);
-      if (score.arms.A8 > score.arms.S8) out.wins += 1;
-      if (score.arms.A8 < score.arms.S8) out.losses += 1;
       if (differ(row)) {
         out.differ += 1;
         out.differLeader += score.leader;
@@ -412,18 +382,20 @@ export async function buildData(target = TARGET) {
       if (!score.leader && score.arms.A8) out.fixed += 1;
       if (score.leader && !score.arms.A8) out.broke += 1;
     }
-    out.stage1 = council.map((model) => ({
-      model,
-      ...stops(slots.filter((slot) => blockOf.get(slot.meta.questionId) === block && scoredMain.has(slot.meta.questionId) && slot.meta.branch === 'council' && slot.meta.stage === 'stage1' && slot.meta.model === model)),
-    }));
+    const stage1 = kept.flatMap((row) => calls.get(row.id)?.stage1 ?? []);
+    out.stage1 = council.map((model) => ({ model, ...stops(stage1.filter((slot) => slot.meta.model === model)) }));
     return out;
   });
 
   const checks = [];
-  const jana = inBlock.find((row) => target.names[row.id] === 'Jana');
-  if (jana) checks.push({ kind: 'composite', id: jana.id, answers: answersOf(jana).map((item) => ({ ...item, next: Number(item.answer) + 1, composite: isComposite(Number(item.answer) + 1) })) });
-  const sheep = inBlock.find((row) => target.names[row.id] === 'овцы');
-  if (sheep) checks.push({ kind: 'sheep', id: sheep.id, fits: sheepFits() });
+  const inBlockRow = (kind) => {
+    const found = inBlock.find((row) => row.id === target.checks[kind]);
+    if (!found) throw new Error(`${target.checks[kind]} (${kind} check) is not a question of ${target.block}`);
+    return found;
+  };
+  const jana = inBlockRow('composite');
+  checks.push({ kind: 'composite', id: jana.id, answers: answersOf(jana).map((item) => ({ ...item, next: Number(item.answer) + 1, composite: isComposite(Number(item.answer) + 1) })) });
+  checks.push({ kind: 'sheep', id: inBlockRow('sheep').id, fits: sheepFits() });
 
   return {
     target,
@@ -449,14 +421,14 @@ function armText(cell) {
 }
 
 function synthText(cell) {
-  return `${FINISH_RU[cell.finish] || cell.finish}${cell.tokens ? `, ${cell.tokens}` : ''}`;
+  return `${finishRu(cell.finish)}${cell.tokens ? `, ${cell.tokens}` : ''}`;
 }
 
 function stopsText(item) {
   return `${item.cap}/${item.n}${item.loop ? ` и цикл ${item.loop}` : ''}`;
 }
 
-export function renderBlock(data) {
+function renderBlock(data) {
   const { target, label, config } = data;
   const title = BLOCK_LABELS[target.block] || target.block;
   const lines = [
@@ -540,21 +512,21 @@ function clip(text, max) {
 // The block and, for the questions where the two arms differ, the stored texts
 // the analysis models may quote from. A call cut before a final answer holds
 // its reasoning, not an answer, so only its ending is given.
-export function renderReport(data) {
+function renderReport(data) {
   const { label } = data;
   const lines = [renderBlock(data), '', '## Приложение: сохранённые тексты по вопросам, где A8 и S8 разошлись (основной вариант)'];
-  const body = (item, max) => (item.finish === 'stop' ? clip(item.text, max) : `[вызов кончился так: ${FINISH_RU[item.finish] || item.finish}; текст ниже — конец того, что он успел выдать]\n${clip(item.text, max).slice(-1500)}`);
+  const body = (item, max) => (item.finish === 'stop' ? clip(item.text, max) : `[вызов кончился так: ${finishRu(item.finish)}; текст ниже — конец того, что он успел выдать]\n${clip(item.text, max).slice(-1500)}`);
   for (const item of data.appendix) {
     lines.push('', `### ${label(item.id)}`, '', 'Условие:', '', item.stem.trim());
-    for (const call of item.stage1) lines.push('', `Ответ Stage 1, ${nameOf(call.model)} (${FINISH_RU[call.finish] || call.finish}; разобранный ответ: ${shortAnswer(call.answer)}):`, '', body(call, 3000));
-    for (const call of item.judges) lines.push('', `Судья ${nameOf(call.model)} (${FINISH_RU[call.finish] || call.finish}):`, '', clip(call.text, 6000));
+    for (const call of item.stage1) lines.push('', `Ответ Stage 1, ${nameOf(call.model)} (${finishRu(call.finish)}; разобранный ответ: ${shortAnswer(call.answer)}):`, '', body(call, 3000));
+    for (const call of item.judges) lines.push('', `Судья ${nameOf(call.model)} (${finishRu(call.finish)}):`, '', clip(call.text, 6000));
     lines.push('', `Председатель A8 (${synthText(item.A8)}; оценка: ${item.A8.status}):`, '', body(item.A8, 5000));
     lines.push('', `Синтез S8 (${synthText(item.S8)}; оценка: ${item.S8.status}):`, '', body(item.S8, 5000));
   }
   return lines.join('\n');
 }
 
-export const INSTRUCTION = [
+const INSTRUCTION = [
   'You analyse one block of a finished paid evaluation campaign for the README of the project. Given below as data: under PROTOCOL, the README sections with the rules of the campaign and with its results as written so far; under REPORT, a report on the block built by code, with stored texts in its appendix.',
   'Write the body of a section titled "Анализ", in Russian, 250 to 450 words, as short paragraphs or a short list. No heading: the heading is added separately.',
   'Use only numbers that appear in the report. Do not introduce any other number.',
@@ -564,7 +536,7 @@ export const INSTRUCTION = [
   'Return only the text of the section.',
 ].join('\n');
 
-export function analysisSection(target, text, check, writer, checker) {
+function analysisSection(target, text, check, writer, checker) {
   return [
     '#### Анализ блока',
     '',
@@ -572,34 +544,6 @@ export function analysisSection(target, text, check, writer, checker) {
     '',
     String(text).trim(),
   ].join('\n');
-}
-
-// Markers already in the README are refilled; otherwise the block goes right
-// before the heading that follows the results of the campaign.
-export function placeBefore(readme, start, end, body, before) {
-  const replaced = replaceSection(readme, start, end, `\n${body}\n`);
-  if (replaced != null) return replaced;
-  const at = readme.indexOf(before);
-  if (at < 0) throw new Error(`${before} is not in the README`);
-  return `${readme.slice(0, at)}${start}\n\n${body}\n\n${end}\n\n${readme.slice(at)}`;
-}
-
-// The README keeps the line endings it has (a checkout may hold it with CRLF):
-// the change is made on an LF copy and written back in the file's own form.
-// Content that comes out the same is not written at all.
-const readReadme = () => readFileSync(README, 'utf8').replace(/\r\n/g, '\n');
-
-export function withLineEndings(original, change) {
-  const before = original.replace(/\r\n/g, '\n');
-  const after = change(before);
-  if (after === before) return original;
-  return original.includes('\r\n') ? after.replace(/\n/g, '\r\n') : after;
-}
-
-function rewriteReadme(change) {
-  const original = readFileSync(README, 'utf8');
-  const next = withLineEndings(original, change);
-  if (next !== original) writeFileSync(README, next, 'utf8');
 }
 
 // What the analysis models get as rules: the campaign section of the README
@@ -617,33 +561,25 @@ export function rulesOf(readme, start) {
   ].join('\n\n');
 }
 
-async function runBlockAnalysis(target) {
-  const { runAnalysis } = await import('../evalAnalysis.js');
+function runBlockAnalysis(target) {
   const reportFile = path.join(RUNS, target.run, 'reports', `block-${target.block}.md`);
   if (!existsSync(reportFile)) throw new Error('Build the block first (run without --analysis).');
   const { start, end, analysisStart, analysisEnd } = markers(target);
-  const readme = readReadme();
+  const readme = readFileSync(README, 'utf8').replace(/\r\n/g, '\n');
   if (!readme.includes(end)) throw new Error('Place the block first (--readme).');
-  const out = path.join(RUNS, target.run, `analysis-block-${target.block}`);
-  const record = await runAnalysis({
-    dir: out,
+  return placeAnalysis({
+    dir: path.join(RUNS, target.run, `analysis-block-${target.block}`),
     instruction: INSTRUCTION,
     rules: rulesOf(readme, start),
     report: readFileSync(reportFile, 'utf8'),
     limits: ANALYSIS_LIMITS,
-    key: String(process.env.or_key || process.env.OR_KEY || '').trim(),
     label: `block-${target.block}`,
+    readme: README,
+    start: analysisStart,
+    end: analysisEnd,
+    after: end,
+    section: (record) => analysisSection(target, record.text, record.check, record.writer, record.checker),
   });
-  console.log(`analysis spend: settled $${record.spend.settledUsd.toFixed(4)}, ${record.spend.posts} POSTs`);
-  if (!record.text) {
-    console.log(`analysis not placed: ${record.reason}`);
-    return 2;
-  }
-  const body = analysisSection(target, record.text, record.check, record.writer, record.checker);
-  writeFileSync(path.join(out, 'analysis.md'), `${body}\n`, 'utf8');
-  rewriteReadme((text) => placeAfter(text, analysisStart, analysisEnd, body, end));
-  console.log('analysis placed in README');
-  return 0;
 }
 
 async function main(argv) {
@@ -657,8 +593,10 @@ async function main(argv) {
   mkdirSync(reports, { recursive: true });
   writeFileSync(path.join(reports, `block-${TARGET.block}.md`), `${renderReport(data)}\n`, 'utf8');
   if (argv.includes('--readme')) {
+    // Markers already in the README are refilled; otherwise the block goes
+    // right before the heading that follows the results of the campaign.
     const { start, end } = markers(TARGET);
-    rewriteReadme((text) => placeBefore(text, start, end, block, BEFORE));
+    rewriteFile(README, (text) => placeBefore(text, start, end, block, BEFORE));
   }
   console.log(block);
   return 0;

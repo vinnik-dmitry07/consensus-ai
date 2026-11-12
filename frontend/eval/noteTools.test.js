@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { flagValue, median, placeAfter, placeAnalysis } from './noteTools.js';
+import { flagValue, mdTable, median, placeAfter, placeAnalysis, rewriteFile } from './noteTools.js';
 
 let dir;
 afterEach(() => {
@@ -23,6 +23,16 @@ describe('note tools', () => {
     expect(once).toBe('top\n<!-- a -->\n\n<!-- s -->\n\none\n\n<!-- e -->\nend\n');
     expect(placeAfter(once, '<!-- s -->', '<!-- e -->', 'two', '<!-- a -->')).toBe('top\n<!-- a -->\n\n<!-- s -->\n\ntwo\n\n<!-- e -->\nend\n');
     expect(() => placeAfter('no anchor', '<!-- s -->', '<!-- e -->', 'x', '<!-- a -->')).toThrow('is not in the README');
+  });
+
+  it('keeps a file in its own line endings and leaves an unchanged file alone', () => {
+    dir = mkdtempSync(path.join(tmpdir(), 'notes-'));
+    const file = path.join(dir, 'README.md');
+    writeFileSync(file, 'a\r\nb\r\n');
+    expect(rewriteFile(file, (text) => text.replace('b', 'c'))).toBe(true);
+    expect(readFileSync(file, 'utf8')).toBe('a\r\nc\r\n');
+    expect(rewriteFile(file, (text) => text)).toBe(false);
+    expect(mdTable(['x', 'y'], [[1, 2]])).toEqual(['| x | y |', '|---|---|', '| 1 | 2 |']);
   });
 
   it('writes analysis.md and places the section, or returns 2 when no text came back', async () => {

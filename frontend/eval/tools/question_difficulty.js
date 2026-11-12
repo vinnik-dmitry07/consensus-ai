@@ -19,8 +19,10 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { canonAnswer, gradeResponse } from '../grade.js';
-import { BLOCK_LABELS, BLOCK_ORDER } from '../a8Blocks.js';
+import { gradeResponse } from '../grade.js';
+import { BLOCK_LABELS, BLOCK_ORDER, LEGACY_BLOCKS, orderBlocks } from '../a8Blocks.js';
+import { flagValue, loadBankTasks, mdTable as table, readGold } from '../noteTools.js';
+import { readSlotMap } from '../runtime.js';
 
 const EVAL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const RUNS = path.join(EVAL_ROOT, '.runs');
@@ -44,44 +46,14 @@ const SUBTYPE_RU = {
   b_wrong: 'все выборки B неверны, права другая модель совета',
 };
 
-function flag(argv, name, fallback = null) {
-  const at = argv.indexOf(name);
-  return at >= 0 && at + 1 < argv.length ? argv[at + 1] : fallback;
-}
-
 function readJson(file) {
   return JSON.parse(readFileSync(file, 'utf8'));
 }
 
-function loadTasks() {
-  const byId = new Map();
-  for (const name of ['bank.json', 'bank-a8x.json']) {
-    for (const item of readJson(path.join(EVAL_ROOT, '.cache', name)).items) {
-      byId.set(`${item.split}:${item.dataset}:${item.sourceId}`, item);
-    }
-  }
-  return byId;
-}
-
-// Same reading of the corrections file as the campaign report: an entry either
-// replaces the gold or removes the question from the scored set.
-function loadGold(tasks, file) {
-  const gold = new Map();
-  const excluded = new Map();
-  for (const [id, entry] of Object.entries(readJson(path.join(EVAL_ROOT, file)))) {
-    if (id.startsWith('$')) continue;
-    const task = tasks.get(id);
-    if (!task) throw new Error(`Gold override for unknown question ${id}`);
-    if (entry?.exclude === true) {
-      excluded.set(id, entry.reason || '');
-      continue;
-    }
-    const canon = canonAnswer(String(entry?.gold ?? entry), task);
-    if (canon == null) throw new Error(`Gold override for ${id} does not read as a ${task.kind} answer`);
-    gold.set(id, canon);
-  }
-  return { gold, excluded };
-}
+// An attempt is right when its canonical answer equals the gold in force.
+const isRight = (answer, gold) => answer != null && answer === gold;
+const isPrimary = (row) => !LEGACY_BLOCKS.includes(row.block);
+const isLegacy = (row) => !isPrimary(row);
 
 function recordsIn(dir, prefix) {
   if (!existsSync(dir)) return [];
@@ -170,11 +142,11 @@ function fromStoredAnswers(run, tasks, goldInForce, slack, checks) {
       checks.regradedSamples += 1;
       if (again !== samples[index]) checks.regradeMismatch += 1;
     });
-    const attempts = samples.map((answer) => ({ model: selection.b, answer, right: answer != null && answer === gold }));
+    const attempts = samples.map((answer) => ({ model: selection.b, answer, right: isRight(answer, gold) }));
     selection.council.forEach((model, index) => {
       if (index === bIndex) return;
       const answer = council[index];
-      attempts.push({ model, answer, right: answer != null && answer === gold });
+      attempts.push({ model, answer, right: isRight(answer, gold) });
     });
     const arms = {};
     for (const arm of ['A8', 'S8', 'P8', 'B8']) arms[arm] = regradeArm(row.arms?.[arm], gold);
@@ -219,7 +191,7 @@ function fromTexts(run, tasks, goldInForce, slack, checks) {
         const storedAnswer = stored?.status === 'graded' ? stored.extracted : null;
         if (storedAnswer !== answer) checks.oldSample1Mismatch += 1;
       }
-      attempts.push({ model: selection.b, answer, right: answer != null && answer === gold });
+      attempts.push({ model: selection.b, answer, right: isRight(answer, gold) });
     });
     const incompleteCouncil = row.arms?.A8?.reason === 'incomplete_council';
     const vote = diagnostics.councilVote;
@@ -249,13 +221,7 @@ function fromTexts(run, tasks, goldInForce, slack, checks) {
 // Every Stage 1 answer and B sample that came back in the test phase of a
 // campaign, graded from its text, with the reason the stream ended.
 function slotAttempts(run, tasks, goldOf) {
-  const file = path.join(RUNS, run, 'comparison', 'test', 'events.jsonl');
-  const slots = new Map();
-  for (const line of readFileSync(file, 'utf8').split('\n')) {
-    if (!line.trim()) continue;
-    const event = JSON.parse(line);
-    if (event.kind === 'slot' && event.key) slots.set(event.key, event.slot);
-  }
+  const slots = readSlotMap(path.join(RUNS, run, 'comparison', 'test', 'events.jsonl'));
   const perQuestion = new Map();
   const seen = new Set();
   const finish = {};
@@ -274,7 +240,7 @@ function slotAttempts(run, tasks, goldOf) {
     finish[reason] = (finish[reason] || 0) + 1;
     if (!perQuestion.has(meta.questionId)) perQuestion.set(meta.questionId, []);
     perQuestion.get(meta.questionId).push({
-      model: meta.model, answer, right: answer != null && answer === goldOf(meta.questionId, task), finishReason: reason,
+      model: meta.model, answer, right: isRight(answer, goldOf(meta.questionId, task)), finishReason: reason,
     });
   }
   return { perQuestion, finish };
@@ -338,6 +304,8 @@ const pct = (part, whole) => (whole ? `${((100 * part) / whole).toFixed(1)}%` : 
 const short = (value, max = 18) => (String(value).length > max ? `${String(value).slice(0, max)}…` : String(value));
 const mark = (value) => (value === 1 || value === true ? '✓' : value === 0 || value === false ? '✗' : '—');
 const blockRank = (block) => (BLOCK_ORDER.indexOf(block) + 1) || 99;
+const bare = (id) => id.replace(/^test:/, '');
+const blocksOf = (rows) => orderBlocks(rows.map((row) => row.block));
 
 function attemptRange(rows) {
   const low = Math.min(...rows.map((row) => row.n));
@@ -351,10 +319,6 @@ function countBy(rows, keyOf) {
   return counts;
 }
 
-function table(header, body) {
-  return [`| ${header.join(' | ')} |`, `|${header.map(() => '---').join('|')}|`, ...body.map((cells) => `| ${cells.join(' | ')} |`)];
-}
-
 function categoryCells(rows) {
   const counts = countBy(rows, (row) => row.category);
   return CATEGORIES.map((name) => `${counts[name] || 0} (${pct(counts[name] || 0, rows.length)})`);
@@ -362,8 +326,7 @@ function categoryCells(rows) {
 
 function byBlockTable(rows, sets) {
   const body = [];
-  const blocks = [...new Set(rows.map((row) => row.block))].sort((left, right) => blockRank(left) - blockRank(right));
-  for (const block of blocks) {
+  for (const block of blocksOf(rows)) {
     const mine = rows.filter((row) => row.block === block);
     body.push([BLOCK_LABELS[block] || block, mine.length, ...categoryCells(mine)]);
   }
@@ -385,12 +348,57 @@ function crossTab(left, right) {
   return { pairs: pairs.length, same, body };
 }
 
-function buildReport(data) {
-  const { main, arxiv, dev, pools, slack, checks, sensitivity } = data;
+// What report.md and the README part are both built from.
+function viewOf({ main, sensitivity }) {
   const scored = main.rows.filter((row) => !row.excluded);
-  const primary = (row) => !['aime', 'gpqa', 'mmlu'].includes(row.block);
-  const legacy = (row) => !primary(row);
-  const others = main.selection.council.filter((model) => model !== main.selection.b);
+  const sorted = (rows) => [...rows].sort((left, right) => blockRank(left.block) - blockRank(right.block) || left.id.localeCompare(right.id));
+  return {
+    scored,
+    sorted,
+    others: main.selection.council.filter((model) => model !== main.selection.b),
+    size: scored[0]?.n || 0,
+    borderline: scored.filter((row) => row.category === 'borderline'),
+    unsolved: sorted(scored.filter((row) => row.category === 'unsolved')),
+    noteOf: (row) => [
+      row.goldCorrected ? 'эталон исправлен' : null,
+      sensitivity.gold.has(row.id) && !row.goldCorrected ? 'эталон оспорен в расширенном списке' : null,
+      sensitivity.excluded.has(row.id) ? 'исключён в расширенном списке' : null,
+    ].filter(Boolean).join('; '),
+  };
+}
+
+// How the attempts of each category ended.
+function finishTable(scored) {
+  return table(
+    ['Категория', 'Вопросов', 'Попыток', 'Верно', 'Неверный ответ', 'Нет читаемого ответа', 'Из них обрезано на лимите'],
+    CATEGORIES.map((name) => {
+      const mine = scored.filter((row) => row.category === name);
+      const sum = (field) => mine.reduce((total, row) => total + row[field], 0);
+      return [CATEGORY_RU[name], mine.length, sum('n'), sum('right'), sum('wrongAnswer'), sum('noAnswer'), sum('cutNoAnswer')];
+    }),
+  );
+}
+
+// Right answers of each arm by category; `cell(count, n)` writes one count.
+function armTable(scored, cell) {
+  const armRows = [];
+  for (const [label, test] of [['Новые блоки', isPrimary], ['Прежние блоки', isLegacy]]) {
+    for (const name of CATEGORIES) {
+      const mine = scored.filter((row) => test(row) && row.category === name);
+      const hits = (arm) => cell(mine.filter((row) => row.arms[arm] === 1).length, mine.length);
+      armRows.push([
+        label, CATEGORY_RU[name], mine.length, hits('A8'), hits('S8'), hits('P8'), hits('B8'),
+        mine.filter((row) => row.arms.A8 === 1 && row.arms.S8 === 0).length,
+        mine.filter((row) => row.arms.A8 === 0 && row.arms.S8 === 1).length,
+      ]);
+    }
+  }
+  return table(['Набор', 'Категория', 'Вопросов', 'A8', 'S8', 'P8', 'B8', 'A8 > S8', 'S8 > A8'], armRows);
+}
+
+function buildReport(data) {
+  const { main, arxiv, dev, pools, slack, checks } = data;
+  const { scored, sorted, others, size, borderline, unsolved, noteOf } = viewOf(data);
   const lines = [];
   const push = (...items) => lines.push(...items);
 
@@ -410,15 +418,14 @@ function buildReport(data) {
     '',
     `## Тест ${MAIN_RUN}: ${scored.length} вопросов, ${attemptRange(scored)} на вопрос`,
     '',
-    `Попытки: 5 выборок B = \`${main.selection.b}\` и по одному ответу Stage 1 от ${others.map((model) => `\`${model}\``).join(' и ')}. Лимит 32768 токенов на каждый вызов. Эталоны из \`${GOLD_FILE}\`: исправлено ${main.rows.filter((row) => row.goldCorrected).length}, исключено вопросов ${main.rows.length - scored.length}.`,
+    `Попытки: ${scored[0]?.nB} выборок B = \`${main.selection.b}\` и по одному ответу Stage 1 от ${others.map((model) => `\`${model}\``).join(' и ')}. Лимит ${main.caps?.sample ?? '?'} токенов на каждый вызов. Эталоны из \`${GOLD_FILE}\`: исправлено ${main.rows.filter((row) => row.goldCorrected).length}, исключено вопросов ${main.rows.length - scored.length}.`,
     '',
-    ...byBlockTable(scored, [['Новые блоки', primary], ['Прежние блоки', legacy], ['Всего', () => true]]),
+    ...byBlockTable(scored, [['Новые блоки', isPrimary], ['Прежние блоки', isLegacy], ['Всего', () => true]]),
     '',
-    '### Сколько попыток из 7 верны',
+    `### Сколько попыток из ${size} верны`,
     '',
   );
-  const blocks = [...new Set(scored.map((row) => row.block))].sort((left, right) => blockRank(left) - blockRank(right));
-  const size = scored[0]?.n || 0;
+  const blocks = blocksOf(scored);
   const range = Array.from({ length: size + 1 }, (_, index) => index);
   push(...table(
     ['Блок', ...range.map((value) => `${value}/${size}`)],
@@ -432,42 +439,22 @@ function buildReport(data) {
     '',
     '### Чем закончились попытки',
     '',
-    '«Нет читаемого ответа» — в тексте нет разбираемой последней строки с ответом. «Из них обрезано» — поток при этом остановлен на лимите 32768 токенов.',
+    `«Нет читаемого ответа» — в тексте нет разбираемой последней строки с ответом. «Из них обрезано» — поток при этом остановлен на лимите ${main.caps?.sample ?? '?'} токенов.`,
     '',
-    ...table(
-      ['Категория', 'Вопросов', 'Попыток', 'Верно', 'Неверный ответ', 'Нет читаемого ответа', 'Из них обрезано на лимите'],
-      CATEGORIES.map((name) => {
-        const mine = scored.filter((row) => row.category === name);
-        const sum = (field) => mine.reduce((total, row) => total + row[field], 0);
-        return [CATEGORY_RU[name], mine.length, sum('n'), sum('right'), sum('wrongAnswer'), sum('noAnswer'), sum('cutNoAnswer')];
-      }),
-    ),
+    ...finishTable(scored),
   );
 
-  const borderline = scored.filter((row) => row.category === 'borderline');
   push('', '### Пограничные вопросы: где расходятся ответы', '');
   push(...table(
     ['Вид', 'Новые блоки', 'Прежние блоки', 'Всего'],
     Object.keys(SUBTYPE_RU).map((name) => {
       const mine = borderline.filter((row) => row.subtype === name);
-      return [SUBTYPE_RU[name], mine.filter(primary).length, mine.filter(legacy).length, mine.length];
+      return [SUBTYPE_RU[name], mine.filter(isPrimary).length, mine.filter(isLegacy).length, mine.length];
     }),
   ));
 
   push('', '### Руки по категориям', '', 'Верных ответов руки внутри категории. «A8 > S8» — вопросы, где A8 верна, а S8 нет; «S8 > A8» — наоборот.', '');
-  const armRows = [];
-  for (const [label, test] of [['Новые блоки', primary], ['Прежние блоки', legacy]]) {
-    for (const name of CATEGORIES) {
-      const mine = scored.filter((row) => test(row) && row.category === name);
-      const hits = (arm) => `${mine.filter((row) => row.arms[arm] === 1).length} (${pct(mine.filter((row) => row.arms[arm] === 1).length, mine.length)})`;
-      armRows.push([
-        label, CATEGORY_RU[name], mine.length, hits('A8'), hits('S8'), hits('P8'), hits('B8'),
-        mine.filter((row) => row.arms.A8 === 1 && row.arms.S8 === 0).length,
-        mine.filter((row) => row.arms.A8 === 0 && row.arms.S8 === 1).length,
-      ]);
-    }
-  }
-  push(...table(['Набор', 'Категория', 'Вопросов', 'A8', 'S8', 'P8', 'B8', 'A8 > S8', 'S8 > A8'], armRows));
+  push(...armTable(scored, (count, n) => `${count} (${pct(count, n)})`));
 
   // ArXivMath
   const answered = arxiv.rows.filter((row) => row.n > 0);
@@ -476,7 +463,7 @@ function buildReport(data) {
     '',
     `## ArXivMath: тест ${ARXIV_RUN} остановлен, данные неполные`,
     '',
-    `Ни один из ${arxiv.rows.length} вопросов не дошёл до конца. Посчитаны ответы, которые успели прийти: ${attemptsTotal} попыток, от ${Math.min(...arxiv.rows.map((row) => row.n))} до ${Math.max(...arxiv.rows.map((row) => row.n))} на вопрос. Из них обрезано на лимите 32768 токенов: ${arxiv.finish.length || 0}; без читаемого ответа: ${arxiv.rows.reduce((sum, row) => sum + row.noAnswer, 0)}. Эталоны ArXivMath не перепроверялись. Категории здесь предварительные.`,
+    `Ни один из ${arxiv.rows.length} вопросов не дошёл до конца. Посчитаны ответы, которые успели прийти: ${attemptsTotal} попыток, от ${Math.min(...arxiv.rows.map((row) => row.n))} до ${Math.max(...arxiv.rows.map((row) => row.n))} на вопрос. Из них обрезано на лимите ${arxiv.caps?.sample ?? '?'} токенов: ${arxiv.finish.length || 0}; без читаемого ответа: ${arxiv.rows.reduce((sum, row) => sum + row.noAnswer, 0)}. Эталоны ArXivMath не перепроверялись. Категории здесь предварительные.`,
     '',
     ...table(
       ['Попыток на вопрос', 'Вопросов', ...CATEGORIES.map((name) => CATEGORY_RU[name])],
@@ -512,7 +499,7 @@ function buildReport(data) {
 
   // Other pools
   push('', '## Те же прежние вопросы при другом составе попыток', '');
-  const legacyRows = scored.filter(legacy);
+  const legacyRows = scored.filter(isLegacy);
   for (const pool of pools) {
     const tab = crossTab(legacyRows, pool.rows);
     push(
@@ -526,13 +513,6 @@ function buildReport(data) {
   }
 
   // Lists
-  const noteOf = (row) => [
-    row.goldCorrected ? 'эталон исправлен' : null,
-    sensitivity.gold.has(row.id) && !row.goldCorrected ? 'эталон оспорен в расширенном списке' : null,
-    sensitivity.excluded.has(row.id) ? 'исключён в расширенном списке' : null,
-  ].filter(Boolean).join('; ');
-  const sorted = (rows) => [...rows].sort((left, right) => blockRank(left.block) - blockRank(right.block) || left.id.localeCompare(right.id));
-  const unsolved = sorted(scored.filter((row) => row.category === 'unsolved'));
   push(
     `## Списки, тест ${MAIN_RUN}`,
     '',
@@ -564,12 +544,12 @@ function buildReport(data) {
   for (const block of blocks) {
     const mine = sorted(scored.filter((row) => row.block === block && row.category === 'easy'));
     const wrongArms = mine.filter((row) => row.arms.A8 === 0 || row.arms.S8 === 0);
-    push(`- **${BLOCK_LABELS[block] || block}** (${mine.length}): ${mine.map((row) => row.id.replace(/^test:/, '')).join(', ')}`);
+    push(`- **${BLOCK_LABELS[block] || block}** (${mine.length}): ${mine.map((row) => bare(row.id)).join(', ')}`);
     if (wrongArms.length) {
-      push(`  - из них рука ошиблась: ${wrongArms.map((row) => `${row.id.replace(/^test:/, '')} (A8 ${mark(row.arms.A8)}, S8 ${mark(row.arms.S8)})`).join(', ')}`);
+      push(`  - из них рука ошиблась: ${wrongArms.map((row) => `${bare(row.id)} (A8 ${mark(row.arms.A8)}, S8 ${mark(row.arms.S8)})`).join(', ')}`);
     }
     const noted = mine.filter((row) => noteOf(row));
-    if (noted.length) push(`  - пометки: ${noted.map((row) => `${row.id.replace(/^test:/, '')} (${noteOf(row)})`).join(', ')}`);
+    if (noted.length) push(`  - пометки: ${noted.map((row) => `${bare(row.id)} (${noteOf(row)})`).join(', ')}`);
   }
   const excludedRows = main.rows.filter((row) => row.excluded);
   push(
@@ -583,7 +563,7 @@ function buildReport(data) {
     `- Первая выборка B и ответ B в Stage 1 — один и тот же вызов; расхождений в ${MAIN_RUN}: ${checks.bSampleIsStage1Mismatch}.`,
     `- Повторная оценка текстов выборок тем же грейдером дала тот же ответ, что сохранён: ${checks.regradedSamples - checks.regradeMismatch} из ${checks.regradedSamples}.`,
     `- Ответы из журнала вызовов (оценены заново по тексту) совпали с ответами в записи вопроса: ${checks.journalQuestions - checks.journalMismatch} из ${checks.journalQuestions} вопросов.`,
-    `- Точность рук на новых блоках по этим же строкам: ${['A8', 'S8', 'P8', 'B8'].map((arm) => `${arm} ${pct(scored.filter((row) => primary(row) && row.arms[arm] === 1).length, scored.filter(primary).length)}`).join(', ')} (${scored.filter(primary).length} вопросов).`,
+    `- Точность рук на новых блоках по этим же строкам: ${['A8', 'S8', 'P8', 'B8'].map((arm) => `${arm} ${pct(scored.filter((row) => isPrimary(row) && row.arms[arm] === 1).length, scored.filter(isPrimary).length)}`).join(', ')} (${scored.filter(isPrimary).length} вопросов).`,
     `- В прежних кампаниях ответ первой выборки, оценённый заново, расходится с сохранённым B8 в ${checks.oldSample1Mismatch} вопросах; его нет в подсчёте голосов совета в ${checks.oldTallyMismatch}.`,
     '- В тесте пять попыток из семи принадлежат одной модели, поэтому «все попытки верны» в основном означает «B устойчиво верен».',
     '- В прежних кампаниях (v4, strong) ответы других моделей совета восстановлены из подсчёта голосов без имён моделей; вопрос с неполным советом учитывается только по выборкам B.',
@@ -596,62 +576,30 @@ function buildReport(data) {
 // The part of the README block about categories. tools/sample_count.js adds
 // its own part and places the whole block.
 function buildReadme(data) {
-  const { main, arxiv, dev, pools, slack, sensitivity } = data;
-  const scored = main.rows.filter((row) => !row.excluded);
-  const primary = (row) => !['aime', 'gpqa', 'mmlu'].includes(row.block);
-  const legacy = (row) => !primary(row);
-  const others = main.selection.council.filter((model) => model !== main.selection.b);
-  const size = scored[0]?.n || 0;
-  const bare = (id) => id.replace(/^test:/, '');
-  const sorted = (rows) => [...rows].sort((left, right) => blockRank(left.block) - blockRank(right.block) || left.id.localeCompare(right.id));
-  const noteOf = (row) => [
-    row.goldCorrected ? 'эталон исправлен' : null,
-    sensitivity.gold.has(row.id) && !row.goldCorrected ? 'эталон оспорен в расширенном списке' : null,
-    sensitivity.excluded.has(row.id) ? 'исключён в расширенном списке' : null,
-  ].filter(Boolean).join('; ');
-  const borderline = scored.filter((row) => row.category === 'borderline');
-  const unsolved = sorted(scored.filter((row) => row.category === 'unsolved'));
+  const { main, arxiv, dev, pools, slack } = data;
+  const { scored, sorted, others, size, borderline, unsolved, noteOf } = viewOf(data);
   const answered = arxiv.rows.filter((row) => row.n > 0);
   const count = (rows, name) => rows.filter((row) => row.category === name).length;
   const lines = [
     '#### Категории вопросов',
     '',
-    `Попытка — один ответ одной модели на вопрос. В тесте ${MAIN_RUN} это 5 выборок B = \`${main.selection.b}\` и по одному ответу Stage 1 от ${others.map((model) => `\`${model}\``).join(' и ')}, лимит ${main.caps?.sample ?? '?'} токенов на вызов. A8, S8 и P8 собраны из этих же ответов и попытками не считаются. Попытка верна, если её канонический ответ равен эталону с исправлениями из \`${GOLD_FILE}\`; ответ без читаемой последней строки неверен. ${slack === 0
+    `Попытка — один ответ одной модели на вопрос. В тесте ${MAIN_RUN} это ${scored[0]?.nB} выборок B = \`${main.selection.b}\` и по одному ответу Stage 1 от ${others.map((model) => `\`${model}\``).join(' и ')}, лимит ${main.caps?.sample ?? '?'} токенов на вызов. A8, S8 и P8 собраны из этих же ответов и попытками не считаются. Попытка верна, если её канонический ответ равен эталону с исправлениями из \`${GOLD_FILE}\`; ответ без читаемой последней строки неверен. ${slack === 0
       ? 'Легко-решаемый вопрос: верны все попытки. Не-решаемый: не верна ни одна. Пограничный: часть верна, часть нет.'
       : `Легко-решаемый вопрос: верных попыток не меньше n − ${slack}. Не-решаемый: не больше ${slack}. Пограничный: всё остальное.`} Категория относится к этим моделям при этом лимите, а не к вопросу вообще. В тесте пять попыток из ${size} принадлежат одной модели.`,
     '',
-    ...byBlockTable(scored, [['Новые блоки', primary], ['Прежние блоки', legacy], ['Всего', () => true]]),
+    ...byBlockTable(scored, [['Новые блоки', isPrimary], ['Прежние блоки', isLegacy], ['Всего', () => true]]),
     '',
     `Верных попыток из ${size}: ${Array.from({ length: size + 1 }, (_, value) => `${value} — ${scored.filter((row) => row.right === value).length}`).join(', ')} вопросов.`,
     '',
-    ...table(
-      ['Категория', 'Вопросов', 'Попыток', 'Верно', 'Неверный ответ', 'Нет читаемого ответа', 'Из них обрезано на лимите'],
-      CATEGORIES.map((name) => {
-        const mine = scored.filter((row) => row.category === name);
-        const sum = (field) => mine.reduce((total, row) => total + row[field], 0);
-        return [CATEGORY_RU[name], mine.length, sum('n'), sum('right'), sum('wrongAnswer'), sum('noAnswer'), sum('cutNoAnswer')];
-      }),
-    ),
+    ...finishTable(scored),
     '',
     `Пограничные вопросы (${borderline.length}): ${Object.keys(SUBTYPE_RU).map((name) => `${SUBTYPE_RU[name]} — ${borderline.filter((row) => row.subtype === name).length}`).join('; ')}.`,
     '',
     'Верных ответов руки внутри категории. «A8 > S8» — вопросы, где A8 верна, а S8 нет; «S8 > A8» — наоборот.',
     '',
   ];
-  const armRows = [];
-  for (const [label, test] of [['Новые блоки', primary], ['Прежние блоки', legacy]]) {
-    for (const name of CATEGORIES) {
-      const mine = scored.filter((row) => test(row) && row.category === name);
-      const hits = (arm) => mine.filter((row) => row.arms[arm] === 1).length;
-      armRows.push([
-        label, CATEGORY_RU[name], mine.length, hits('A8'), hits('S8'), hits('P8'), hits('B8'),
-        mine.filter((row) => row.arms.A8 === 1 && row.arms.S8 === 0).length,
-        mine.filter((row) => row.arms.A8 === 0 && row.arms.S8 === 1).length,
-      ]);
-    }
-  }
   lines.push(
-    ...table(['Набор', 'Категория', 'Вопросов', 'A8', 'S8', 'P8', 'B8', 'A8 > S8', 'S8 > A8'], armRows),
+    ...armTable(scored, (hits) => hits),
     '',
     `Не-решаемые (${unsolved.length}):`,
     '',
@@ -675,7 +623,7 @@ function buildReadme(data) {
     '',
   );
   for (const pool of pools) {
-    const tab = crossTab(scored.filter(legacy), pool.rows);
+    const tab = crossTab(scored.filter(isLegacy), pool.rows);
     lines.push(
       `\`${pool.run}\` — ${pool.label}: B = \`${pool.selection.b}\`, совет ${pool.selection.council.map((model) => `\`${model}\``).join(', ')}, лимит ${pool.caps?.sample ?? '?'}. Общих вопросов ${tab.pairs}, категория совпала в ${tab.same}.`,
       '',
@@ -696,12 +644,13 @@ function csv(rows) {
 }
 
 function main(argv) {
-  const slack = Number(flag(argv, '--slack', '0'));
+  const slack = Number(flagValue(argv, '--slack') ?? '0');
   if (!Number.isInteger(slack) || slack < 0) throw new Error('--slack takes a whole number, 0 or more');
-  const outDir = path.resolve(flag(argv, '--out', path.join(RUNS, 'question-difficulty')));
-  const tasks = loadTasks();
-  const goldInForce = loadGold(tasks, GOLD_FILE);
-  const sensitivity = loadGold(tasks, GOLD_SENSITIVITY_FILE);
+  const outDir = path.resolve(flagValue(argv, '--out') ?? path.join(RUNS, 'question-difficulty'));
+  const tasks = loadBankTasks(EVAL_ROOT);
+  const goldOf = (file) => readGold(readJson(path.join(EVAL_ROOT, file)), tasks);
+  const goldInForce = goldOf(GOLD_FILE);
+  const sensitivity = goldOf(GOLD_SENSITIVITY_FILE);
   const checks = {
     bSampleIsStage1Mismatch: 0, regradedSamples: 0, regradeMismatch: 0,
     journalQuestions: 0, journalMismatch: 0, oldSample1Mismatch: 0, oldTallyMismatch: 0,
@@ -710,7 +659,7 @@ function main(argv) {
   const main_ = fromStoredAnswers(MAIN_RUN, tasks, goldInForce, slack, checks);
   main_.rows = withFinishReasons(MAIN_RUN, main_.rows, tasks, goldInForce, checks);
   main_.caps = capsOf(MAIN_RUN);
-  const arxiv = fromSlots(ARXIV_RUN, tasks, slack);
+  const arxiv = { ...fromSlots(ARXIV_RUN, tasks, slack), caps: capsOf(ARXIV_RUN) };
   const dev = DEV_RUNS.flatMap((item) => fromDev(item.run, item.blocks, slack));
   const pools = OTHER_POOLS.map((pool) => ({ ...pool, caps: capsOf(pool.run), ...fromTexts(pool.run, tasks, goldInForce, slack, checks) }));
 
@@ -745,4 +694,4 @@ function main(argv) {
   }, null, 2));
 }
 
-main(process.argv.slice(2));
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main(process.argv.slice(2));

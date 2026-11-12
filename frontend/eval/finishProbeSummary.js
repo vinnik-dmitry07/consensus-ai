@@ -13,7 +13,7 @@ import { budgetTotals, labelSpend, mergedSlots, stageIndex } from './finishProbe
 import {
   ARMS, COUNCIL, HY4, STAGE1, STEPFUN, V3_CAPS, allCells, handRecount, labelsOf, moneyOf, outcomesFor, stageCells, v3Paths,
 } from './finishProbeV3.js';
-import { ANALYSIS_LIMITS, median, placeAfter, placeAnalysis, readJson, readJsonl, ruleFiles } from './noteTools.js';
+import { ANALYSIS_LIMITS, median, placeAfter, placeAnalysis, readJson, readJsonl, rewriteFile, ruleFiles } from './noteTools.js';
 import { readSlotJournal } from './runtime.js';
 
 export { median };
@@ -440,9 +440,7 @@ export function runSummaryReport(argv = [], paths = summaryPaths()) {
   const block = renderSummaryReadme(built);
   writeFileSync(paths.readme, `${block}\n`, 'utf8');
   if (argv.includes('--readme')) {
-    const text = readFileSync(README, 'utf8');
-    const next = placeAfter(text, README_START, README_END, block, AFTER_V3);
-    if (next !== text) writeFileSync(README, next, 'utf8');
+    rewriteFile(README, (text) => placeAfter(text, README_START, README_END, block, AFTER_V3));
   }
   console.log(`summary written: ${paths.reportMd}`);
   return 0;

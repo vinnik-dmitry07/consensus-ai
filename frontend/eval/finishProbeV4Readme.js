@@ -17,7 +17,7 @@ import { markers as campaignMarkers } from './a8CampaignNote.js';
 import {
   ANALYSIS_END, ANALYSIS_LIMITS, ANALYSIS_START, PROTOCOL_V4, README_END, README_START, V4_INSTRUCTION, renderV4Readme, v4AnalysisSection,
 } from './finishProbeV4.js';
-import { placeAfter, placeAnalysis, readJson, readJsonl, ruleFiles } from './noteTools.js';
+import { placeAfter, placeAnalysis, readJson, readJsonl, rewriteFile, ruleFiles } from './noteTools.js';
 
 const EVAL_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const RUN_DIR = path.join(EVAL_ROOT, '.runs', 'finish-probe-v4');
@@ -75,10 +75,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const note = buildNote(built, readJsonl(path.join(RUN_DIR, 'stops.jsonl')));
     writeFileSync(path.join(RUN_DIR, 'readme-note.md'), `${note}\n`, 'utf8');
     if (argv.includes('--readme')) {
-      let text = readFileSync(README, 'utf8');
-      text = placeAfter(text, README_START, README_END, block, AFTER);
-      text = placeAfter(text, NOTE_START, NOTE_END, note, README_END);
-      writeFileSync(README, text, 'utf8');
+      rewriteFile(README, (text) => placeAfter(placeAfter(text, README_START, README_END, block, AFTER), NOTE_START, NOTE_END, note, README_END));
     }
     console.log(block);
     console.log('----');

@@ -11,7 +11,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { markers as runNoteMarkers } from './a8RunNote.js';
-import { ANALYSIS_LIMITS, flagValue, placeAfter, placeAnalysis, readJson, ruleFiles } from './noteTools.js';
+import { ANALYSIS_LIMITS, flagValue, placeAfter, placeAnalysis, readJson, rewriteFile, ruleFiles } from './noteTools.js';
 
 const EVAL_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const RUNS_ROOT = path.join(EVAL_ROOT, '.runs');
@@ -127,9 +127,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     writeFileSync(path.join(RUNS_ROOT, run, 'readme-block.md'), `${block}\n`, 'utf8');
     if (argv.includes('--readme')) {
       const { start, end } = markers(run);
-      const text = readFileSync(README, 'utf8');
-      const next = placeAfter(text, start, end, block, flagValue(argv, '--after') || runNoteMarkers('a8-open-v6').end);
-      if (next !== text) writeFileSync(README, next, 'utf8');
+      rewriteFile(README, (text) => placeAfter(text, start, end, block, flagValue(argv, '--after') || runNoteMarkers('a8-open-v6').end));
     }
     console.log(block);
   }

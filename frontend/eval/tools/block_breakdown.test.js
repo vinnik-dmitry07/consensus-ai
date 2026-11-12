@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
+import { placeBefore, readGold, withLineEndings } from '../noteTools.js';
 import {
-  TARGET, markers, placeBefore, readGold, rulesOf, scoreRow, sheepFits, shownCandidates, shownResponses, tally, variantsOf, withLineEndings,
+  TARGET, markers, rulesOf, scoreRow, sheepFits, shownCandidates, shownResponses, tally, variantsOf,
 } from './block_breakdown.js';
 
 const graded = (extracted) => ({ status: 'graded', extracted });
