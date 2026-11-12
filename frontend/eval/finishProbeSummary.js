@@ -11,9 +11,12 @@ import { cellKey, cellState, loadSource, orderCells } from './finishProbe.js';
 import { evaluateBounded, isConfirmed } from './finishProbeCriteria.js';
 import { budgetTotals, labelSpend, mergedSlots, stageIndex } from './finishProbeV2.js';
 import {
-  COUNCIL, HY4, STEPFUN, V3_CAPS, allCells, handRecount, labelsOf, moneyOf, outcomesFor, placeBlock, stageCells, v3Paths,
+  ARMS, COUNCIL, HY4, STAGE1, STEPFUN, V3_CAPS, allCells, handRecount, labelsOf, moneyOf, outcomesFor, stageCells, v3Paths,
 } from './finishProbeV3.js';
+import { ANALYSIS_LIMITS, median, placeAfter, placeAnalysis, readJson, readJsonl, ruleFiles } from './noteTools.js';
 import { readSlotJournal } from './runtime.js';
+
+export { median };
 
 const EVAL_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const RUNS_ROOT = path.join(EVAL_ROOT, '.runs');
@@ -26,17 +29,6 @@ export const README_START = '<!-- finish-probe-summary:start -->';
 export const README_END = '<!-- finish-probe-summary:end -->';
 export const AFTER_V3 = '<!-- finish-probe-v3-analysis:end -->';
 export const GROUPS = Object.freeze(['firm', 'candidate', 'none', 'unlabelled']);
-const ARMS = Object.freeze(['B8', 'P8', 'V5', 'A8', 'S8']);
-
-function readJson(file, fallback = null) {
-  if (!existsSync(file)) return fallback;
-  return JSON.parse(readFileSync(file, 'utf8'));
-}
-
-function readJsonl(file) {
-  if (!existsSync(file)) return [];
-  return readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
-}
 
 function writeJson(file, value) {
   mkdirSync(path.dirname(file), { recursive: true });
@@ -52,34 +44,39 @@ export function summaryPaths(root = RUNS_ROOT) {
   const v1 = path.join(root, 'finish-probe-v1');
   const v2 = path.join(root, 'finish-probe-v2');
   return {
-    dir,
     report: path.join(dir, 'report.json'),
     reportMd: path.join(dir, 'report.md'),
     readme: path.join(dir, 'readme-block.md'),
     analysis: path.join(dir, 'analysis'),
-    budget: path.join(dir, 'budget.jsonl'),
     v1: { report: path.join(v1, 'report.json'), budget: path.join(v1, 'budget.jsonl') },
     v2: { report: path.join(v2, 'report.json'), budget: path.join(v2, 'budget.jsonl'), labels: path.join(v2, 'labels', 'calls.jsonl'), analysis: path.join(v2, 'analysis', 'calls.jsonl') },
     v3: v3Paths(root),
   };
 }
 
-export function median(values) {
-  if (!values.length) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+const stateOf = (row) => (row?.v3 === 'accepted' || row?.v3 === 'rejected' ? row.v3 : 'unconfirmed');
+const STATES = Object.freeze(['accepted', 'rejected']);
+
+// Rows: the class of a cell at 2048 (`to` plus unconfirmed); columns: its class
+// at 8192 (`to`). Only cells v3 confirmed are counted.
+function crossTable(list, at2048, at8192, classify, to) {
+  const table = Object.fromEntries([...to, 'unconfirmed'].map((from) => [from, Object.fromEntries(to.map((key) => [key, 0]))]));
+  for (const cell of list) table[classify(at2048.get(cell.id))][classify(at8192.get(cell.id))] += 1;
+  return table;
 }
 
-const stateOf = (row) => (row?.v3 === 'accepted' || row?.v3 === 'rejected' ? row.v3 : 'unconfirmed');
+// The markdown rows of a crossTable; the unconfirmed row only when it holds a cell.
+function crossRows(table, to, label = (key) => key) {
+  return [...to, 'unconfirmed']
+    .filter((from) => from !== 'unconfirmed' || to.some((key) => table[from][key] > 0))
+    .map((from) => `| ${label(from)} | ${to.map((key) => table[from][key]).join(' | ')} |`);
+}
 
 // The same StepFun F cells at the 2048 cap (v1 and v2) and at 8192 (v3), on
 // every cell v3 confirmed.
 export function transitions(cells, at2048, at8192) {
-  const keys = ['accepted', 'rejected', 'unconfirmed'];
-  const table = Object.fromEntries(keys.map((from) => [from, Object.fromEntries(keys.slice(0, 2).map((to) => [to, 0]))]));
   const list = cells.filter((cell) => isConfirmed(at8192.get(cell.id)));
-  for (const cell of list) table[stateOf(at2048.get(cell.id))][stateOf(at8192.get(cell.id))] += 1;
+  const table = crossTable(list, at2048, at8192, stateOf, STATES);
   const side = (outcome) => {
     const rows = list.map((cell) => outcome.get(cell.id));
     const accepted = rows.filter((row) => row?.v3 === 'accepted');
@@ -103,22 +100,22 @@ export function transitions(cells, at2048, at8192) {
   return { n: list.length, table, at2048: side(at2048), at8192: side(at8192) };
 }
 
+// Acceptance and correctness of the F outcomes of these inputs.
+function tally(list, outcome) {
+  const rows = list.map((item) => outcome.get(`${item.id}|F`));
+  return {
+    n: list.length,
+    accepted: rows.filter((row) => row?.v3 === 'accepted').length,
+    correct: rows.filter((row) => row?.v3 === 'accepted' && row.correct === 1).length,
+    wrong: rows.filter((row) => row?.v3 === 'accepted' && row.correct !== 1).length,
+    rejected: rows.filter((row) => row?.v3 === 'rejected').length,
+    unconfirmed: rows.filter((row) => !isConfirmed(row)).length,
+  };
+}
+
 // Acceptance and correctness of F by the v2 label group of the text.
 export function byGroup(inputs, outcome, groups) {
-  const out = {};
-  for (const group of GROUPS) {
-    const list = inputs.filter((item) => (groups.get(item.id) || 'unlabelled') === group);
-    const rows = list.map((item) => outcome.get(`${item.id}|F`));
-    out[group] = {
-      n: list.length,
-      accepted: rows.filter((row) => row?.v3 === 'accepted').length,
-      correct: rows.filter((row) => row?.v3 === 'accepted' && row.correct === 1).length,
-      wrong: rows.filter((row) => row?.v3 === 'accepted' && row.correct !== 1).length,
-      rejected: rows.filter((row) => row?.v3 === 'rejected').length,
-      unconfirmed: rows.filter((row) => !isConfirmed(row)).length,
-    };
-  }
-  return out;
+  return Object.fromEntries(GROUPS.map((group) => [group, tally(inputs.filter((item) => (groups.get(item.id) || 'unlabelled') === group), outcome)]));
 }
 
 // The status both labelling passes gave the text (accepted, leading, none),
@@ -133,19 +130,11 @@ export function statusOf(item) {
 }
 
 export function byStatus(inputs, outcome, labelItems) {
-  const out = {};
-  for (const status of STATUSES) {
-    const list = inputs.filter((item) => statusOf(labelItems.get(item.id)) === status);
-    const rows = list.map((item) => outcome.get(`${item.id}|F`));
-    out[status] = {
-      n: list.length,
-      accepted: rows.filter((row) => row?.v3 === 'accepted').length,
-      correct: rows.filter((row) => row?.v3 === 'accepted' && row.correct === 1).length,
-      rejected: rows.filter((row) => row?.v3 === 'rejected').length,
-      unconfirmed: rows.filter((row) => !isConfirmed(row)).length,
-    };
-  }
-  return out;
+  return Object.fromEntries(STATUSES.map((status) => {
+    // The status table has no wrong column.
+    const { wrong: _wrong, ...counts } = tally(inputs.filter((item) => statusOf(labelItems.get(item.id)) === status), outcome);
+    return [status, counts];
+  }));
 }
 
 // right (accepted and correct), wrong (accepted, not correct), cut (rejected).
@@ -157,12 +146,7 @@ function formOf(row) {
 }
 
 export function correctnessTransitions(cells, at2048, at8192) {
-  const keys = [...FORMS, 'unconfirmed'];
-  const table = Object.fromEntries(keys.map((from) => [from, Object.fromEntries(FORMS.map((to) => [to, 0]))]));
-  for (const cell of cells.filter((entry) => isConfirmed(at8192.get(entry.id)))) {
-    table[formOf(at2048.get(cell.id))][formOf(at8192.get(cell.id))] += 1;
-  }
-  return table;
+  return crossTable(cells.filter((cell) => isConfirmed(at8192.get(cell.id))), at2048, at8192, formOf, FORMS);
 }
 
 // Every cell whose acceptance differs between the caps.
@@ -207,11 +191,6 @@ function stateCounts(cells, outcome) {
   return counts;
 }
 
-function analysisSpend(file) {
-  const calls = readJsonl(file).filter((event) => event.kind === 'call');
-  return { calls: calls.length, usd: calls.filter((event) => Number.isFinite(event.cost)).reduce((sum, event) => sum + event.cost, 0) };
-}
-
 export function buildSummary(paths, source) {
   const { tasks, sources, rows, ctx } = source;
   const inputs = sources.filter((item) => item.kind === 'input');
@@ -233,7 +212,7 @@ export function buildSummary(paths, source) {
   const v1Money = budgetTotals(readJsonl(paths.v1.budget));
   const v2Money = budgetTotals(readJsonl(paths.v2.budget), { maxUsd: 10, maxPosts: 500 });
   const v2Labels = labelSpend(readJsonl(paths.v2.labels));
-  const v2Analysis = analysisSpend(paths.v2.analysis);
+  const v2Analysis = labelSpend(readJsonl(paths.v2.analysis));
   const v3Money = moneyOf(readJsonl(paths.v3.budget));
   const rounds = [
     {
@@ -247,7 +226,7 @@ export function buildSummary(paths, source) {
       heldNoModelUsd: v2Report?.extra?.held?.routeUnavailableUsd ?? null,
       decision: v2Report?.result?.criteria?.decision ?? null,
       settledUsd: v2Money.settledUsd, heldUsd: v2Money.heldUsd, posts: v2Money.posts,
-      extraUsd: v2Labels.knownUsd + v2Analysis.usd, extraPosts: v2Labels.calls + v2Analysis.calls,
+      extraUsd: v2Labels.knownUsd + v2Analysis.knownUsd, extraPosts: v2Labels.calls + v2Analysis.calls,
     },
     {
       round: 'v3', caps: `${V3_CAPS[STEPFUN]} StepFun, ${BASE_CAP} others`, capsRu: `StepFun ${V3_CAPS[STEPFUN]}, остальные ${BASE_CAP}`, cells: cells.length,
@@ -268,7 +247,7 @@ export function buildSummary(paths, source) {
   };
   const v3Stage1 = v3Report?.result?.stage1 ?? null;
   const corrections = {
-    stage1Rule: 9,
+    stage1Rule: STAGE1.stopAt,
     stage1Rejected: v3Stage1?.rejected ?? null,
     v3MoneyNow: { settledUsd: v3Money.settledUsd, posts: v3Money.posts, keyDelta: v3Money.key.delta },
   };
@@ -354,21 +333,13 @@ export function renderSummaryReport({ meta, result }) {
 
   const t = result.transitions;
   lines.push('## StepFun F: the same cells at 2048 and at 8192', '', `Every StepFun F cell that v3 confirmed (${t.n}). Rows: outcome at 2048 (v1 or v2); columns: outcome at 8192 (v3).`, '', '| At 2048 | accepted at 8192 | rejected at 8192 |', '| --- | --- | --- |');
-  for (const from of ['accepted', 'rejected', 'unconfirmed']) {
-    const row = t.table[from];
-    if (from === 'unconfirmed' && row.accepted + row.rejected === 0) continue;
-    lines.push(`| ${from} | ${row.accepted} | ${row.rejected} |`);
-  }
+  lines.push(...crossRows(t.table, STATES));
   lines.push('', '| Cap | accepted | correct among accepted | rejected | accepted tokens median | accepted tokens max | mean $ accepted | mean $ rejected | median s accepted | median s rejected |', '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |');
   for (const [cap, side] of [[BASE_CAP, t.at2048], [V3_CAPS[STEPFUN], t.at8192]]) {
     lines.push(`| ${cap} | ${side.accepted} | ${side.correct} | ${side.rejected} | ${num(side.acceptedTokensMedian)} | ${side.acceptedTokensMax ?? 'n/a'} | ${usd4(side.acceptedMeanUsd)} | ${usd4(side.rejectedMeanUsd)} | ${num(side.acceptedMedianSeconds)} | ${num(side.rejectedMedianSeconds)} |`);
   }
   lines.push('', 'The same cells by correctness: right (accepted and correct), wrong (accepted, not correct), cut (not accepted). One generation per cell and cap.', '', `| At 2048 | ${FORMS.map((form) => `${form} at 8192`).join(' | ')} |`, `| --- | ${FORMS.map(() => '---').join(' | ')} |`);
-  for (const from of [...FORMS, 'unconfirmed']) {
-    const row = result.correctness[from];
-    if (from === 'unconfirmed' && FORMS.every((to) => row[to] === 0)) continue;
-    lines.push(`| ${from} | ${FORMS.map((to) => row[to]).join(' | ')} |`);
-  }
+  lines.push(...crossRows(result.correctness, FORMS));
   lines.push('', 'Cells whose acceptance differs between the caps (status: what both labelling passes gave the text):', '');
   for (const row of result.changed) lines.push(`- ${row.cell}: status ${row.status}; 2048 ${row.at2048.form} (${row.at2048.tokens ?? 'n/a'} tokens), 8192 ${row.at8192.form} (${row.at8192.tokens ?? 'n/a'} tokens).`);
   lines.push('', '## F by the status both labelling passes gave the text', '', 'Each pass marks the value the text holds as accepted, leading, or none, without the gold. "differ": the passes disagree.', '');
@@ -433,18 +404,10 @@ export function renderSummaryReadme({ meta, result }) {
   lines.push('', `Разметка и анализ v2 — ещё ${usd2(meta.rounds[1].extraUsd)}. Всего с ними ${usd2(meta.total.settledUsd)}, удержано ${usd2(meta.total.heldUsd)}, из них ${usd2(meta.rounds[1].heldNoModelUsd)} — резерв вызовов v2, получивших 404 до модели.`);
   lines.push('', `StepFun F, одни и те же ${t.n} ячеек при лимите ${BASE_CAP} и ${V3_CAPS[STEPFUN]}:`, '', `| При ${BASE_CAP} | принят при ${V3_CAPS[STEPFUN]} | не принят при ${V3_CAPS[STEPFUN]} |`, '| --- | --- | --- |');
   const ru = { accepted: 'принят', rejected: 'не принят', unconfirmed: 'без исхода' };
-  for (const from of ['accepted', 'rejected', 'unconfirmed']) {
-    const row = t.table[from];
-    if (from === 'unconfirmed' && row.accepted + row.rejected === 0) continue;
-    lines.push(`| ${ru[from]} | ${row.accepted} | ${row.rejected} |`);
-  }
+  lines.push(...crossRows(t.table, STATES, (from) => ru[from]));
   lines.push('', `Принято: при ${BASE_CAP} — ${t.at2048.accepted}, при ${V3_CAPS[STEPFUN]} — ${t.at8192.accepted}; верных среди принятых ${t.at2048.correct} и ${t.at8192.correct}. По верности (верно / неверно / не принят), строки при ${BASE_CAP}, столбцы при ${V3_CAPS[STEPFUN]}:`, '', `| При ${BASE_CAP} | верно | неверно | не принят |`, '| --- | --- | --- | --- |');
   const formRu = { right: 'верно', wrong: 'неверно', cut: 'не принят', unconfirmed: 'без исхода' };
-  for (const from of [...FORMS, 'unconfirmed']) {
-    const row = result.correctness[from];
-    if (from === 'unconfirmed' && FORMS.every((to) => row[to] === 0)) continue;
-    lines.push(`| ${formRu[from]} | ${FORMS.map((to) => row[to]).join(' | ')} |`);
-  }
+  lines.push(...crossRows(result.correctness, FORMS, (from) => formRu[from]));
   const statusRu = { accepted: 'оба: значение принято', leading: 'оба: значение ведущее', none: 'оба: значения нет', differ: 'проходы разошлись', unlabelled: 'не размечен' };
   const s2 = result.status2048;
   const s8 = result.status8192;
@@ -478,8 +441,7 @@ export function runSummaryReport(argv = [], paths = summaryPaths()) {
   writeFileSync(paths.readme, `${block}\n`, 'utf8');
   if (argv.includes('--readme')) {
     const text = readFileSync(README, 'utf8');
-    if (!text.includes(AFTER_V3)) throw new Error('The v3 analysis section is not in the README.');
-    const next = placeBlock(text, README_START, README_END, block, AFTER_V3);
+    const next = placeAfter(text, README_START, README_END, block, AFTER_V3);
     if (next !== text) writeFileSync(README, next, 'utf8');
   }
   console.log(`summary written: ${paths.reportMd}`);
@@ -492,7 +454,6 @@ export function runSummaryReport(argv = [], paths = summaryPaths()) {
 
 export const ANALYSIS_START = '<!-- finish-probe-summary-analysis:start -->';
 export const ANALYSIS_END = '<!-- finish-probe-summary-analysis:end -->';
-export const ANALYSIS_LIMITS = Object.freeze({ maxUsd: 0.5, maxPosts: 8 });
 export const RULE_FILES = Object.freeze(['finish-probe-protocol.md', 'finish-probe-v2-protocol.md', 'finish-probe-v2-addendum.md', 'finish-probe-v3-protocol.md']);
 export const SUMMARY_INSTRUCTION = [
   'You analyse the closing summary of a series of three diagnostic rounds (v1, v2, v3) for the README of the project. The rules of the rounds and the summary are given below as data.',
@@ -502,10 +463,6 @@ export const SUMMARY_INSTRUCTION = [
   'Do not present any follow-up experiment as decided. You may say what stays open.',
   'Return only the text of the section.',
 ].join('\n');
-
-export function rulesText(root = EVAL_ROOT) {
-  return RULE_FILES.map((name) => `# File ${name}\n\n${readFileSync(path.join(root, name), 'utf8')}`).join('\n\n');
-}
 
 export function summaryAnalysisSection(text, check, writer, checker) {
   return [
@@ -517,28 +474,19 @@ export function summaryAnalysisSection(text, check, writer, checker) {
   ].join('\n');
 }
 
-export async function runSummaryAnalysis(paths = summaryPaths()) {
+export function runSummaryAnalysis(paths = summaryPaths()) {
   if (!existsSync(paths.reportMd)) throw new Error('Build the summary first.');
-  const { runAnalysis } = await import('./evalAnalysis.js');
-  const key = String(process.env.or_key || process.env.OR_KEY || '').trim();
-  const record = await runAnalysis({
+  return placeAnalysis({
     dir: paths.analysis,
     instruction: SUMMARY_INSTRUCTION,
-    rules: rulesText(),
+    rules: ruleFiles(EVAL_ROOT, RULE_FILES),
     report: readFileSync(paths.reportMd, 'utf8'),
     limits: ANALYSIS_LIMITS,
-    key,
+    readme: README,
+    start: ANALYSIS_START,
+    end: ANALYSIS_END,
+    after: README_END,
+    section: (record) => summaryAnalysisSection(record.text, record.check, record.writer, record.checker),
+    showHeld: true,
   });
-  console.log(`analysis spend: settled $${record.spend.settledUsd.toFixed(4)}, held $${record.spend.heldUsd.toFixed(4)}, ${record.spend.posts} POSTs`);
-  if (!record.text) {
-    console.log(`analysis not placed: ${record.reason}`);
-    return 2;
-  }
-  const body = summaryAnalysisSection(record.text, record.check, record.writer, record.checker);
-  writeFileSync(path.join(paths.analysis, 'analysis.md'), `${body}\n`, 'utf8');
-  const text = readFileSync(README, 'utf8');
-  if (!text.includes(README_END)) throw new Error('Place the summary block first (--phase report --readme).');
-  writeFileSync(README, placeBlock(text, ANALYSIS_START, ANALYSIS_END, body, README_END), 'utf8');
-  console.log('analysis placed in README');
-  return 0;
 }

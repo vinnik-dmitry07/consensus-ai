@@ -1,12 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
 import { writeAndCheck, writerMessages } from './evalAnalysis.js';
-import { outcomeOf } from './finishProbeV3.js';
+import { outcomeOf, placeBlock } from './finishProbeV3.js';
 import {
   AFTER_V3, ANALYSIS_END, ANALYSIS_START, GROUPS, README_END, README_START, STATUSES, SUMMARY_INSTRUCTION,
   byGroup, byStatus, changedCells, correctnessTransitions, median, pricePerCorrect, summaryAnalysisSection, transitions,
 } from './finishProbeSummary.js';
-import { placeBlock } from './finishProbeV3.js';
 
 const row = (v3, extra = {}) => ({ v3, correct: 0, posts: 1, cost: 0.01, completionTokens: 100, serviceMs: 1000, ...extra });
 const cells = (n) => Array.from({ length: n }, (_, index) => ({ id: `c${index}`, questionId: `q${index}` }));

@@ -4,6 +4,7 @@
 // and the user has read the report of this stop.
 //
 //   node frontend/eval/a8Gate.js --run a8-open-v6 [--block arxiv] [--compare a8-open-v5d]
+// --block defaults to the one primary block of the campaign.
 
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
@@ -11,6 +12,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { LEGACY_BLOCKS } from './a8Blocks.js';
+import { envKey, flagValue, readJson } from './noteTools.js';
 
 const EVAL_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const RUNS_ROOT = path.join(EVAL_ROOT, '.runs');
@@ -20,11 +22,6 @@ const SKIP = new Set(['order.json', 'runner.json', 'cooldowns.json', 'forecast.j
 // the block are read as an answer, or A8 or S8 reads on one pilot question.
 export const MIN_DEV_PARSED = 2;
 export const MIN_PILOT_PARSED = 1;
-
-function readJson(file, fallback = null) {
-  if (!existsSync(file)) return fallback;
-  return JSON.parse(readFileSync(file, 'utf8'));
-}
 
 export function questionRows(dir) {
   if (!existsSync(dir)) return [];
@@ -97,7 +94,7 @@ export function blockDetail(devRows, pilotRows, block = 'arxiv') {
 }
 
 async function keyInfo(fetchImpl = fetch) {
-  const key = String(process.env.or_key || process.env.OR_KEY || '').trim();
+  const key = envKey();
   if (!key) return { status: null, error: 'or_key is missing' };
   try {
     const response = await fetchImpl(KEY_URL, { headers: { Authorization: `Bearer ${key}` } });
@@ -113,17 +110,15 @@ function fileSha(file) {
   return existsSync(file) ? createHash('sha256').update(readFileSync(file)).digest('hex') : 'absent';
 }
 
-function flagValue(argv, name) {
-  const index = argv.indexOf(name);
-  return index < 0 ? null : (argv[index + 1] ?? null);
-}
-
 export async function runGate(argv, { root = RUNS_ROOT, fetchImpl = fetch } = {}) {
   const run = flagValue(argv, '--run');
   if (!run) throw new Error('--run is required');
-  const block = flagValue(argv, '--block') || 'arxiv';
-  const compare = flagValue(argv, '--compare') || 'a8-open-v5d';
   const dir = path.join(root, run);
+  // The gated block: --block, or the one primary block of the campaign.
+  const primary = readJson(path.join(dir, 'campaign.json'))?.primaryBlocks || [];
+  const block = flagValue(argv, '--block') || (primary.length === 1 ? primary[0] : null);
+  if (!block) throw new Error(`--block is required: ${run} has ${primary.length} primary blocks`);
+  const compare = flagValue(argv, '--compare') || 'a8-open-v5d';
   const selection = readJson(path.join(dir, 'selection.json'));
   const forecast = readJson(path.join(dir, 'comparison', 'pilot', 'forecast.json'));
   if (!selection || !forecast) throw new Error('Run dev and the pilot first.');

@@ -19,7 +19,9 @@ describe('frozen input redirect', () => {
     writeFileSync(other, 'other');
     const script = path.join(dir, 'read.mjs');
     writeFileSync(script, "import { readFileSync } from 'node:fs';\nconst [a, b] = process.argv.slice(2);\nconsole.log(readFileSync(a, 'utf8') + '|' + readFileSync(b, 'utf8'));\n");
-    const child = runRedirected([script, live.toUpperCase(), other], [[live, frozen]]);
+    // Windows paths match without case; elsewhere the path is asked as written.
+    const asked = process.platform === 'win32' ? live.toUpperCase() : live;
+    const child = runRedirected([script, asked, other], [[live, frozen]]);
     expect(child.status).toBe(0);
     expect(child.stdout.trim()).toBe('frozen|other');
     expect(readFileSync(live, 'utf8')).toBe('live');

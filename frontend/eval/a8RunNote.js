@@ -9,16 +9,18 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createCampaignBudget } from './budget.js';
+import { ANALYSIS_END as SUMMARY_ANALYSIS_END } from './finishProbeSummary.js';
+import { flagValue, placeAfter, readJson, readJsonl } from './noteTools.js';
 import { readSlotJournal } from './runtime.js';
-import { replaceSection } from './report.js';
+
+// tools/block_breakdown.js imports placeAfter from here.
+export { placeAfter };
 
 const EVAL_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const RUNS_ROOT = path.join(EVAL_ROOT, '.runs');
 const README = path.join(EVAL_ROOT, 'README.md');
-export const AFTER = '<!-- finish-probe-summary-analysis:end -->';
+export const AFTER = SUMMARY_ANALYSIS_END;
 
-const readJson = (file) => (existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : null);
-const readJsonl = (file) => (existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)) : []);
 const usd2 = (value) => `$${Number(value || 0).toFixed(2)}`;
 const short = (model) => String(model).split('/')[0];
 
@@ -27,13 +29,12 @@ export function markers(run) {
 }
 
 // Counts of the test journal by slot state; no field of a result is read.
-export function testCounts(slots, chairman) {
-  const counts = { slots: slots.length, posts: 0, refusals: 0, failed: 0, chairmanDone: 0, byModel: {} };
+export function testCounts(slots) {
+  const counts = { slots: slots.length, posts: 0, refusals: 0, failed: 0, byModel: {} };
   for (const slot of slots) {
     counts.posts += slot.httpAttempts || 0;
     counts.refusals += slot.limitedAttempts || 0;
     if (slot.state === 'failed') counts.failed += 1;
-    if (slot.meta.model === chairman && slot.state === 'completed') counts.chairmanDone += 1;
     const row = counts.byModel[slot.meta.model] ||= { completed: 0, other: 0 };
     if (slot.state === 'completed') row.completed += 1;
     else row.other += 1;
@@ -60,21 +61,19 @@ export function buildNote(run, root = RUNS_ROOT) {
   let testUsd = 0;
   for (const [id, row] of Object.entries(budget.state.reservations)) if (id.startsWith('test:') && row.settled && !row.unresolved) testUsd += row.cost || 0;
   const primary = (campaign.primaryBlocks || []).reduce((sum, block) => sum + (campaign.counts?.blocks?.[block]?.test || 0), 0);
-  const perQuestion = 12;
+  // H serves 8 of the 12 calls of a v6 question (Stage 1, samples 2-5, judge, A8 and S8 syntheses).
   const chairmanCalls = 8;
   return {
     run,
-    blocks: campaign.primaryBlocks,
     primary,
     cap: campaign.stageCaps?.stage1,
     routesFrom: campaign.routesInheritedFrom,
     repin: repin ? { model: repin.model, to: repin.chosen?.tag ?? null } : null,
     selection: { b: selection.b, h: selection.h, council: selection.council, table: (selection.table || []).map((row) => ({ id: row.id, correct: row.correct, expected: row.expected })) },
     gate: gate ? { verdict: gate.verdict, at: gate.at, stressUsd: gate.conditions?.money?.stressUsd, baseUsd: gate.conditions?.key?.baseUsd } : null,
-    test: testCounts(slots, selection.h),
+    test: testCounts(slots),
     plannedChairmanCalls: primary * chairmanCalls,
-    plannedCalls: primary * perQuestion,
-    questionsComplete: questions ?? 0,
+    questionsComplete: questions,
     money: { settledUsd: budget.state.settledUsd, heldUsd: budget.state.unresolvedUsd, posts: budget.state.posts, testUsd },
     stop: stop ? { at: stop.at, endpoints: (stop.stepfunEndpoints || []).map((row) => ({ tag: row.tag, status: row.status, uptimeLast30m: row.uptime_last_30m, uptimeLast1d: row.uptime_last_1d })) } : null,
   };
@@ -95,20 +94,6 @@ export function renderNote(note) {
   if (note.stop) lines.push(`- Причина остановки (${note.stop.at}): хосты ${short(note.selection.h)} — ${note.stop.endpoints.map((row) => `\`${row.tag}\` статус ${row.status}, доступность за 30 мин ${row.uptimeLast30m ?? 'n/a'}%, за сутки ${row.uptimeLast1d == null ? 'n/a' : Number(row.uptimeLast1d).toFixed(1)}%`).join('; ')}.`);
   lines.push(`- Расход кампании: подтверждено ${usd2(note.money.settledUsd)} (из них тест ${usd2(note.money.testUsd)}), удержано ${usd2(note.money.heldUsd)}, ${note.money.posts} POST.`);
   return lines.join('\n');
-}
-
-export function placeAfter(readme, start, end, body, after) {
-  const replaced = replaceSection(readme, start, end, `\n${body}\n`);
-  if (replaced != null) return replaced;
-  const at = readme.indexOf(after);
-  if (at < 0) throw new Error(`${after} is not in the README`);
-  const cut = at + after.length;
-  return `${readme.slice(0, cut)}\n\n${start}\n\n${body}\n\n${end}${readme.slice(cut)}`;
-}
-
-function flagValue(argv, name) {
-  const index = argv.indexOf(name);
-  return index < 0 ? null : (argv[index + 1] ?? null);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

@@ -9,7 +9,9 @@ import { syncBuiltinESMExports } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const key = (file) => path.resolve(file instanceof URL ? fileURLToPath(file) : String(file)).toLowerCase();
+// Windows paths compare without case; others compare as they are.
+const fold = process.platform === 'win32' ? (text) => text.toLowerCase() : (text) => text;
+const key = (file) => fold(path.resolve(file instanceof URL ? fileURLToPath(file) : String(file)));
 const pairs = JSON.parse(process.env.FROZEN_REDIRECT || '[]');
 const redirect = new Map(pairs.map(([live, frozen]) => [key(live), frozen]));
 const readFileSync = fs.readFileSync;

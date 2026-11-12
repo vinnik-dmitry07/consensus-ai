@@ -187,8 +187,8 @@ describe('a8 host check', () => {
 describe('a8 run note', () => {
   it('counts slots by state without reading a result', () => {
     const slot = (model, state, extra = {}) => ({ meta: { model }, state, httpAttempts: 1, limitedAttempts: 0, ...extra });
-    const counts = testCounts([slot('s', 'completed'), slot('s', 'skipped', { limitedAttempts: 3, httpAttempts: 3 }), slot('d', 'failed')], 's');
-    expect(counts).toMatchObject({ slots: 3, posts: 5, refusals: 3, failed: 1, chairmanDone: 1 });
+    const counts = testCounts([slot('s', 'completed'), slot('s', 'skipped', { limitedAttempts: 3, httpAttempts: 3 }), slot('d', 'failed')]);
+    expect(counts).toMatchObject({ slots: 3, posts: 5, refusals: 3, failed: 1 });
     expect(counts.byModel).toEqual({ s: { completed: 1, other: 1 }, d: { completed: 0, other: 1 } });
   });
 

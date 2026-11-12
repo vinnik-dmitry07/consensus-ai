@@ -9,27 +9,25 @@
 //   node frontend/eval/finishProbeV4Readme.js --readme
 //   node frontend/eval/finishProbeV4Readme.js --analysis --live
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { placeAfter } from './a8RunNote.js';
+import { markers as campaignMarkers } from './a8CampaignNote.js';
 import {
-  ANALYSIS_END, ANALYSIS_START, PROTOCOL_V4, README_END, README_START, V4_INSTRUCTION, renderV4Readme, v4AnalysisSection,
+  ANALYSIS_END, ANALYSIS_LIMITS, ANALYSIS_START, PROTOCOL_V4, README_END, README_START, V4_INSTRUCTION, renderV4Readme, v4AnalysisSection,
 } from './finishProbeV4.js';
+import { placeAfter, placeAnalysis, readJson, readJsonl, ruleFiles } from './noteTools.js';
 
 const EVAL_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const RUN_DIR = path.join(EVAL_ROOT, '.runs', 'finish-probe-v4');
 const README = path.join(EVAL_ROOT, 'README.md');
-export const AFTER = '<!-- a8-open-v7-analysis:end -->';
+export const AFTER = campaignMarkers('a8-open-v7').analysisEnd;
 export const NOTE_START = '<!-- finish-probe-v4-note:start -->';
 export const NOTE_END = '<!-- finish-probe-v4-note:end -->';
 const VERDICT_RU = Object.freeze({ pass: 'выполнен', fail: 'не выполнен', not_evaluable: 'не определён' });
 // Each decision code and the criteria its frozen text calls "held".
 export const CLAIMED_HELD = Object.freeze({ accepted_often_wrong: ['k4'], no_use_for_arms: ['k4', 'kp'], confirmed_for_arms: ['k4', 'kp', 'kw'] });
-
-const readJson = (file) => (existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : null);
-const readJsonl = (file) => (existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)) : []);
 
 // Pure: the note from the report and the stops of the run.
 export function buildNote({ result }, stops) {
@@ -49,30 +47,20 @@ export function buildNote({ result }, stops) {
   return lines.join('\n');
 }
 
-export async function runAnalysisLive() {
-  const report = readFileSync(path.join(RUN_DIR, 'report.md'), 'utf8');
+export function runAnalysisLive() {
   const note = readFileSync(path.join(RUN_DIR, 'readme-note.md'), 'utf8');
-  const { runAnalysis } = await import('./evalAnalysis.js');
-  const rules = [
-    ...[PROTOCOL_V4, 'finish-probe-protocol.md'].map((name) => `# File ${name}\n\n${readFileSync(path.join(EVAL_ROOT, name), 'utf8')}`),
-    `# Note computed from the report (README, beside the block)\n\n${note}`,
-  ].join('\n\n');
-  const record = await runAnalysis({
-    dir: path.join(RUN_DIR, 'analysis'), instruction: V4_INSTRUCTION, rules, report,
-    limits: { maxUsd: 0.5, maxPosts: 8 }, key: String(process.env.or_key || process.env.OR_KEY || '').trim(),
+  return placeAnalysis({
+    dir: path.join(RUN_DIR, 'analysis'),
+    instruction: V4_INSTRUCTION,
+    rules: `${ruleFiles(EVAL_ROOT, [PROTOCOL_V4, 'finish-probe-protocol.md'])}\n\n# Note computed from the report (README, beside the block)\n\n${note}`,
+    report: readFileSync(path.join(RUN_DIR, 'report.md'), 'utf8'),
+    limits: ANALYSIS_LIMITS,
+    readme: README,
+    start: ANALYSIS_START,
+    end: ANALYSIS_END,
+    after: NOTE_END,
+    section: (record) => v4AnalysisSection(record.text, record.check, record.writer, record.checker),
   });
-  console.log(`analysis spend: settled $${record.spend.settledUsd.toFixed(4)}, ${record.spend.posts} POSTs`);
-  if (!record.text) {
-    console.log(`analysis not placed: ${record.reason}`);
-    return 2;
-  }
-  const body = v4AnalysisSection(record.text, record.check, record.writer, record.checker);
-  writeFileSync(path.join(RUN_DIR, 'analysis', 'analysis.md'), `${body}\n`, 'utf8');
-  const text = readFileSync(README, 'utf8');
-  if (!text.includes(NOTE_END)) throw new Error('Place the v4 block and note first (--readme).');
-  writeFileSync(README, placeAfter(text, ANALYSIS_START, ANALYSIS_END, body, NOTE_END), 'utf8');
-  console.log('analysis placed in README');
-  return 0;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

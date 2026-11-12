@@ -10,15 +10,13 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { placeAfter } from './a8RunNote.js';
+import { markers as runNoteMarkers } from './a8RunNote.js';
+import { ANALYSIS_LIMITS, flagValue, placeAfter, placeAnalysis, readJson, ruleFiles } from './noteTools.js';
 
 const EVAL_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const RUNS_ROOT = path.join(EVAL_ROOT, '.runs');
 const README = path.join(EVAL_ROOT, 'README.md');
 export const SECTIONS = Object.freeze(['Secondary family', 'Dev selection', 'Calls by stage', 'Cost']);
-export const ANALYSIS_LIMITS = Object.freeze({ maxUsd: 0.5, maxPosts: 8 });
-
-const readJson = (file) => (existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : null);
 
 export function markers(run) {
   return {
@@ -99,36 +97,22 @@ export function analysisSection(run, text, check, writer, checker) {
   ].join('\n');
 }
 
-function flagValue(argv, name) {
-  const index = argv.indexOf(name);
-  return index < 0 ? null : (argv[index + 1] ?? null);
-}
-
-async function runCampaignAnalysis(run) {
-  const { runAnalysis } = await import('./evalAnalysis.js');
+function runCampaignAnalysis(run) {
+  // v7 and later protocols restate only what differs from v6, so v6 goes with them.
   const protocols = [`${run}-protocol.md`, 'a8-open-v6-protocol.md'].filter((name, index, list) => list.indexOf(name) === index && existsSync(path.join(EVAL_ROOT, name)));
-  const rules = protocols.map((name) => `# File ${name}\n\n${readFileSync(path.join(EVAL_ROOT, name), 'utf8')}`).join('\n\n');
-  const record = await runAnalysis({
+  const { end, analysisStart, analysisEnd } = markers(run);
+  return placeAnalysis({
     dir: path.join(RUNS_ROOT, run, 'analysis'),
     instruction: CAMPAIGN_INSTRUCTION,
-    rules,
+    rules: ruleFiles(EVAL_ROOT, protocols),
     report: readFileSync(path.join(RUNS_ROOT, run, 'reports', 'report.md'), 'utf8'),
     limits: ANALYSIS_LIMITS,
-    key: String(process.env.or_key || process.env.OR_KEY || '').trim(),
+    readme: README,
+    start: analysisStart,
+    end: analysisEnd,
+    after: end,
+    section: (record) => analysisSection(run, record.text, record.check, record.writer, record.checker),
   });
-  console.log(`analysis spend: settled $${record.spend.settledUsd.toFixed(4)}, ${record.spend.posts} POSTs`);
-  if (!record.text) {
-    console.log(`analysis not placed: ${record.reason}`);
-    return 2;
-  }
-  const { end, analysisStart, analysisEnd } = markers(run);
-  const body = analysisSection(run, record.text, record.check, record.writer, record.checker);
-  writeFileSync(path.join(RUNS_ROOT, run, 'analysis', 'analysis.md'), `${body}\n`, 'utf8');
-  const readme = readFileSync(README, 'utf8');
-  if (!readme.includes(end)) throw new Error('Place the campaign block first (--readme).');
-  writeFileSync(README, placeAfter(readme, analysisStart, analysisEnd, body, end), 'utf8');
-  console.log('analysis placed in README');
-  return 0;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -144,7 +128,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     if (argv.includes('--readme')) {
       const { start, end } = markers(run);
       const text = readFileSync(README, 'utf8');
-      const next = placeAfter(text, start, end, block, flagValue(argv, '--after') || '<!-- a8-open-v6:end -->');
+      const next = placeAfter(text, start, end, block, flagValue(argv, '--after') || runNoteMarkers('a8-open-v6').end);
       if (next !== text) writeFileSync(README, next, 'utf8');
     }
     console.log(block);

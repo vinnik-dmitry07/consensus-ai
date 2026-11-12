@@ -18,12 +18,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const EVAL_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const RUNS_ROOT = path.join(EVAL_ROOT, '.runs');
-export const LIVE = path.join(RUNS_ROOT, 'a8-open-v5e', 'reports', 'report-corrected.md');
-export const FROZEN = path.join(RUNS_ROOT, 'frozen-inputs', 'a8-open-v5e', 'report-corrected.md');
-export const REDIRECT = path.join(EVAL_ROOT, 'frozenInputRedirect.mjs');
-export const RUNS = Object.freeze(['finish-probe-v2', 'finish-probe-v3']);
+const LIVE = path.join(RUNS_ROOT, 'a8-open-v5e', 'reports', 'report-corrected.md');
+const FROZEN = path.join(RUNS_ROOT, 'frozen-inputs', 'a8-open-v5e', 'report-corrected.md');
+const REDIRECT = path.join(EVAL_ROOT, 'frozenInputRedirect.mjs');
+const RUNS = Object.freeze(['finish-probe-v2', 'finish-probe-v3']);
 
-export const fileSha = (file) => createHash('sha256').update(readFileSync(file)).digest('hex');
+const fileSha = (file) => createHash('sha256').update(readFileSync(file)).digest('hex');
 
 // A node child that reads `live` as `frozen`.
 export function runRedirected(args, pairs, options = {}) {
@@ -51,11 +51,11 @@ function rebuild(run) {
   const child = runRedirected([path.join(EVAL_ROOT, 'finishProbeCli.js'), run, '--phase', 'report'], [[LIVE, FROZEN]], { env: { or_key: '', OR_KEY: '' } });
   const after = files.map(fileSha);
   const changed = files.filter((_, index) => before[index] !== after[index]).map((file) => path.basename(file));
-  const tail = String(child.stderr || '').split('\n').filter((line) => line && !line.includes('NODE_TLS')).slice(0, 1)[0] || '';
+  const tail = String(child.stderr || '').split('\n').find((line) => line && !line.includes('NODE_TLS')) || '';
   return { run, exit: child.status, files: files.map((file) => path.basename(file)), changed, tail };
 }
 
-export function main() {
+function main() {
   const want = frozenHash();
   if (!existsSync(FROZEN) || fileSha(FROZEN) !== want) throw new Error(`No frozen copy with sha ${want.slice(0, 12)} at ${FROZEN}`);
   const live = fileSha(LIVE);

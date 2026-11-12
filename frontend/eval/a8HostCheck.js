@@ -14,7 +14,8 @@ import { fileURLToPath } from 'node:url';
 
 import { createCampaignBudget } from './budget.js';
 import { audit } from './finishProbe.js';
-import { V3BudgetStop, budgetedFetch } from './finishProbeV3.js';
+import { V3BudgetStop, budgetedFetch, providerOf } from './finishProbeV3.js';
+import { envKey, flagValue, median, readJsonl } from './noteTools.js';
 
 const EVAL_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const RUNS_ROOT = path.join(EVAL_ROOT, '.runs');
@@ -28,13 +29,6 @@ export const MIN_TOKENS_PER_SECOND = 10;
 export const MAX_TOKENS = 512;
 export const LIMITS = Object.freeze({ maxUsd: 0.25, maxPosts: 15 });
 export const PROMPT = 'Write the whole numbers from 1 to 300 in order, separated by single spaces, and nothing else.';
-
-export function median(values) {
-  if (!values.length) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-}
 
 // Pure: the verdict from the rows of the calls.
 export function hostVerdict(rows, { minAccepted = MIN_ACCEPTED, minSpeed = MIN_TOKENS_PER_SECOND } = {}) {
@@ -59,20 +53,10 @@ export function requestBody(route, tag) {
     max_tokens: MAX_TOKENS,
     temperature: route.temperature ?? 0.7,
     top_p: route.topP ?? 1,
-    provider: { order: [tag], allow_fallbacks: false, max_price: route.provider.max_price },
+    provider: providerOf(route, { tag }),
     stream: false,
     usage: { include: true },
   };
-}
-
-function flagValue(argv, name) {
-  const index = argv.indexOf(name);
-  return index < 0 ? null : (argv[index + 1] ?? null);
-}
-
-function readJsonl(file) {
-  if (!existsSync(file)) return [];
-  return readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
 }
 
 export async function runHostCheck(argv, { root = RUNS_ROOT, fetchImpl = fetch } = {}) {
@@ -82,7 +66,7 @@ export async function runHostCheck(argv, { root = RUNS_ROOT, fetchImpl = fetch }
   const from = flagValue(argv, '--from') || 'a8-routes-v6';
   const out = flagValue(argv, '--out');
   if (!modelId || !tag || !out) throw new Error('--model, --tag, and --out are required');
-  const key = String(process.env.or_key || process.env.OR_KEY || '').trim();
+  const key = envKey();
   if (!key) throw new Error('or_key is missing');
   const snapshot = JSON.parse(readFileSync(path.join(root, from, 'preflight.json'), 'utf8'));
   const route = snapshot.routes.find((row) => row.id === modelId);
@@ -134,7 +118,7 @@ export async function runHostCheck(argv, { root = RUNS_ROOT, fetchImpl = fetch }
     model: modelId,
     tag,
     rule: `use when at least ${MIN_ACCEPTED} of ${CALLS} calls at once come back with a generation and the median speed is at least ${MIN_TOKENS_PER_SECOND} tokens/s; otherwise drop the model`,
-    request: { ...body, messages: [{ role: 'user', content: PROMPT }] },
+    request: body,
     ...verdict,
     rows,
     spend: { settledUsd: budget.state.settledUsd, heldUsd: budget.state.unresolvedUsd, posts: budget.state.posts },
