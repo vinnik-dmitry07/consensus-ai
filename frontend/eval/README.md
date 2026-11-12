@@ -663,7 +663,7 @@ Tail rule applied: Stage 1 answers 123, B samples 180, judges 82.
 #### Cost
 
 Campaign: settled $17.0371, still held $0.2163, 858 POSTs of 4000; cap $90.
-Key usage at the last audit: 94.134437301 (an audit only; it never releases a reserve).
+Key usage at the last audit: 96.997296052 (an audit only; it never releases a reserve).
 Test questions, paid once: $13.7050. Standalone, with B's first answer counted in both: A8 $10.0840, S8 $4.2997. Held reserves inside these: A8 $0.2163, S8 $0.0000. Retries count toward their own arm.
 Preparation phases (probe, dev, smoke, pilot, self-test): $3.5484. No claim is made about efficiency at an equal budget.
 
