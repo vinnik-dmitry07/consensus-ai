@@ -139,6 +139,13 @@
       "value": 62.5,
       "digits": 0,
       "expected": "62"
+    },
+    {
+      "name": "self-moa synthesis prompt",
+      "kind": "self_moa_prompt",
+      "query": "What is 2 + 2?",
+      "samples": ["4", "Four."],
+      "expected": "You are aggregating independent answers from one model.\nThe samples may repeat the same mistake. Do not treat agreement as proof.\n\nOriginal Question: What is 2 + 2?\n\nSAMPLES:\n\nSample slot 1:\n4\n\nSample slot 2:\nFour.\n\nYour task:\n- Check the reasoning of every sample. Keep what is correct and fix what is wrong.\n- Where the samples disagree, work out which answer is right instead of following the majority.\n- Do not mention the samples, the aggregation, or model names.\n\nProvide a clear, well-reasoned final answer:"
     }
   ]
 }

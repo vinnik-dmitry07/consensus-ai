@@ -24,10 +24,15 @@ from .council import (
     retained_stage1_failures,
     run_full_council,
     run_post_ranking,
+    run_self_moa,
+    self_moa_metadata,
+    self_moa_model,
+    self_moa_synthesize,
     stage1_collect_responses_streaming,
     stage2_collect_rankings_streaming,
     stage3_synthesize_final,
 )
+from .config import MODE_COUNCIL, MODE_SELF_MOA, SELF_MOA_SAMPLES
 from .openrouter import (
     CatalogueUnavailable,
     get_credits,
@@ -298,14 +303,23 @@ async def _emit_stage1_sse(
     collected: Dict[str, Any],
     existing_results: Optional[List[Dict[str, Any]]] = None,
     existing_failures: Optional[List[Dict[str, Any]]] = None,
+    self_moa_model_id: Optional[str] = None,
 ):
-    """Yield Stage 1 SSE lines and persist successes and failures as they land."""
+    """Yield Stage 1 SSE lines and persist successes and failures as they land.
+
+    With self_moa_model_id, Stage 1 is that one model's Self-MoA samples.
+    """
     results: List[Dict[str, Any]] = []
     failures: Optional[List[Dict[str, Any]]] = None
-    council_models = list(settings.council_models)
+    if self_moa_model_id:
+        council_models = [self_moa_model_id]
+        sample_limit = SELF_MOA_SAMPLES
+    else:
+        council_models = list(settings.council_models)
+        sample_limit = stage1_sample_limit(council_models, settings.n_samples)
     pending = pending_stage1_slots(
         council_models,
-        stage1_sample_limit(council_models, settings.n_samples),
+        sample_limit,
         existing_results,
     )
     retained = retained_stage1_failures(
@@ -318,10 +332,18 @@ async def _emit_stage1_sse(
         stage1_skipped=[],
     )
     collected['skipped'] = []
+    stage1_options = {}
+    if self_moa_model_id:
+        stage1_options = {
+            'n': SELF_MOA_SAMPLES,
+            'council_models': council_models,
+            'cap_samples': False,
+        }
     async for event_type, event_data in stage1_collect_responses_streaming(
         user_message,
         existing_results=existing_results,
         existing_failures=existing_failures,
+        **stage1_options,
     ):
         if event_type == 'init':
             yield f"data: {json.dumps({'type': 'stage1_init', 'data': event_data})}\n\n"
@@ -374,6 +396,57 @@ async def _emit_stage1_sse(
     if failures_known:
         payload['failures'] = failures
     yield f"data: {json.dumps(payload)}\n\n"
+
+
+def _stored_self_moa_model(assistant: Dict[str, Any]) -> Optional[str]:
+    """The Self-MoA model a stored message ran with, or None for a council run.
+
+    A message with rankings or council metadata is a council run. Only a
+    message with no record of its run follows the current setting.
+    """
+    metadata = assistant.get('metadata') or {}
+    if metadata.get('mode') == MODE_SELF_MOA:
+        model = metadata.get('model')
+        if not model:
+            samples = assistant.get('stage1') or []
+            model = samples[0].get('model') if samples else None
+        return model or self_moa_model()
+    if metadata or assistant.get('stage2'):
+        return None
+    if settings.mode == MODE_SELF_MOA:
+        return self_moa_model()
+    return None
+
+
+async def _emit_self_moa_stage3_sse(
+    conversation_id: str,
+    msg_index: int,
+    query_text: str,
+    stage1_results: List[Dict[str, Any]],
+    model: str,
+    outcome: Dict[str, Any],
+):
+    """Self-MoA synthesis. Sets outcome['stopped'] when it fails."""
+    outcome['stopped'] = False
+    metadata = self_moa_metadata(stage1_results, model)
+    storage.update_streaming_message(conversation_id, msg_index, metadata=metadata)
+    yield f"data: {json.dumps({'type': 'stage3_start', 'metadata': metadata})}\n\n"
+    try:
+        stage3_result = await self_moa_synthesize(query_text, stage1_results, model)
+        storage.update_streaming_message(
+            conversation_id, msg_index,
+            stage3=stage3_result,
+            streaming=False,
+        )
+        yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
+    except Exception as e:
+        storage.update_streaming_message(
+            conversation_id, msg_index,
+            error={'stage': 3, 'message': str(e)},
+            streaming=False,
+        )
+        outcome['stopped'] = True
+        yield f"data: {json.dumps({'type': 'stage3_error', 'stage': 3, 'message': str(e)})}\n\n"
 
 
 def _stage2_fail_message(failures: List[Dict[str, Any]]) -> str:
@@ -613,6 +686,7 @@ class UpdateSettingsRequest(BaseModel):
     red_team_model: Optional[str] = None
     self_exclusion: Optional[bool] = None
     api_key: Optional[str] = None
+    mode: Optional[str] = None
 
 
 @app.get("/api/settings")
@@ -625,6 +699,13 @@ async def get_settings():
 async def update_settings(request: UpdateSettingsRequest):
     """Update council settings."""
     update_data = {}
+    if request.mode is not None:
+        if request.mode not in (MODE_COUNCIL, MODE_SELF_MOA):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown mode: {request.mode}",
+            )
+        update_data['mode'] = request.mode
     if request.council_models is not None:
         update_data['council_models'] = request.council_models
     if request.n_samples is not None:
@@ -699,6 +780,7 @@ async def get_council_pricing():
     
     # Also return the council structure
     return {
+        'mode': settings.mode,
         'council_models': settings.council_models,
         'chairman_model': settings.chairman_model,
         'n_samples': settings.n_samples,
@@ -800,10 +882,16 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
         title = await generate_conversation_title(query_text)
         storage.update_conversation_title(conversation_id, title)
 
-    # Run the 3-stage council process
-    stage1_results, stage2_results, stage3_result, metadata = await run_full_council(
-        user_message
-    )
+    # Run the 3-stage council process, or Self-MoA
+    if settings.mode == MODE_SELF_MOA:
+        stage1_results, stage3_result, metadata = await run_self_moa(
+            user_message, query_text
+        )
+        stage2_results = []
+    else:
+        stage1_results, stage2_results, stage3_result, metadata = await run_full_council(
+            user_message
+        )
 
     # Add assistant message with all stages and metadata
     stage1_failures = (metadata or {}).get('stage1_failures') or []
@@ -850,6 +938,8 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
 
     # Check if this is the first message
     is_first_message = len(conversation["messages"]) == 0
+    # The mode and the Self-MoA model are fixed when the run starts.
+    moa_model = self_moa_model() if settings.mode == MODE_SELF_MOA else None
 
     async def event_generator():
         stage1_results = None
@@ -882,6 +972,12 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
 
             # Create empty assistant message for streaming (saved to disk immediately)
             msg_index = storage.create_streaming_assistant_message(conversation_id)
+            if moa_model:
+                # Recorded first, so a retry of an interrupted run keeps the mode.
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    metadata={'mode': MODE_SELF_MOA, 'model': moa_model},
+                )
 
             # Start title generation in parallel (don't await yet)
             if is_first_message and follow_up_to is None:
@@ -893,7 +989,8 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             try:
                 collected = {}
                 async for chunk in _emit_stage1_sse(
-                    conversation_id, msg_index, user_message, collected
+                    conversation_id, msg_index, user_message, collected,
+                    self_moa_model_id=moa_model,
                 ):
                     yield chunk
                 stage1_results = collected['results']
@@ -903,54 +1000,66 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                 )
                 return
 
-            # Stage 2: Collect rankings with streaming progress
-            current_stage = 2
-            yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
-            collected_s2 = {}
-            try:
-                async for chunk in _emit_stage2_sse(
-                    conversation_id, msg_index, query_text, stage1_results, collected_s2
+            if moa_model:
+                # Self-MoA: the same model combines its samples. No Stage 2.
+                current_stage = 3
+                outcome = {}
+                async for chunk in _emit_self_moa_stage3_sse(
+                    conversation_id, msg_index, query_text,
+                    stage1_results, moa_model, outcome,
                 ):
                     yield chunk
-                stage2_results = collected_s2['results']
-                label_to_model = collected_s2['label_to_model']
-            except Exception as e:
-                yield _persist_stage2_error(conversation_id, msg_index, e, collected_s2)
-                return
-
-            current_stage = 2
-            yield f"data: {json.dumps({'type': 'redteam_start'})}\n\n"
-            metadata, red_team_ok, red_team_error = await _run_and_save_post_ranking(
-                conversation_id, msg_index, query_text,
-                stage1_results, stage2_results, label_to_model,
-            )
-            if red_team_ok:
-                yield f"data: {json.dumps({'type': 'redteam_complete', 'metadata': metadata})}\n\n"
+                if outcome.get('stopped'):
+                    return
             else:
-                yield f"data: {json.dumps({'type': 'redteam_error', 'message': red_team_error or 'Red-team review unavailable', 'metadata': metadata})}\n\n"
+                # Stage 2: Collect rankings with streaming progress
+                current_stage = 2
+                yield f"data: {json.dumps({'type': 'stage2_start'})}\n\n"
+                collected_s2 = {}
+                try:
+                    async for chunk in _emit_stage2_sse(
+                        conversation_id, msg_index, query_text, stage1_results, collected_s2
+                    ):
+                        yield chunk
+                    stage2_results = collected_s2['results']
+                    label_to_model = collected_s2['label_to_model']
+                except Exception as e:
+                    yield _persist_stage2_error(conversation_id, msg_index, e, collected_s2)
+                    return
 
-            # Stage 3: Synthesize final answer
-            current_stage = 3
-            yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
-            try:
-                stage3_result = await stage3_synthesize_final(
-                    query_text, stage1_results, stage2_results, metadata
+                current_stage = 2
+                yield f"data: {json.dumps({'type': 'redteam_start'})}\n\n"
+                metadata, red_team_ok, red_team_error = await _run_and_save_post_ranking(
+                    conversation_id, msg_index, query_text,
+                    stage1_results, stage2_results, label_to_model,
                 )
-                # Save stage3 and mark streaming complete
-                storage.update_streaming_message(
-                    conversation_id, msg_index,
-                    stage3=stage3_result,
-                    streaming=False
-                )
-                yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
-            except Exception as e:
-                storage.update_streaming_message(
-                    conversation_id, msg_index,
-                    error={'stage': 3, 'message': str(e)},
-                    streaming=False
-                )
-                yield f"data: {json.dumps({'type': 'stage3_error', 'stage': 3, 'message': str(e)})}\n\n"
-                return
+                if red_team_ok:
+                    yield f"data: {json.dumps({'type': 'redteam_complete', 'metadata': metadata})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'type': 'redteam_error', 'message': red_team_error or 'Red-team review unavailable', 'metadata': metadata})}\n\n"
+
+                # Stage 3: Synthesize final answer
+                current_stage = 3
+                yield f"data: {json.dumps({'type': 'stage3_start'})}\n\n"
+                try:
+                    stage3_result = await stage3_synthesize_final(
+                        query_text, stage1_results, stage2_results, metadata
+                    )
+                    # Save stage3 and mark streaming complete
+                    storage.update_streaming_message(
+                        conversation_id, msg_index,
+                        stage3=stage3_result,
+                        streaming=False
+                    )
+                    yield f"data: {json.dumps({'type': 'stage3_complete', 'data': stage3_result})}\n\n"
+                except Exception as e:
+                    storage.update_streaming_message(
+                        conversation_id, msg_index,
+                        error={'stage': 3, 'message': str(e)},
+                        streaming=False
+                    )
+                    yield f"data: {json.dumps({'type': 'stage3_error', 'stage': 3, 'message': str(e)})}\n\n"
+                    return
 
             # Wait for title generation if it was started
             if title_task:
@@ -1026,10 +1135,11 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
     await _require_servable_roster()
 
     msg_index = request.message_index
-    
+
     # Get existing stage1 results for resume
     existing_stage1 = messages[msg_index].get("stage1") or []
     existing_failures = messages[msg_index].get('stage1_failures')
+    moa_model = _stored_self_moa_model(assistant)
 
     async def event_generator():
         stage1_results = None
@@ -1049,6 +1159,11 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
                 stage2=None, stage3=None, metadata=None, streaming=True,
                 stage1_complete=False, stage2_failures=[], stage2_skipped=[],
             )
+            if moa_model:
+                storage.update_streaming_message(
+                    conversation_id, msg_index,
+                    metadata={'mode': MODE_SELF_MOA, 'model': moa_model},
+                )
 
             # Stage 1: Collect responses with streaming progress (resume from existing)
             yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
@@ -1061,6 +1176,7 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
                     collected,
                     existing_results=existing_stage1,
                     existing_failures=existing_failures,
+                    self_moa_model_id=moa_model,
                 ):
                     yield chunk
                 stage1_results = collected['results']
@@ -1068,6 +1184,18 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
                 yield _persist_stage1_error(
                     conversation_id, msg_index, e, collected
                 )
+                return
+
+            if moa_model:
+                current_stage = 3
+                outcome = {}
+                async for chunk in _emit_self_moa_stage3_sse(
+                    conversation_id, msg_index, query_text,
+                    stage1_results, moa_model, outcome,
+                ):
+                    yield chunk
+                if not outcome.get('stopped'):
+                    yield f"data: {json.dumps({'type': 'complete'})}\n\n"
                 return
 
             current_stage = 2
@@ -1130,6 +1258,39 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
     )
 
 
+def _self_moa_retry_stream(
+    conversation_id: str,
+    msg_index: int,
+    query_text: str,
+    stage1_results: List[Dict[str, Any]],
+    model: str,
+) -> StreamingResponse:
+    """Retry the synthesis of a Self-MoA message from its stored samples."""
+
+    async def event_generator():
+        try:
+            storage.update_streaming_message(
+                conversation_id, msg_index, stage3=None, streaming=True
+            )
+            outcome = {}
+            async for chunk in _emit_self_moa_stage3_sse(
+                conversation_id, msg_index, query_text,
+                stage1_results, model, outcome,
+            ):
+                yield chunk
+            if not outcome.get('stopped'):
+                yield f"data: {json.dumps({'type': 'complete'})}\n\n"
+        except Exception as e:
+            yield _persist_generic_error(conversation_id, msg_index, 3, e)
+
+    _require_api_key()
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+    )
+
+
 @app.post("/api/conversations/{conversation_id}/retry/stage2/stream")
 async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
     """
@@ -1160,6 +1321,12 @@ async def retry_stage2_stream(conversation_id: str, request: RetryStageRequest):
     _, query_text = _rebuild_council_query(conversation, user_msg_index)
     await _require_servable_roster()
     msg_index = request.message_index
+    moa_model = _stored_self_moa_model(assistant_msg)
+    if moa_model:
+        # A Self-MoA run has no Stage 2: retrying it means its synthesis.
+        return _self_moa_retry_stream(
+            conversation_id, msg_index, query_text, stage1_results, moa_model
+        )
 
     async def event_generator():
         stage2_results = None
@@ -1255,10 +1422,11 @@ async def retry_stage3_stream(conversation_id: str, request: RetryStageRequest):
 
     stage1_results = assistant_msg.get("stage1")
     stage2_results = assistant_msg.get("stage2")
+    moa_model = _stored_self_moa_model(assistant_msg)
 
     if not stage1_results:
         raise HTTPException(status_code=400, detail="Stage 1 results not available. Retry Stage 1 first.")
-    if not stage2_results:
+    if not stage2_results and not moa_model:
         raise HTTPException(status_code=400, detail="Stage 2 results not available. Retry Stage 2 first.")
 
     # Get user message
@@ -1269,6 +1437,10 @@ async def retry_stage3_stream(conversation_id: str, request: RetryStageRequest):
     _, query_text = _rebuild_council_query(conversation, user_msg_index)
     await _require_servable_roster()
     msg_index = request.message_index
+    if moa_model:
+        return _self_moa_retry_stream(
+            conversation_id, msg_index, query_text, stage1_results, moa_model
+        )
 
     async def event_generator():
         metadata = dict(assistant_msg.get('metadata') or {})

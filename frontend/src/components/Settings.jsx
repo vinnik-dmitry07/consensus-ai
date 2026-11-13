@@ -20,6 +20,7 @@ import {
   DEFAULT_COUNCIL_MODELS,
   DEFAULT_N_SAMPLES,
 } from '../engine/browser/settings.js';
+import { SELF_MOA_SAMPLES } from '../engine/browser/selfMoa.js';
 import {
   forgetGithubToken,
   getGithubToken,
@@ -46,6 +47,7 @@ export default function Settings({
   const [error, setError] = useState(null);
 
   // Local state for editing
+  const [mode, setMode] = useState('council');
   const [nSamples, setNSamples] = useState(1);
   const [councilModels, setCouncilModels] = useState([]);
   const [chairmanModel, setChairmanModel] = useState('');
@@ -123,6 +125,7 @@ export default function Settings({
   }, [councilModels, nSamples]);
 
   const showSavedSettings = (settingsData) => {
+    setMode(settingsData.mode === 'self_moa' ? 'self_moa' : 'council');
     setTopK(settingsData.top_k ?? 3);
     setSelfExclusion(settingsData.self_exclusion !== false);
     setHasApiKey(settingsData.has_api_key || false);
@@ -423,6 +426,7 @@ export default function Settings({
       setEngineMode(engineMode);
       setApiBase(nextBase);
       const updateData = sameEngine ? {
+        mode,
         n_samples: nSamples,
         council_models: councilModels,
         chairman_model: chairmanModel,
@@ -449,6 +453,9 @@ export default function Settings({
         }
         if (updatedSettings.chairman_model) {
           setChairmanModel(updatedSettings.chairman_model);
+        }
+        if (updatedSettings.mode) {
+          setMode(updatedSettings.mode === 'self_moa' ? 'self_moa' : 'council');
         }
         setRedTeamModel(updatedSettings.red_team_model || '');
         setHasApiKey(updatedSettings.has_api_key || false);
@@ -536,6 +543,7 @@ export default function Settings({
       freeManagedDraft.current = false;
       rosterTouched.current = false;
       setFreeRosterNote('');
+      setMode(resetSettings.mode === 'self_moa' ? 'self_moa' : 'council');
       setNSamples(resetSettings.n_samples);
       setCouncilModels(resetSettings.council_models);
       setChairmanModel(resetSettings.chairman_model);
@@ -749,7 +757,38 @@ export default function Settings({
                 </div>
               </div>
 
+              {/* Answer mode */}
+              <div className="settings-section">
+                <h3>Answer Mode</h3>
+                <p className="settings-description">
+                  {mode === 'self_moa'
+                    ? `Self-MoA (S8): the model chosen below answers ${SELF_MOA_SAMPLES} times on its own, then the same model combines those answers. No peer ranking and no red team; ${SELF_MOA_SAMPLES + 1} calls per question. The council list is kept for council mode.`
+                    : 'Council: every council model answers, the models rank each other anonymously, a red team checks the leader, and the chairman writes the final answer.'}
+                </p>
+                <div className="engine-options">
+                  <label className="toggle-row">
+                    <input
+                      type="radio"
+                      name="answer-mode"
+                      checked={mode === 'council'}
+                      onChange={() => { markDirty(); setMode('council'); }}
+                    />
+                    <span>Council (default)</span>
+                  </label>
+                  <label className="toggle-row">
+                    <input
+                      type="radio"
+                      name="answer-mode"
+                      checked={mode === 'self_moa'}
+                      onChange={() => { markDirty(); setMode('self_moa'); }}
+                    />
+                    <span>Self-MoA (S8): one model, {SELF_MOA_SAMPLES} samples, self-synthesis</span>
+                  </label>
+                </div>
+              </div>
+
               {/* N_SAMPLES Setting */}
+              {mode !== 'self_moa' && (
               <div className="settings-section">
                 <h3>Samples per Model</h3>
                 <p className="settings-description">
@@ -786,6 +825,7 @@ export default function Settings({
                   Total Stage 1 calls: {nSamples * councilModels.length}
                 </div>
               </div>
+              )}
 
               {/* Council Models */}
               <div className="settings-section">
@@ -964,6 +1004,7 @@ export default function Settings({
               </div>
 
               {/* Deliberation */}
+              {mode !== 'self_moa' && (
               <div className="settings-section">
                 <h3>Deliberation</h3>
                 <p className="settings-description">
@@ -1025,12 +1066,15 @@ export default function Settings({
                   </select>
                 </div>
               </div>
+              )}
 
               {/* Chairman Model */}
               <div className="settings-section">
-                <h3>Chairman Model</h3>
+                <h3>{mode === 'self_moa' ? 'Self-MoA Model' : 'Chairman Model'}</h3>
                 <p className="settings-description">
-                  The model that synthesizes the final response from all council outputs.
+                  {mode === 'self_moa'
+                    ? `The one model that answers ${SELF_MOA_SAMPLES} times and combines its own answers. In council mode it is the chairman.`
+                    : 'The model that synthesizes the final response from all council outputs.'}
                 </p>
                 
                 <div className="chairman-selector">

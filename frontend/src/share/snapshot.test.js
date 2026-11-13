@@ -71,6 +71,21 @@ describe('share snapshot', () => {
     expect(snapshot.conversation.messages[1].run_roster.token).toBeUndefined();
   });
 
+  it('keeps the self-moa mode of a run and drops an unknown one', () => {
+    const conversation = sampleConversation();
+    const assistant = conversation.messages[1];
+    assistant.run_roster.mode = 'self_moa';
+    assistant.metadata = { mode: 'self_moa', model: 'anthropic/claude', sample_count: 5 };
+    assistant.stage3 = { ...assistant.stage3, mode: 'self_moa', sample_count: 5 };
+    const shared = buildShareSnapshot(conversation).conversation.messages[1];
+    expect(shared.run_roster.mode).toBe('self_moa');
+    expect(shared.metadata).toMatchObject({ mode: 'self_moa', sample_count: 5 });
+    expect(shared.stage3).toMatchObject({ mode: 'self_moa', sample_count: 5 });
+
+    assistant.run_roster.mode = '<script>';
+    expect(buildShareSnapshot(conversation).conversation.messages[1].run_roster.mode).toBeUndefined();
+  });
+
   it('keeps attachments by default and assigns a new id on import', () => {
     const snapshot = buildShareSnapshot(sampleConversation());
     expect(snapshot.conversation.messages[0].images).toEqual(['data:image/png;base64,aaaa']);

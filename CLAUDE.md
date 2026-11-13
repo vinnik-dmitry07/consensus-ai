@@ -15,6 +15,7 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 - Contains `CHAIRMAN_MODEL` (model that synthesizes final answer)
 - Contains `N_SAMPLES` (independent Stage 1 answers collected per model)
 - Contains `TOP_K`, `RED_TEAM_MODEL` (None = chairman), `SELF_EXCLUSION`
+- Contains `MODE` (`'council'` default, or `'self_moa'`) and `SELF_MOA_SAMPLES` (5)
 - Uses environment variable `OPENROUTER_API_KEY` from `.env`
 - Backend runs on **port 8001** (NOT 8000 - user had another app on 8000)
 
@@ -42,6 +43,7 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 - `run_post_ranking()`: Aggregation + red team + consensus used by every entry point
 - `stage3_synthesize_final()`: Chairman sees anonymized top-K only; Candidate #1 is the base draft
 - `parse_ranking_from_text()` / `parse_correctness_scores()` / `parse_issues()` / `parse_disputed_claims()`
+- Self-MoA (S8): `self_moa_model()` is the chairman. Stage 1 asks it `SELF_MOA_SAMPLES` times (`council_models=[model]`, `cap_samples=False`, so a free model is not cut to one sample), then `self_moa_synthesize()` has the same model combine them with `build_self_moa_prompt()`. No Stage 2, no red team, no fallback synthesizer. The prompt text is pinned in `tests/fixtures/stage2_cases.json` (`self_moa_prompt`) and must match `engine/browser/selfMoa.js`
 
 **`storage.py`**
 - JSON-based conversation storage in `data/conversations/`
@@ -60,6 +62,8 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 - Retry Stage 3 recomputes post-ranking (including red team)
 - `_rebuild_council_query()`: every retry endpoint rebuilds the *original* query. A message stored with `follow_up_to` is recomposed against that earlier final answer; if it is gone, the retry is refused with 400 rather than silently re-asking a bare fragment
 - Each retry clears the stages it replaces (Stage 1 retry clears stage2/stage3/metadata, Stage 2 retry clears stage3, Stage 3 retry clears stage3), so a failed retry never leaves the previous run's answer on the message
+- A Self-MoA run writes `metadata = {mode: 'self_moa', model}` before Stage 1, so a retry keeps the mode and model it ran with (`_stored_self_moa_model`). A message with rankings or council metadata is a council run; only a message with no record follows the current `mode`. A Stage 2 or Stage 3 retry of a Self-MoA message re-runs its synthesis from the stored samples
+- Self-MoA events: `stage1_*`, then `stage3_start` (carrying `metadata`), `stage3_complete` / `stage3_error`, `title_complete`, `complete`. No `stage2_*` or `redteam_*`. `stage3` carries `mode` and `sample_count`
 
 ### Frontend Structure (`frontend/src/`)
 
@@ -83,6 +87,7 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 - Port of `council.py`, `openrouter.py`, `storage.py`, and `settings.py`
 - IndexedDB conversations (same JSON as `data/conversations/`). Each update is one readwrite transaction, so two tabs cannot clobber each other. localStorage settings reload when another tab writes them
 - `catalogueModelId` / `catalogue_model_id` strip only a trailing `-reasoning` or `-reasoning-high`. A name like `phi-4-reasoning-plus` is a real catalogue id
+- Settings `mode` (`council` default, `self_moa`) is stored with the other settings and copied into `run_roster.mode` by `captureRunRoster`. `selfMoa.js` holds the Self-MoA run; the Self-MoA model is the run's `chairmanModel`, so the Top 10 Free preset gives a new visitor one free model for it. A retry keeps the stored `run_roster.mode`; old rosters without a mode are council runs. `frontend/src/runMode.js` `isSelfMoaMessage()` drives the UI (Stage 3 label, resume buttons, cost estimate)
 - Stage 2 `Response N` labels are case-sensitive, matching Python. Headings such as `FINAL RANKING` stay case-insensitive
 - Displayed scores use `pyFixed`, which matches Python `format` (half to even on an exact tie). `round()` is `Number(pyFixed(...))`
 - `label_to_index` is stored per judge. The seeded shuffle does not need to match Python's RNG

@@ -7,7 +7,7 @@ import re
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from .config import TITLE_MODEL
+from .config import MODE_SELF_MOA, SELF_MOA_SAMPLES, TITLE_MODEL
 from .openrouter import (
     get_api_key,
     model_family,
@@ -529,20 +529,28 @@ async def stage1_collect_responses_streaming(
     n: int = None,
     existing_results: List[Dict] = None,
     existing_failures: List[Dict] = None,
+    council_models: List[str] = None,
+    cap_samples: bool = True,
 ):
     """
     Stage 1 with streaming: Collect responses and yield progress events.
 
     Resume counts successes per model against n_samples. Prior failures for
     models still being queried are dropped; the rest are replayed.
+    Self-MoA passes its one model and cap_samples=False, so a free model
+    still gets every sample.
     """
     if n is None:
         n = settings.n_samples
 
     await ensure_servable_roster()
-    n = stage1_sample_limit(settings.council_models, n)
+    if council_models is None:
+        council_models = list(settings.council_models)
+    else:
+        council_models = list(council_models)
+    if cap_samples:
+        n = stage1_sample_limit(council_models, n)
     messages = [{'role': 'user', 'content': user_query}]
-    council_models = list(settings.council_models)
     total_slots = len(council_models) * n
     all_results = usable_stage1_results(council_models, n, existing_results)
     pending_models = pending_stage1_slots(council_models, n, all_results)
@@ -1233,6 +1241,111 @@ Provide a clear, well-reasoned final answer:'''
         'top_k_indices': top_k_indices,
         'consensus_level': level,
     }
+
+
+def self_moa_model() -> str:
+    """The one model of a Self-MoA run: the chairman."""
+    chairman = str(settings.chairman_model or '').strip()
+    if chairman:
+        return chairman
+    models = settings.council_models or []
+    return str(models[0]).strip() if models else ''
+
+
+def self_moa_sample_texts(stage1_results: List[Dict[str, Any]]) -> List[str]:
+    texts = []
+    for row in stage1_results or []:
+        text = row.get('response') if isinstance(row, dict) else None
+        if isinstance(text, str) and text.strip():
+            texts.append(text)
+    return texts
+
+
+def build_self_moa_prompt(query_text: str, samples: List[str]) -> str:
+    """Self-MoA synthesis prompt. Must match engine/browser/selfMoa.js."""
+    blocks = '\n\n'.join(
+        f'Sample slot {index}:\n{text}'
+        for index, text in enumerate(samples, start=1)
+    )
+    return f'''You are aggregating independent answers from one model.
+The samples may repeat the same mistake. Do not treat agreement as proof.
+
+Original Question: {query_text}
+
+SAMPLES:
+
+{blocks}
+
+Your task:
+- Check the reasoning of every sample. Keep what is correct and fix what is wrong.
+- Where the samples disagree, work out which answer is right instead of following the majority.
+- Do not mention the samples, the aggregation, or model names.
+
+Provide a clear, well-reasoned final answer:'''
+
+
+def self_moa_metadata(
+    stage1_results: List[Dict[str, Any]], model: str
+) -> Dict[str, Any]:
+    return {
+        'mode': MODE_SELF_MOA,
+        'model': model,
+        'sample_count': len(self_moa_sample_texts(stage1_results)),
+        'label_to_model': canonical_label_to_model(stage1_results or []),
+    }
+
+
+async def self_moa_synthesize(
+    query_text: str,
+    stage1_results: List[Dict[str, Any]],
+    model: str,
+) -> Dict[str, Any]:
+    """The Self-MoA model combines its own samples. No fallback model."""
+    samples = self_moa_sample_texts(stage1_results)
+    if not samples:
+        raise Exception('No samples to combine. Retry Stage 1 first.')
+    if not model or model_unavailable(model):
+        raise Exception(MODELS_UNAVAILABLE)
+    prompt = build_self_moa_prompt(query_text, samples)
+    result = await query_model_result(model, [{'role': 'user', 'content': prompt}])
+    if result.get('skipped'):
+        raise Exception(MODELS_UNAVAILABLE)
+    if not result.get('ok'):
+        err = result.get('error') or {}
+        detail = err.get('message') or 'failed to generate response'
+        raise Exception(f'Self-MoA model ({model}) failed: {detail}')
+    return {
+        'model': model,
+        'response': result.get('content', ''),
+        'usage': result.get('usage', {}),
+        'mode': MODE_SELF_MOA,
+        'sample_count': len(samples),
+    }
+
+
+async def run_self_moa(
+    user_query: Union[str, List[Dict]],
+    query_text: str,
+) -> Tuple[List, Optional[Dict], Dict]:
+    """Non-streaming Self-MoA run: (samples, final answer, metadata)."""
+    model = self_moa_model()
+    results: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+    async for event_type, data in stage1_collect_responses_streaming(
+        user_query,
+        n=SELF_MOA_SAMPLES,
+        council_models=[model],
+        cap_samples=False,
+    ):
+        if event_type == 'all_complete':
+            results = data['results']
+            failures = data['failures']
+    metadata = self_moa_metadata(results, model)
+    metadata['stage1_failures'] = failures
+    if not results:
+        return [], None, metadata
+    stage3 = await self_moa_synthesize(query_text, results, model)
+    return results, stage3, metadata
 
 
 async def generate_conversation_title(user_query: str) -> str:

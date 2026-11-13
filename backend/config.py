@@ -40,6 +40,14 @@ RED_TEAM_MODEL = None
 # Exclude a judge's own model family from the candidates it ranks
 SELF_EXCLUSION = True
 
+# Answer mode: 'council' (3 stages) or 'self_moa' (S8). Self-MoA asks the
+# chairman model for SELF_MOA_SAMPLES independent answers and has the same
+# model combine them, with no peer ranking and no red team.
+MODE_COUNCIL = 'council'
+MODE_SELF_MOA = 'self_moa'
+MODE = MODE_COUNCIL
+SELF_MOA_SAMPLES = 5
+
 # OpenRouter API endpoint
 OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions'
 OPENROUTER_CREDITS_URL = 'https://openrouter.ai/api/v1/credits'

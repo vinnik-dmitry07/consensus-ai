@@ -17,7 +17,7 @@ import {
   storePrunedRoster,
   supportsTextChat,
 } from './roster.js';
-import { notifySettingsChanged, sameStringList, settings } from './settings.js';
+import { normalizeMode, notifySettingsChanged, sameStringList, settings } from './settings.js';
 
 export const ENDPOINT_CONCURRENCY = 5;
 export const ENDPOINT_TIMEOUT_MS = 4000;
@@ -423,6 +423,7 @@ export function captureRunRoster(source = settings, runId = null) {
   const id = runId || (globalThis.crypto?.randomUUID?.() || `run-${Date.now()}`);
   return {
     runId: id,
+    mode: normalizeMode(source.mode),
     councilModels: [...source.councilModels],
     chairmanModel: source.chairmanModel || '',
     redTeamModel: source.redTeamModel || null,

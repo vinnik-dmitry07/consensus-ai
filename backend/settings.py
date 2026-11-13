@@ -5,12 +5,19 @@ from typing import List, Optional
 from .config import (
     CHAIRMAN_MODEL as DEFAULT_CHAIRMAN_MODEL,
     COUNCIL_MODELS as DEFAULT_COUNCIL_MODELS,
+    MODE as DEFAULT_MODE,
+    MODE_COUNCIL,
+    MODE_SELF_MOA,
     N_SAMPLES as DEFAULT_N_SAMPLES,
     OPENROUTER_API_KEY as ENV_API_KEY,
     RED_TEAM_MODEL as DEFAULT_RED_TEAM_MODEL,
     SELF_EXCLUSION as DEFAULT_SELF_EXCLUSION,
     TOP_K as DEFAULT_TOP_K,
 )
+
+
+def normalize_mode(value) -> str:
+    return MODE_SELF_MOA if value == MODE_SELF_MOA else MODE_COUNCIL
 
 
 class CouncilSettings:
@@ -28,6 +35,7 @@ class CouncilSettings:
         if self._initialized:
             return
         self._initialized = True
+        self._mode: str = normalize_mode(DEFAULT_MODE)
         self._council_models: List[str] = list(DEFAULT_COUNCIL_MODELS)
         self._n_samples: int = DEFAULT_N_SAMPLES
         self._chairman_model: str = DEFAULT_CHAIRMAN_MODEL
@@ -36,6 +44,14 @@ class CouncilSettings:
         self._self_exclusion: bool = DEFAULT_SELF_EXCLUSION
         self._api_key: Optional[str] = ENV_API_KEY  # Initialize from env, can be overridden
     
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    @mode.setter
+    def mode(self, value: str):
+        self._mode = normalize_mode(value)
+
     @property
     def council_models(self) -> List[str]:
         return self._council_models
@@ -113,6 +129,7 @@ class CouncilSettings:
     
     def reset_to_defaults(self):
         """Reset all settings to their default values (except API key)."""
+        self._mode = normalize_mode(DEFAULT_MODE)
         self._council_models = list(DEFAULT_COUNCIL_MODELS)
         self._n_samples = DEFAULT_N_SAMPLES
         self._chairman_model = DEFAULT_CHAIRMAN_MODEL
@@ -124,6 +141,7 @@ class CouncilSettings:
     def to_dict(self) -> dict:
         """Return settings as a dictionary (with masked API key for security)."""
         return {
+            'mode': self._mode,
             'council_models': self._council_models,
             'n_samples': self._n_samples,
             'chairman_model': self._chairman_model,
@@ -136,6 +154,8 @@ class CouncilSettings:
     
     def update_from_dict(self, data: dict):
         """Update settings from a dictionary."""
+        if 'mode' in data:
+            self.mode = data['mode']
         if 'council_models' in data:
             self.council_models = data['council_models']
         if 'n_samples' in data:

@@ -11,6 +11,8 @@ import {
   usableFinalAnswer,
 } from '../engine/browser/query.js';
 import { answerTabsFrom, safeNoteReason, shortModelName } from '../stage1State.js';
+import { isSelfMoaMessage } from '../runMode.js';
+import { SELF_MOA_SAMPLES } from '../engine/browser/selfMoa.js';
 import Stage1 from './Stage1';
 import Stage2 from './Stage2';
 import Stage3 from './Stage3';
@@ -111,14 +113,17 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
   if (!pricingData || !pricingData.pricing) return null;
 
   const {
-    council_models,
     chairman_model,
     pricing,
-    n_samples = 1,
     top_k = 3,
     self_exclusion = true,
     red_team_model,
   } = pricingData;
+  // Self-MoA: the chairman model answers SELF_MOA_SAMPLES times and combines
+  // them. No Stage 2 and no red team.
+  const selfMoa = pricingData.mode === 'self_moa';
+  const council_models = selfMoa ? [chairman_model] : (pricingData.council_models || []);
+  const n_samples = selfMoa ? SELF_MOA_SAMPLES : (pricingData.n_samples ?? 1);
   const hasPrice = (model) => Boolean(pricing[catalogueModelId(model)]?.pricing);
   if (!council_models.some(hasPrice) && !hasPrice(chairman_model)) return null;
   
@@ -158,8 +163,10 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
     return remaining;
   };
   
-  // Stage 3: top-K answers + consensus/red-team overhead
-  const stage3PromptTokens = stage3SystemTokens + inputTokens + (topK * avgResponseTokens) + 800;
+  // Stage 3: top-K answers + consensus/red-team overhead, or every Self-MoA sample
+  const stage3PromptTokens = selfMoa
+    ? stage3SystemTokens + inputTokens + (totalStage1Responses * avgResponseTokens)
+    : stage3SystemTokens + inputTokens + (topK * avgResponseTokens) + 800;
   const redTeamPromptTokens = redTeamSystemTokens + inputTokens + avgResponseTokens;
   
   let totalCost = 0;
@@ -200,7 +207,7 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
 
   let stage2TotalPrompt = 0;
   // Stage 2: One call per model, but evaluating ALL N_SAMPLES×MODELS responses
-  for (const model of council_models) {
+  for (const model of selfMoa ? [] : council_models) {
     const baseModel = catalogueModelId(model);
     const isReasoning = isReasoningModel(model);
     const modelPricing = pricing[baseModel]?.pricing || {};
@@ -259,6 +266,7 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
   if (isRedTeamReasoning) {
     redTeamCost += avgReasoningTokens * redReasoningPrice;
   }
+  if (selfMoa) redTeamCost = 0;
   breakdown.redteam.model = redTeamBase;
   breakdown.redteam.total = redTeamCost;
   breakdown.redteam.isReasoning = isRedTeamReasoning;
@@ -275,11 +283,11 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
     stage2: {
       completionPerCall: avgRankingTokens,
       totalPrompt: stage2TotalPrompt,
-      totalCompletion: avgRankingTokens * numModels,
+      totalCompletion: selfMoa ? 0 : avgRankingTokens * numModels,
     },
     redteam: {
-      prompt: redTeamPromptTokens,
-      completion: redTeamOutputTokens,
+      prompt: selfMoa ? 0 : redTeamPromptTokens,
+      completion: selfMoa ? 0 : redTeamOutputTokens,
     },
     stage3: {
       prompt: stage3PromptTokens,
@@ -287,7 +295,7 @@ function calculateEstimatedCost(inputText, numImages, pricingData) {
     },
   };
 
-  return { totalCost, breakdown, n_samples, estimatedTokens };
+  return { totalCost, breakdown, n_samples, estimatedTokens, selfMoa };
 }
 
 // Calculate actual usage from message data
@@ -778,17 +786,38 @@ export default function ChatInterface({
                           </button>
                           <button
                             className="retry-button secondary"
-                            onClick={() => onRetryStage(index, 2)}
+                            onClick={() => onRetryStage(index, isSelfMoaMessage(msg) ? 3 : 2)}
                             disabled={runBlocked}
                           >
-                            Skip to Stage 2
+                            {isSelfMoaMessage(msg) ? 'Skip to synthesis' : 'Skip to Stage 2'}
                           </button>
                         </div>
                       )}
                     </div>
                   )}
+                  {/* Self-MoA: samples collected but the synthesis was interrupted */}
+                  {isSelfMoaMessage(msg) && msg.streaming && !msg.loading?.stage3 && msg.stage1_complete && !msg.stage3 && !msg.error && (
+                    <div className="stage-interrupted">
+                      <div className="interrupted-content">
+                        <span className="interrupted-icon">⏸️</span>
+                        <div className="interrupted-details">
+                          <strong>Processing Interrupted</strong>
+                          <p>Samples collected. Ready to combine them.</p>
+                        </div>
+                      </div>
+                      {showRetry && (
+                        <button
+                          className="retry-button"
+                          onClick={() => onRetryStage(index, 3)}
+                          disabled={runBlocked}
+                        >
+                          Resume synthesis
+                        </button>
+                      )}
+                    </div>
+                  )}
                   {/* Stage 1 complete but Stage 2 was interrupted */}
-                  {msg.streaming && !msg.loading?.stage2 && msg.stage1_complete && !msg.stage2 && !msg.error && (
+                  {!isSelfMoaMessage(msg) && msg.streaming && !msg.loading?.stage2 && msg.stage1_complete && !msg.stage2 && !msg.error && (
                     <div className="stage-interrupted">
                       <div className="interrupted-content">
                         <span className="interrupted-icon">⏸️</span>
@@ -926,12 +955,17 @@ export default function ChatInterface({
                   {msg.loading?.stage3 && (
                     <div className="stage-loading">
                       <div className="spinner"></div>
-                      <span>Running Stage 3: Final synthesis...</span>
+                      <span>
+                        {isSelfMoaMessage(msg)
+                          ? 'Running Stage 3: Combining the samples...'
+                          : 'Running Stage 3: Final synthesis...'}
+                      </span>
                     </div>
                   )}
                   {usableFinalAnswer(msg.stage3) && (
                     <Stage3
                       finalResponse={msg.stage3}
+                      selfMoa={isSelfMoaMessage(msg)}
                       consensus={msg.metadata?.consensus}
                       labelToModel={msg.metadata?.label_to_model}
                       topKIndices={msg.metadata?.top_k_indices}
@@ -1085,22 +1119,26 @@ export default function ChatInterface({
                   <div className="cost-stage-tokens">
                     Est. tokens: {estimatedCost.estimatedTokens.stage1.totalPrompt.toLocaleString()} prompt + {estimatedCost.estimatedTokens.stage1.totalCompletion.toLocaleString()} completion
                   </div>
+                  {!estimatedCost.selfMoa && (
+                    <>
+                      <div className="cost-stage">
+                        <span>Stage 2 ({estimatedCost.breakdown.stage2.callCount} calls)</span>
+                        <span>${estimatedCost.breakdown.stage2.total.toFixed(4)}</span>
+                      </div>
+                      <div className="cost-stage-tokens">
+                        Est. tokens: {estimatedCost.estimatedTokens.stage2.totalPrompt.toLocaleString()} prompt + {estimatedCost.estimatedTokens.stage2.totalCompletion.toLocaleString()} completion
+                      </div>
+                      <div className="cost-stage">
+                        <span>Red team (1 call)</span>
+                        <span>${estimatedCost.breakdown.redteam.total.toFixed(4)}</span>
+                      </div>
+                      <div className="cost-stage-tokens">
+                        Est. tokens: {estimatedCost.estimatedTokens.redteam.prompt.toLocaleString()} prompt + {estimatedCost.estimatedTokens.redteam.completion.toLocaleString()} completion
+                      </div>
+                    </>
+                  )}
                   <div className="cost-stage">
-                    <span>Stage 2 ({estimatedCost.breakdown.stage2.callCount} calls)</span>
-                    <span>${estimatedCost.breakdown.stage2.total.toFixed(4)}</span>
-                  </div>
-                  <div className="cost-stage-tokens">
-                    Est. tokens: {estimatedCost.estimatedTokens.stage2.totalPrompt.toLocaleString()} prompt + {estimatedCost.estimatedTokens.stage2.totalCompletion.toLocaleString()} completion
-                  </div>
-                  <div className="cost-stage">
-                    <span>Red team (1 call)</span>
-                    <span>${estimatedCost.breakdown.redteam.total.toFixed(4)}</span>
-                  </div>
-                  <div className="cost-stage-tokens">
-                    Est. tokens: {estimatedCost.estimatedTokens.redteam.prompt.toLocaleString()} prompt + {estimatedCost.estimatedTokens.redteam.completion.toLocaleString()} completion
-                  </div>
-                  <div className="cost-stage">
-                    <span>Stage 3 (1 call)</span>
+                    <span>{estimatedCost.selfMoa ? 'Self-MoA synthesis (1 call)' : 'Stage 3 (1 call)'}</span>
                     <span>${estimatedCost.breakdown.stage3.total.toFixed(4)}</span>
                   </div>
                   <div className="cost-stage-tokens">

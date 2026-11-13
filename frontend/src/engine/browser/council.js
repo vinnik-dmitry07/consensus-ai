@@ -447,7 +447,9 @@ export async function* stage1CollectResponsesStreaming(userQuery, options = {}) 
   const roster = resolveRoster(options);
   const messages = [{ role: 'user', content: userQuery }];
   const councilModels = [...roster.councilModels];
-  const n = stage1SampleLimit(councilModels, options.n ?? roster.nSamples);
+  // Self-MoA needs its samples even from a free model; the council caps them.
+  const requested = options.n ?? roster.nSamples;
+  const n = options.uncappedSamples ? requested : stage1SampleLimit(councilModels, requested);
   const totalSlots = councilModels.length * n;
   const allResults = usableStage1Results(councilModels, n, existingResults);
   const pendingModels = pendingStage1Slots(councilModels, n, allResults);

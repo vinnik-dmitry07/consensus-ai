@@ -1,3 +1,5 @@
+import { isSelfMoaMessage } from './runMode.js';
+
 function list(value) {
   return Array.isArray(value) ? value : [];
 }
@@ -52,6 +54,9 @@ export function safeNoteReason(kind, message) {
 
 export function stageRetryPatch(message, stage) {
   const current = message || {};
+  // A Self-MoA run has no rankings or red team: any retry past Stage 1 is
+  // its synthesis.
+  const selfMoa = isSelfMoaMessage(current);
   return {
     ...current,
     error: null,
@@ -63,9 +68,9 @@ export function stageRetryPatch(message, stage) {
     ...(stage === 1 ? { stage1: [], stage1Progress: null } : {}),
     loading: {
       stage1: stage === 1,
-      stage2: stage === 2,
-      redteam: stage === 3,
-      stage3: false,
+      stage2: stage === 2 && !selfMoa,
+      redteam: stage === 3 && !selfMoa,
+      stage3: selfMoa && stage !== 1,
     },
   };
 }

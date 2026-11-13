@@ -22,7 +22,14 @@ import {
   prepareCouncilQuery,
   rebuildCouncilQuery,
 } from './query.js';
-import { settings } from './settings.js';
+import {
+  isSelfMoaRoster,
+  selfMoaMetadata,
+  selfMoaModel,
+  selfMoaStage1Roster,
+  selfMoaSynthesize,
+} from './selfMoa.js';
+import { MODE_COUNCIL, MODE_SELF_MOA, settings } from './settings.js';
 import * as storage from './storage.js';
 
 function errorText(exc) {
@@ -220,8 +227,11 @@ async function* emitStage1(
   existingFailures = null,
   roster = null,
 ) {
-  const councilModels = [...(roster?.councilModels || settings.councilModels)];
-  const sampleLimit = stage1SampleLimit(councilModels, roster?.nSamples ?? settings.nSamples);
+  const selfMoa = isSelfMoaRoster(roster);
+  const stageRoster = selfMoa ? selfMoaStage1Roster(roster) : roster;
+  const councilModels = [...(stageRoster?.councilModels || settings.councilModels)];
+  const requested = stageRoster?.nSamples ?? settings.nSamples;
+  const sampleLimit = selfMoa ? requested : stage1SampleLimit(councilModels, requested);
   const pending = council.pendingStage1Slots(
     councilModels,
     sampleLimit,
@@ -243,7 +253,7 @@ async function* emitStage1(
   let failures = null;
   for await (const [eventType, eventData] of council.stage1CollectResponsesStreaming(
     userMessage,
-    { existingResults, existingFailures, roster },
+    { existingResults, existingFailures, roster: stageRoster, uncappedSamples: selfMoa },
   )) {
     if (eventType === 'init') {
       yield { type: 'stage1_init', data: eventData };
@@ -462,6 +472,37 @@ async function* runFromStage2(ctx) {
   return stopped;
 }
 
+// After Stage 1: the council ranks and red-teams, Self-MoA goes straight to
+// its own synthesis.
+async function* runAfterStage1(ctx) {
+  if (isSelfMoaRoster(ctx.roster)) return yield* emitSelfMoaStage3(ctx);
+  return yield* runFromStage2(ctx);
+}
+
+async function* emitSelfMoaStage3(ctx) {
+  ctx.currentStage = 3;
+  const metadata = selfMoaMetadata(ctx.stage1Results, selfMoaModel(ctx.roster));
+  ctx.metadata = metadata;
+  await storage.updateStreamingMessage(ctx.conversationId, ctx.msgIndex, { metadata });
+  yield { type: 'stage3_start', metadata };
+  try {
+    const stage3Result = await selfMoaSynthesize(ctx.queryText, ctx.stage1Results, ctx.roster);
+    await storage.updateStreamingMessage(ctx.conversationId, ctx.msgIndex, {
+      stage3: stage3Result,
+      streaming: false,
+    });
+    yield { type: 'stage3_complete', data: stage3Result };
+  } catch (exc) {
+    await storage.updateStreamingMessage(ctx.conversationId, ctx.msgIndex, {
+      error: { stage: 3, message: errorText(exc) },
+      streaming: false,
+    });
+    yield { type: 'stage3_error', stage: 3, message: errorText(exc) };
+    return true;
+  }
+  return false;
+}
+
 async function* emitRedTeamAndStage3(ctx) {
   yield { type: 'redteam_start' };
   const { metadata, redOk, redError } = await pipeline.runAndSavePostRanking(
@@ -537,6 +578,7 @@ export const browserEngine = {
       if (modelsPricing[modelId]) pricing[modelId] = modelsPricing[modelId];
     }
     return {
+      mode: settings.mode,
       council_models: [...settings.councilModels],
       chairman_model: settings.chairmanModel,
       n_samples: settings.nSamples,
@@ -694,7 +736,30 @@ export const browserEngine = {
       requireFreeRosterIfPending();
       await ensureServableRoster({ replaceManaged: false });
     }
-    const roster = storedRoster || captureRunRoster();
+    const roster = { ...(storedRoster || captureRunRoster()) };
+    // A retry keeps the mode the message ran in. Messages saved before the
+    // mode existed, and any message with rankings, are council runs. Only a
+    // message with no record of its run follows the current setting.
+    if (assistant.metadata?.mode === MODE_SELF_MOA || storedRoster?.mode === MODE_SELF_MOA) {
+      roster.mode = MODE_SELF_MOA;
+    } else if (storedRoster || assistant.stage2?.length) {
+      roster.mode = MODE_COUNCIL;
+    }
+    const selfMoa = isSelfMoaRoster(roster);
+
+    if (selfMoa && (stage === 2 || stage === 3)) {
+      if (!assistant.stage1?.length) {
+        throw new Error('Stage 1 results not available. Retry Stage 1 first.');
+      }
+      await runEvents(retrySelfMoaStage3Events({
+        conversationId,
+        msgIndex: messageIndex,
+        queryText: rebuilt.queryText,
+        stage1Results: assistant.stage1,
+        roster,
+      }), onEvent);
+      return;
+    }
 
     if (stage === 1) {
       await runEvents(retryStage1Events({
@@ -779,7 +844,7 @@ async function* sendEvents({ conversationId, msgIndex, isFirst, prepared, roster
       return;
     }
 
-    const stopped = yield* runFromStage2(ctx);
+    const stopped = yield* runAfterStage1(ctx);
     if (stopped) return;
     yield* finishTitle(conversationId, titleState);
     titleState = null;
@@ -841,7 +906,7 @@ async function* retryStage1Events(input) {
       return;
     }
 
-    const stopped = yield* runFromStage2(ctx);
+    const stopped = yield* runAfterStage1(ctx);
     if (!stopped) yield { type: 'complete' };
   } catch (exc) {
     yield await persistGenericError(input.conversationId, input.msgIndex, ctx.currentStage, exc);
@@ -871,6 +936,26 @@ async function* retryStage2Events(input) {
     if (!stopped) yield { type: 'complete' };
   } catch (exc) {
     yield await persistGenericError(input.conversationId, input.msgIndex, ctx.currentStage, exc);
+  }
+}
+
+async function* retrySelfMoaStage3Events(input) {
+  requireApiKey();
+  try {
+    await storage.updateStreamingMessage(input.conversationId, input.msgIndex, {
+      stage3: null,
+      streaming: true,
+    });
+    const stopped = yield* emitSelfMoaStage3({
+      conversationId: input.conversationId,
+      msgIndex: input.msgIndex,
+      queryText: input.queryText,
+      stage1Results: input.stage1Results,
+      roster: input.roster,
+    });
+    if (!stopped) yield { type: 'complete' };
+  } catch (exc) {
+    yield await persistGenericError(input.conversationId, input.msgIndex, 3, exc);
   }
 }
 

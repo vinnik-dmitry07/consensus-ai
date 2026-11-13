@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from backend.council import (
+    build_self_moa_prompt,
     calculate_aggregate_rankings,
     compute_consensus,
     parse_correctness_scores,
@@ -49,6 +50,10 @@ def check_case(case):
             assert result['top1_agreement'] == case['top1_agreement']
         if 'reason_includes' in case:
             assert case['reason_includes'] in result['reasons']
+        return
+
+    if kind == 'self_moa_prompt':
+        assert build_self_moa_prompt(case['query'], case['samples']) == case['expected']
         return
 
     raise AssertionError(f'unknown fixture kind {kind}')

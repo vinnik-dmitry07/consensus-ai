@@ -1369,3 +1369,133 @@ describe('skip persistence', () => {
     expect(message.stage2_skipped).toEqual([]);
   });
 });
+
+describe('self-moa mode', () => {
+  const SYNTH_LEAD = 'You are aggregating independent answers from one model.';
+
+  afterEach(() => {
+    settings.mode = 'council';
+    vi.restoreAllMocks();
+    resetFreeQueueForTests();
+  });
+
+  function useSelfMoa(model) {
+    settings.councilModels = ['a/one', 'b/two'];
+    settings.chairmanModel = model;
+    settings.redTeamModel = null;
+    settings.nSamples = 1;
+    settings.mode = 'self_moa';
+  }
+
+  function selfMoaQuery({ failSynthesis = false } = {}) {
+    const calls = [];
+    vi.spyOn(openrouter, 'queryModel').mockResolvedValue({ content: 'Title', usage: {} });
+    vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model, messages) => {
+      const content = messages?.[0]?.content;
+      const text = typeof content === 'string' ? content : JSON.stringify(content);
+      calls.push({ model, text });
+      if (text.startsWith(SYNTH_LEAD)) {
+        if (failSynthesis) return { ok: false, error: { status: 500, message: 'down', detail: '' } };
+        return { ok: true, content: 'final', usage: {} };
+      }
+      return { ok: true, content: `sample ${calls.length}`, usage: {} };
+    });
+    return calls;
+  }
+
+  it('samples one model five times and lets it combine them', async () => {
+    useSelfMoa('x/model');
+    const calls = selfMoaQuery();
+    const created = await browserEngine.createConversation();
+    const { events, onEvent } = collectEvents();
+    await browserEngine.sendMessageStream(created.id, 'What is 2 + 2?', [], [], onEvent);
+
+    const types = events.map((item) => item.type);
+    expect(types).not.toContain('stage2_start');
+    expect(types).not.toContain('redteam_start');
+    expect(types).toContain('stage3_complete');
+    expect(types.at(-1)).toBe('complete');
+    expect(events.find((item) => item.type === 'stage3_start').event.metadata.mode).toBe('self_moa');
+
+    expect(calls).toHaveLength(6);
+    expect(calls.every((call) => call.model === 'x/model')).toBe(true);
+    const synth = calls.filter((call) => call.text.startsWith(SYNTH_LEAD));
+    expect(synth).toHaveLength(1);
+    expect(synth[0].text).toContain('Original Question: What is 2 + 2?');
+    expect(synth[0].text).toContain('Sample slot 5:');
+
+    const message = (await getConversation(created.id)).messages[1];
+    expect(message.stage1).toHaveLength(5);
+    expect(message.stage2 ?? null).toBeNull();
+    expect(message.run_roster.mode).toBe('self_moa');
+    expect(message.metadata).toMatchObject({ mode: 'self_moa', model: 'x/model', sample_count: 5 });
+    expect(message.stage3).toMatchObject({ response: 'final', mode: 'self_moa', sample_count: 5 });
+    expect(message.streaming).toBe(false);
+  });
+
+  it('keeps every sample for a free model', async () => {
+    useSelfMoa('x/model:free');
+    const calls = selfMoaQuery();
+    const created = await browserEngine.createConversation();
+    await browserEngine.sendMessageStream(created.id, 'q', [], [], () => {});
+    expect(calls.filter((call) => !call.text.startsWith(SYNTH_LEAD))).toHaveLength(5);
+  });
+
+  it('reports a failed synthesis as a stage 3 error', async () => {
+    useSelfMoa('x/model');
+    selfMoaQuery({ failSynthesis: true });
+    const created = await browserEngine.createConversation();
+    const { events, onEvent } = collectEvents();
+    await browserEngine.sendMessageStream(created.id, 'q', [], [], onEvent);
+    const types = events.map((item) => item.type);
+    expect(types).toContain('stage3_error');
+    expect(types).not.toContain('complete');
+    const message = (await getConversation(created.id)).messages[1];
+    expect(message.error.stage).toBe(3);
+  });
+
+  it('retries the synthesis with the stored run after the mode changes', async () => {
+    useSelfMoa('x/model');
+    selfMoaQuery({ failSynthesis: true });
+    const created = await browserEngine.createConversation();
+    await browserEngine.sendMessageStream(created.id, 'q', [], [], () => {});
+    settings.mode = 'council';
+    settings.chairmanModel = 'a/one';
+    vi.restoreAllMocks();
+    for (const stage of [2, 3]) {
+      const calls = selfMoaQuery();
+      const { events, onEvent } = collectEvents();
+      await browserEngine.retryStage(created.id, stage, 1, onEvent);
+      const types = events.map((item) => item.type);
+      expect(types).not.toContain('stage2_start');
+      expect(types).toContain('stage3_complete');
+      expect(calls.map((call) => call.model)).toEqual(['x/model']);
+      vi.restoreAllMocks();
+    }
+    const message = (await getConversation(created.id)).messages[1];
+    expect(message.stage3.response).toBe('final');
+  });
+
+  it('resumes stage 1 from the stored samples', async () => {
+    useSelfMoa('x/model');
+    selfMoaQuery();
+    const created = await browserEngine.createConversation();
+    await browserEngine.sendMessageStream(created.id, 'q', [], [], () => {});
+    vi.restoreAllMocks();
+    const calls = selfMoaQuery();
+    const { events, onEvent } = collectEvents();
+    await browserEngine.retryStage(created.id, 1, 1, onEvent);
+    expect(events.map((item) => item.type)).not.toContain('stage2_start');
+    expect(calls).toHaveLength(1);
+    expect(calls[0].text.startsWith(SYNTH_LEAD)).toBe(true);
+  });
+
+  it('keeps the mode through settings round trips', async () => {
+    useSelfMoa('x/model');
+    expect(settings.toDict().mode).toBe('self_moa');
+    resetSettingsState();
+    expect(settings.mode).toBe('self_moa');
+    settings.updateFromDict({ mode: 'nonsense' });
+    expect(settings.mode).toBe('council');
+  });
+});

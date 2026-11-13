@@ -389,7 +389,12 @@ function App() {
         updateIfCurrentConv((prev) => {
           const messages = [...prev.messages];
           const idx = getTargetMsgIndex(prev);
-          messages[idx] = { ...messages[idx], loading: { ...messages[idx].loading, stage3: true } };
+          // Self-MoA sends its metadata here: it has no Stage 2 or red team.
+          messages[idx] = {
+            ...messages[idx],
+            metadata: event.metadata || messages[idx].metadata,
+            loading: { ...messages[idx].loading, redteam: false, stage3: true },
+          };
           return { ...prev, messages };
         });
         break;

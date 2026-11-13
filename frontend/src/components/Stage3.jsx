@@ -35,6 +35,7 @@ function displayNameForIndex(index, labelToModel) {
 
 export default function Stage3({
   finalResponse,
+  selfMoa = false,
   consensus,
   labelToModel,
   topKIndices,
@@ -44,6 +45,35 @@ export default function Stage3({
     return null;
   }
   const answer = typeof finalResponse.response === 'string' ? finalResponse.response : '';
+
+  if (selfMoa || finalResponse.mode === 'self_moa') {
+    const count = Number.isInteger(finalResponse.sample_count) ? finalResponse.sample_count : null;
+    return (
+      <div className="stage stage3">
+        <h3 className="stage-title">Stage 3: Final Self-MoA Answer</h3>
+        <div className="final-response">
+          <div className="chairman-row">
+            <div className="chairman-label">
+              Model: {shortName(finalResponse.model)}
+            </div>
+          </div>
+          {count != null && (
+            <div className="based-on-label">
+              Combined from {count} sample{count === 1 ? '' : 's'} of the same model
+            </div>
+          )}
+          <div className="final-text markdown-content">
+            <ReactMarkdown remarkPlugins={[remarkGfmPlugin]} components={components}>
+              {answer}
+            </ReactMarkdown>
+          </div>
+          <div className="copy-row">
+            <CopyButton text={answer} label="Copy answer" />
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const rawLevel = finalResponse.consensus_level || consensus?.level;
   const level = typeof rawLevel === 'string' ? rawLevel : '';

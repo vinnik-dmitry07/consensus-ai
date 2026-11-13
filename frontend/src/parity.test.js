@@ -12,6 +12,7 @@ import {
   parseRankingFromText,
   pyFixed,
 } from './engine/browser/council.js';
+import { buildSelfMoaPrompt } from './engine/browser/selfMoa.js';
 
 const fixturePath = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -60,6 +61,10 @@ function checkCase(testCase) {
     if ('reason_includes' in testCase) {
       expect(result.reasons).toContain(testCase.reason_includes);
     }
+    return;
+  }
+  if (testCase.kind === 'self_moa_prompt') {
+    expect(buildSelfMoaPrompt(testCase.query, testCase.samples)).toBe(testCase.expected);
     return;
   }
   throw new Error(`unknown fixture kind ${testCase.kind}`);

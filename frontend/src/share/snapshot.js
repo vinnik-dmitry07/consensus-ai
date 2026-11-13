@@ -126,6 +126,7 @@ function sanitizeRunRoster(value) {
     : [];
   if (!models.length) return undefined;
   const next = { councilModels: models };
+  if (value.mode === 'council' || value.mode === 'self_moa') next.mode = value.mode;
   if (typeof value.runId === 'string' && value.runId.trim()) {
     next.runId = clip(value.runId.trim(), 80);
   }

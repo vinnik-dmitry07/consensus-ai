@@ -31,8 +31,19 @@ export const DEFAULT_TOP_K = 3;
 export const DEFAULT_RED_TEAM_MODEL = null;
 export const DEFAULT_SELF_EXCLUSION = true;
 
+// 'council' is the 3-stage council. 'self_moa' (S8) asks the chairman model
+// for several independent answers and has the same model combine them.
+export const MODE_COUNCIL = 'council';
+export const MODE_SELF_MOA = 'self_moa';
+export const DEFAULT_MODE = MODE_COUNCIL;
+
+export function normalizeMode(value) {
+  return value === MODE_SELF_MOA ? MODE_SELF_MOA : MODE_COUNCIL;
+}
+
 function freshState() {
   return {
+    mode: DEFAULT_MODE,
     council_models: [...DEFAULT_COUNCIL_MODELS],
     n_samples: DEFAULT_N_SAMPLES,
     chairman_model: DEFAULT_CHAIRMAN_MODEL,
@@ -74,6 +85,7 @@ function load() {
     const next = freshState();
     next.use_free_tier_default = false;
     next.free_roster_managed = false;
+    next.mode = normalizeMode(parsed.mode);
     if (Array.isArray(parsed.council_models)) {
       next.council_models = parsed.council_models.map((model) => String(model));
     }
@@ -138,6 +150,15 @@ function maskedKey(apiKey) {
 }
 
 export const settings = {
+  get mode() {
+    return normalizeMode(current().mode);
+  },
+
+  set mode(value) {
+    current().mode = normalizeMode(value);
+    persist();
+  },
+
   get councilModels() {
     return current().council_models;
   },
@@ -277,6 +298,7 @@ export const settings = {
   toDict() {
     const data = current();
     return {
+      mode: normalizeMode(data.mode),
       council_models: [...data.council_models],
       n_samples: data.n_samples,
       chairman_model: data.chairman_model,
@@ -294,6 +316,7 @@ export const settings = {
     const currentData = current();
     const beforeCouncil = currentData.council_models.map((model) => String(model));
     const beforeChairman = currentData.chairman_model;
+    if ('mode' in data) currentData.mode = normalizeMode(data.mode);
     if ('council_models' in data && Array.isArray(data.council_models)) {
       currentData.council_models = data.council_models.map((model) => String(model));
     }

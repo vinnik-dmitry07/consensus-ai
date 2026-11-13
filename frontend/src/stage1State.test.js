@@ -230,6 +230,19 @@ describe('stage retry patch', () => {
       stage3: false,
     });
   });
+
+  it('goes straight to the synthesis for a self-moa retry', () => {
+    const selfMoa = { ...message, metadata: { mode: 'self_moa' } };
+    for (const stage of [2, 3]) {
+      expect(stageRetryPatch(selfMoa, stage).loading).toEqual({
+        stage1: false,
+        stage2: false,
+        redteam: false,
+        stage3: true,
+      });
+    }
+    expect(stageRetryPatch(selfMoa, 1).loading.stage3).toBe(false);
+  });
 });
 
 describe('diagnostic note text', () => {
