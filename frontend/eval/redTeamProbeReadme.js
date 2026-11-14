@@ -8,13 +8,14 @@
 //   node frontend/eval/redTeamProbeReadme.js --readme   (place it in README.md)
 //   node frontend/eval/redTeamProbeReadme.js --analysis --live
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-  ANALYSIS_LIMITS, attributedSection, placeAfter, placeAnalysis, readJson, rewriteFile, ruleFiles, sectionMarkers,
+  ANALYSIS_LIMITS, attributedSection, placeAfter, placeAnalysis, readJson, readJsonl, rewriteFile, ruleFiles, sectionMarkers,
 } from './noteTools.js';
+import { readSlotJournal } from './runtime.js';
 
 const EVAL_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const RUN = 'redteam-probe-v1';
@@ -24,7 +25,41 @@ const README = path.join(EVAL_ROOT, 'README.md');
 const PROTOCOL = 'redteam-probe-v1-protocol.md';
 export const AFTER = sectionMarkers('question-difficulty').end;
 export const { start: README_START, end: README_END } = sectionMarkers(RUN);
+export const { start: NOTE_START, end: NOTE_END } = sectionMarkers(`${RUN}-note`);
 export const { start: ANALYSIS_START, end: ANALYSIS_END } = sectionMarkers(`${RUN}-analysis`);
+
+// The red-team calls that were refused before generation because no pinned
+// endpoint was left (the cause the protocol counts as not measured).
+export function refusedRoutes(slots) {
+  return [...slots].filter((slot) => slot.meta?.branch === 'RT' && slot.state === 'failed' && slot.result?.error?.status === 404
+    && String(slot.result.error.detail || '').startsWith('No endpoints found'))
+    .map((slot) => ({ questionId: slot.meta.questionId, model: slot.meta.model, maxPrice: /Filter by Max Price removed[^;]*/.test(slot.result.error.detail) }));
+}
+
+// Pure: why the primary set stopped, from the report, the launches and the
+// refused calls. `checked` is the last launch's route check (route.json).
+export function buildNote(report, stops, refused, checked) {
+  const { meta } = report;
+  const lines = [];
+  const states = Object.entries(meta.states).map(([key, value]) => `${key} ${value}`).join(', ');
+  lines.push(`- Состояния вопросов: ${states}. В главный счёт по правилу начального отрезка входят первые ${meta.measured}: вопрос ${meta.measured + 1} в порядке не измерен.`);
+  const launches = stops.filter((row) => row.end);
+  if (launches.length) lines.push(`- Запуски: ${launches.map((row) => `${row.kind} — \`${row.end}\`${row.blocked?.length ? `, закрыт до конца запуска: ${row.blocked.join(', ')}` : ''}`).join('; ')}.`);
+  for (const item of refused) {
+    lines.push(`- Вызов red team \`${item.questionId}\` (${item.model}) отклонён до генерации обеими попытками: 404 «No endpoints found»${item.maxPrice ? ', закреплённый хост убран фильтром максимальной цены, то есть стоил дороже закреплённой цены' : ''}. По протоколу такой вопрос не измерен, хост внутри замера не заменяется; остальные вопросы с этой моделью в роли red team не отправлялись.`);
+  }
+  const unflagged = refused.filter((item) => checked?.checks?.[item.model] && !checked.checks[item.model].problems.length);
+  for (const model of new Set(unflagged.map((item) => item.model))) {
+    lines.push(`- Проверка маршрута при запуске эту модель не закрыла (\`route.json\`: проблем нет). Замороженный \`routeProblems\` сравнивает цену первого хоста в списке, чьё имя совпадает с закреплённым \`${checked.checks[model].tag}\` или начинается с него; в списке хостов ${model}, прочитанном после прогона, первым таким был другой, более дешёвый вариант хоста. На исход это не влияет: закрытая при запуске модель тоже оставила бы свои вопросы неизмеренными.`);
+  }
+  return lines.join('\n');
+}
+
+function noteFromRun() {
+  const report = readJson(path.join(RUN_DIR, 'report.json'));
+  const slots = readSlotJournal(path.join(RUN_DIR, 'test', 'events.jsonl')).values();
+  return buildNote(report, readJsonl(path.join(RUN_DIR, 'stops.jsonl')), refusedRoutes(slots), readJson(path.join(RUN_DIR, 'route.json')));
+}
 
 const pp = (value) => (value == null ? 'н/д' : `${(value * 100).toFixed(1)} п. п.`);
 const pct = (value) => (value == null ? 'н/д' : `${(value * 100).toFixed(1)}%`);
@@ -69,7 +104,7 @@ export function renderReadme(report, audit) {
     '',
     `Источник — сохранённые Stage 1 и Stage 2 теста \`${meta.source}\`; хосты из \`${meta.routes}\`. Правила — в [${PROTOCOL}](${PROTOCOL}), заморожены до первого платного вызова (коммит \`${meta.frozen ? meta.frozen.slice(0, 7) : 'н/д'}\`). Новые вызовы — только red team (RT) и председатель: C без red team, Rc с «чистым» red team, Rp с red team как в продукте. Числа и чтение посчитаны кодом; блок собран из отчёта без толкования.`,
     '',
-    `Измерено ${meta.measured} из ${meta.planned} вопросов в порядке с фиксированным зерном (${meta.complete ? 'набор завершён' : 'набор не завершён'}).`,
+    `В главный счёт входят ${meta.measured} из ${meta.planned} вопросов — самый длинный полностью измеренный начальный отрезок порядка с фиксированным зерном (${meta.complete ? 'набор завершён' : 'набор не завершён'}). Всего измерено ${meta.states.measured ?? 0}.`,
     '',
     `**Главная пара Rc − C:** ${pp(primary.delta)}; точность C ${pct(primary.accuracy.C)}, Rc ${pct(primary.accuracy.Rc)}. Выигрыши / проигрыши ${primary.wins} / ${primary.losses}; ничьи по построению ${primary.constructionTies}, наблюдаемые ${primary.observedTies}. Точный тест Макнемара p = ${pFixed(primary)}; 95% интервал ${ci(primary.interval)} п. п., 90% интервал ${ci(primary.interval90)} п. п.`,
     '',
@@ -128,16 +163,17 @@ export function analysisSection(record) {
 
 export function runAnalysisLive() {
   const audit = path.join(EVAL_ROOT, '.runs', 'redteam-main-audit', 'audit.md');
+  const note = readFileSync(path.join(RUN_DIR, 'readme-note.md'), 'utf8');
   return placeAnalysis({
     dir: path.join(RUN_DIR, 'analysis'),
     instruction: INSTRUCTION,
-    rules: ruleFiles(EVAL_ROOT, [PROTOCOL]),
+    rules: `${ruleFiles(EVAL_ROOT, [PROTOCOL])}\n\n# Note computed from the run (README, beside the block)\n\n${note}`,
     report: `${readFileSync(path.join(RUN_DIR, 'report.md'), 'utf8')}\n\n# Audit of campaign main\n\n${readFileSync(audit, 'utf8')}`,
     limits: ANALYSIS_LIMITS,
     readme: README,
     start: ANALYSIS_START,
     end: ANALYSIS_END,
-    after: README_END,
+    after: NOTE_END,
     section: analysisSection,
   });
 }
@@ -151,7 +187,13 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const report = readJson(path.join(RUN_DIR, 'report.json'));
     if (!report) throw new Error('Build the probe report first: node frontend/eval/redTeamProbeCli.js --phase report');
     const block = renderReadme(report, readJson(AUDIT));
-    if (argv.includes('--readme')) rewriteFile(README, (text) => placeAfter(text, README_START, README_END, block, AFTER));
+    const note = noteFromRun();
+    writeFileSync(path.join(RUN_DIR, 'readme-note.md'), `${note}\n`, 'utf8');
+    if (argv.includes('--readme')) {
+      rewriteFile(README, (text) => placeAfter(placeAfter(text, README_START, README_END, block, AFTER), NOTE_START, NOTE_END, note, README_END));
+    }
     console.log(block);
+    console.log('----');
+    console.log(note);
   }
 }
