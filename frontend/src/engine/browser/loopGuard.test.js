@@ -151,7 +151,8 @@ describe('loop guard in the engine', () => {
     const loop = chunks(looping(24000), 400).map((reasoning) => ({ reasoning }));
     const fetchMock = vi.fn(async () => sseResponse(loop));
     vi.stubGlobal('fetch', fetchMock);
-    const result = await queryModelResult('openai/gpt-4.1', messages, selfMoaRequestOptions());
+    const info = { supported_parameters: ['temperature', 'top_p'] };
+    const result = await queryModelResult('openai/gpt-4.1', messages, selfMoaRequestOptions(null, messages, info));
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(result.loopCut).toBe(true);
     expect(result.finishReason).toBe('loop');

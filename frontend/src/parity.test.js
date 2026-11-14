@@ -93,8 +93,19 @@ function checkCase(testCase) {
     expect(forwarded).toBe(testCase.expected_prefix + text.slice(-testCase.expected_tail_chars));
     return;
   }
+  if (testCase.kind === 'self_moa_request') {
+    const messages = [{ role: 'user', content: 'x'.repeat(testCase.prompt_chars) }];
+    const options = selfMoaRequestOptions(null, messages, testCase.info);
+    expect({
+      max_tokens: options.maxTokens,
+      temperature: options.temperature ?? null,
+      top_p: options.topP ?? null,
+    }).toEqual(testCase.expected);
+    return;
+  }
   if (testCase.kind === 'self_moa_settings') {
-    const options = selfMoaRequestOptions();
+    const messages = [{ role: 'user', content: 'x'.repeat(testCase.prompt_chars) }];
+    const options = selfMoaRequestOptions(null, messages, testCase.info);
     expect(SELF_MOA_SAMPLES).toBe(testCase.samples);
     expect(options.maxTokens).toBe(testCase.max_tokens);
     expect(options.temperature).toBe(testCase.temperature);

@@ -1380,7 +1380,18 @@ describe('self-moa mode', () => {
     resetFreeQueueForTests();
   });
 
-  function useSelfMoa(model) {
+  function catalogue(rows = {}) {
+    vi.spyOn(openrouter, 'getModelsPricing').mockImplementation(async () => {
+      const pricing = {};
+      for (const id of selectedCatalogueIds()) {
+        pricing[id] = { name: id, supported_parameters: ['temperature', 'top_p'], ...(rows[id] || {}) };
+      }
+      return pricing;
+    });
+  }
+
+  function useSelfMoa(model, rows = {}) {
+    catalogue(rows);
     settings.councilModels = ['a/one', 'b/two'];
     settings.chairmanModel = model;
     settings.redTeamModel = null;
@@ -1447,6 +1458,22 @@ describe('self-moa mode', () => {
     expect(message.metadata).toMatchObject({ mode: 'self_moa', model: 'x/model', sample_count: 5 });
     expect(message.stage3).toMatchObject({ response: 'final', mode: 'self_moa', sample_count: 5 });
     expect(message.streaming).toBe(false);
+  });
+
+  it('sends sampling settings only to a model that lists them, and fits the cap', async () => {
+    useSelfMoa('x/model', {
+      'x/model': { supported_parameters: ['max_tokens', 'reasoning'], context_length: 40000, max_completion_tokens: 16000 },
+    });
+    const calls = selfMoaQuery();
+    const created = await browserEngine.createConversation();
+    await browserEngine.sendMessageStream(created.id, 'q', [], [], () => {});
+    expect(calls).toHaveLength(6);
+    for (const call of calls) {
+      expect(call.options).not.toHaveProperty('temperature');
+      expect(call.options).not.toHaveProperty('topP');
+      expect(call.options.maxTokens).toBeLessThanOrEqual(16000);
+    }
+    expect(calls[0].options.maxTokens).toBe(16000);
   });
 
   it('keeps every sample for a free model', async () => {

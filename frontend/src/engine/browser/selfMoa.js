@@ -29,6 +29,7 @@ import { MODE_SELF_MOA } from './settings.js';
 
 export const SELF_MOA_SAMPLES = 5;
 export const SELF_MOA_MAX_TOKENS = 32768;
+export const SELF_MOA_MIN_TOKENS = 1024;
 export const SELF_MOA_TEMPERATURE = 0.7;
 export const SELF_MOA_TOP_P = 1;
 // A full 32768-token answer at 8 tokens a second, plus the header grace.
@@ -55,20 +56,53 @@ export function selfMoaModel(roster) {
   return String(roster?.councilModels?.[0] || '').trim();
 }
 
-/** What every Self-MoA call sends besides its messages. */
-export function selfMoaRequestOptions(roster = null) {
+/**
+ * The completion cap of one call. The runs used only routes that could take
+ * the full cap; the product cannot pick routes, so it lowers the cap to the
+ * model's own output limit and to the room its context leaves after the
+ * prompt (a conservative estimate), but never below SELF_MOA_MIN_TOKENS.
+ */
+export function selfMoaMaxTokens(messages, info = null) {
+  let cap = SELF_MOA_MAX_TOKENS;
+  const maxOut = Number(info?.max_completion_tokens);
+  if (Number.isFinite(maxOut) && maxOut > 0) cap = Math.min(cap, maxOut);
+  const context = Number(info?.context_length);
+  if (Number.isFinite(context) && context > 0) {
+    cap = Math.min(cap, context - openrouter.promptTokenEstimate(messages));
+  }
+  return Math.max(SELF_MOA_MIN_TOKENS, Math.floor(cap));
+}
+
+/**
+ * What a Self-MoA call sends besides its messages. As in the runs, the
+ * sampling settings go only to a model whose catalogue entry lists them;
+ * otherwise the provider default applies (Anthropic, for one, refuses
+ * temperature with thinking on).
+ */
+export function selfMoaRequestOptions(roster, messages, info = null) {
+  const supported = new Set(Array.isArray(info?.supported_parameters) ? info.supported_parameters : []);
   const options = {
-    maxTokens: SELF_MOA_MAX_TOKENS,
-    temperature: SELF_MOA_TEMPERATURE,
-    topP: SELF_MOA_TOP_P,
+    maxTokens: selfMoaMaxTokens(messages, info),
     timeout: SELF_MOA_STREAM_SECONDS,
     loopGuard: { ...LOOP_GUARD_DEFAULTS },
     maxRetries: SELF_MOA_MAX_ATTEMPTS,
     // Finish reason and reasoning provenance, needed by the tail rule.
     evalAnnotations: true,
   };
+  if (supported.has('temperature')) options.temperature = SELF_MOA_TEMPERATURE;
+  if (supported.has('top_p')) options.topP = SELF_MOA_TOP_P;
   if (roster?.runId) options.runId = roster.runId;
   return options;
+}
+
+/** The catalogue entry of a model, or null when the catalogue is unavailable. */
+export async function catalogueInfo(model) {
+  try {
+    const pricing = await openrouter.getModelsPricing();
+    return pricing?.[openrouter.catalogueModelId(model)] || null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -167,7 +201,7 @@ export async function* collectSelfMoaSamples(userQuery, options = {}) {
   for (const failure of failures) yield ['model_failed', { ...failure, existing: true }];
 
   const messages = [{ role: 'user', content: userQuery }];
-  const requestOptions = selfMoaRequestOptions(roster);
+  const requestOptions = selfMoaRequestOptions(roster, messages, await catalogueInfo(model));
   const fresh = new Array(pending.length).fill(null);
   if (pending.length) {
     const tasks = pending.map((slotModel, slot) => async () => ({
@@ -198,10 +232,11 @@ export async function selfMoaSynthesize(queryText, stage1Results, roster) {
   if (!samples.length) throw new Error('No samples to combine. Retry Stage 1 first.');
   if (!model || modelUnavailable(model)) throw new Error(MODELS_UNAVAILABLE);
   const prompt = buildSelfMoaPrompt(queryText, samples);
+  const messages = [{ role: 'user', content: prompt }];
   const result = await openrouter.queryModelResult(
     model,
-    [{ role: 'user', content: prompt }],
-    selfMoaRequestOptions(roster),
+    messages,
+    selfMoaRequestOptions(roster, messages, await catalogueInfo(model)),
   );
   if (result.skipped) throw new Error(MODELS_UNAVAILABLE);
   if (!result.ok) {

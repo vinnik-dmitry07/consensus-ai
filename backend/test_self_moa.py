@@ -81,7 +81,19 @@ class SelfMoaTests(unittest.TestCase):
             )
         })
 
-    def use_self_moa(self, model):
+    def use_self_moa(self, model, rows=None):
+        rows = rows or {}
+
+        async def catalogue():
+            from backend.roster import _selected_catalogue_ids
+            return {
+                model_id: {'supported_parameters': ['temperature', 'top_p'], **rows.get(model_id, {})}
+                for model_id in _selected_catalogue_ids()
+            }
+
+        catalogue_patch = patch('backend.openrouter.get_models_pricing', new=catalogue)
+        catalogue_patch.start()
+        self.addCleanup(catalogue_patch.stop)
         settings.update_from_dict({
             'mode': 'self_moa',
             'council_models': ['a/one', 'b/two'],
@@ -137,6 +149,23 @@ class SelfMoaTests(unittest.TestCase):
         self.assertEqual(assistant['stage3']['response'], 'final')
         self.assertEqual(assistant['stage3']['mode'], 'self_moa')
         self.assertFalse(assistant.get('streaming'))
+
+    def test_sampling_settings_only_where_listed_and_cap_fits(self):
+        self.use_self_moa('x/model', {
+            'x/model': {
+                'supported_parameters': ['max_tokens', 'reasoning'],
+                'context_length': 40000,
+                'max_completion_tokens': 16000,
+            },
+        })
+        fake = FakeModel()
+        self.send(fake)
+        self.assertEqual(len(fake.calls), 6)
+        for options in fake.options:
+            self.assertNotIn('temperature', options)
+            self.assertNotIn('top_p', options)
+            self.assertLessEqual(options['max_tokens'], 16000)
+        self.assertEqual(fake.options[0]['max_tokens'], 16000)
 
     def test_free_model_keeps_every_sample(self):
         self.use_self_moa('x/model:free')

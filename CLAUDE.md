@@ -15,7 +15,7 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 - Contains `CHAIRMAN_MODEL` (model that synthesizes final answer)
 - Contains `N_SAMPLES` (independent Stage 1 answers collected per model)
 - Contains `TOP_K`, `RED_TEAM_MODEL` (None = chairman), `SELF_EXCLUSION`
-- Contains `MODE` (`'council'` default, or `'self_moa'`), `SELF_MOA_SAMPLES` (5) and the Self-MoA call settings taken from the a8-open v5+ runs: `SELF_MOA_MAX_TOKENS` 32768, temperature 0.7, top_p 1, `SELF_MOA_STREAM_SECONDS` 4216 (a full cap at 8 tok/s plus 120 s), idle 120 s, `SELF_MOA_MAX_ATTEMPTS` 2, tail rule 8000 characters with `SELF_MOA_TAIL_MARKER`
+- Contains `MODE` (`'council'` default, or `'self_moa'`), `SELF_MOA_SAMPLES` (5) and the Self-MoA call settings taken from the a8-open v5+ runs: `SELF_MOA_MAX_TOKENS` 32768 (`self_moa_max_tokens` lowers it to the model's output limit and the context room, floor `SELF_MOA_MIN_TOKENS` 1024), temperature 0.7 and top_p 1 only when the catalogue's `supported_parameters` lists them (as the runs did per route), `SELF_MOA_STREAM_SECONDS` 4216 (a full cap at 8 tok/s plus 120 s), idle 120 s, `SELF_MOA_MAX_ATTEMPTS` 2, tail rule 8000 characters with `SELF_MOA_TAIL_MARKER`
 - Uses environment variable `OPENROUTER_API_KEY` from `.env`
 - Backend runs on **port 8001** (NOT 8000 - user had another app on 8000)
 

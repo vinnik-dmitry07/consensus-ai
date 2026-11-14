@@ -199,10 +199,17 @@ async def get_models_pricing() -> Dict[str, Dict[str, Any]]:
             for model in data.get('data', []):
                 model_id = model.get('id')
                 if model_id:
+                    top = model.get('top_provider') or {}
+                    params = model.get('supported_parameters')
                     built[model_id] = {
                         'name': model.get('name'),
                         'pricing': model.get('pricing', {}),
                         'description': model.get('description', ''),
+                        'context_length': model.get('context_length'),
+                        'max_completion_tokens': (
+                            top.get('max_completion_tokens') if isinstance(top, dict) else None
+                        ),
+                        'supported_parameters': list(params) if isinstance(params, list) else None,
                     }
             _models_cache = built
             _models_cache_time = time.time()
@@ -308,6 +315,26 @@ def _fail_result(
         'ok': False,
         'error': {'status': status, 'message': message, 'detail': detail},
     }
+
+
+# Conservative prompt size, as promptTokenEstimate in the in-browser engine:
+# two characters per token plus a margin per message for the chat template.
+CONTEXT_CHARS_PER_TOKEN = 2
+CONTEXT_MESSAGE_MARGIN = 64
+CONTEXT_TEMPLATE_MARGIN = 1024
+
+
+def prompt_token_estimate(messages: Any) -> int:
+    items = messages if isinstance(messages, list) else []
+    chars = 0
+    for message in items:
+        content = message.get('content') if isinstance(message, dict) else None
+        chars += len('' if content is None else str(content))
+    return (
+        -(-chars // CONTEXT_CHARS_PER_TOKEN)
+        + CONTEXT_MESSAGE_MARGIN * len(items)
+        + CONTEXT_TEMPLATE_MARGIN
+    )
 
 
 def _usage_counts(usage: Any) -> Dict[str, int]:

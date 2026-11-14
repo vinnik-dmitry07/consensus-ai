@@ -181,6 +181,13 @@
     {
       "name": "self-moa request settings from the a8 runs",
       "kind": "self_moa_settings",
+      "info": {
+        "supported_parameters": [
+          "temperature",
+          "top_p"
+        ]
+      },
+      "prompt_chars": 1,
       "samples": 5,
       "max_tokens": 32768,
       "temperature": 0.7,
@@ -272,6 +279,102 @@
       ],
       "end": 8000,
       "expected": 0.22782258064516128
+    },
+    {
+      "name": "self-moa request: a model that lists the sampling settings",
+      "kind": "self_moa_request",
+      "info": {
+        "supported_parameters": [
+          "temperature",
+          "top_p",
+          "max_tokens"
+        ],
+        "context_length": 262144,
+        "max_completion_tokens": 32768
+      },
+      "prompt_chars": 1,
+      "expected": {
+        "max_tokens": 32768,
+        "temperature": 0.7,
+        "top_p": 1
+      }
+    },
+    {
+      "name": "self-moa request: a model that does not list them gets the provider default",
+      "kind": "self_moa_request",
+      "info": {
+        "supported_parameters": [
+          "max_tokens",
+          "reasoning"
+        ],
+        "context_length": 1000000,
+        "max_completion_tokens": 128000
+      },
+      "prompt_chars": 1,
+      "expected": {
+        "max_tokens": 32768,
+        "temperature": null,
+        "top_p": null
+      }
+    },
+    {
+      "name": "self-moa request: the cap drops to the model output limit",
+      "kind": "self_moa_request",
+      "info": {
+        "supported_parameters": [
+          "temperature"
+        ],
+        "context_length": 32768,
+        "max_completion_tokens": 8192
+      },
+      "prompt_chars": 1,
+      "expected": {
+        "max_tokens": 8192,
+        "temperature": 0.7,
+        "top_p": null
+      }
+    },
+    {
+      "name": "self-moa request: the cap drops to the room the context leaves",
+      "kind": "self_moa_request",
+      "info": {
+        "supported_parameters": [
+          "temperature",
+          "top_p"
+        ],
+        "context_length": 40000,
+        "max_completion_tokens": null
+      },
+      "prompt_chars": 20000,
+      "expected": {
+        "max_tokens": 28912,
+        "temperature": 0.7,
+        "top_p": 1
+      }
+    },
+    {
+      "name": "self-moa request: no catalogue entry",
+      "kind": "self_moa_request",
+      "info": null,
+      "prompt_chars": 1,
+      "expected": {
+        "max_tokens": 32768,
+        "temperature": null,
+        "top_p": null
+      }
+    },
+    {
+      "name": "self-moa request: never below the minimum cap",
+      "kind": "self_moa_request",
+      "info": {
+        "context_length": 4000
+      },
+      "prompt_chars": 10000,
+      "expected": {
+        "max_tokens": 1024,
+        "temperature": null,
+        "top_p": null
+      }
     }
   ]
 }

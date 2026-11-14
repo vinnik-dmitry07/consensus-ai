@@ -12,6 +12,7 @@ from .config import (
     SELF_MOA_IDLE_SECONDS,
     SELF_MOA_MAX_ATTEMPTS,
     SELF_MOA_MAX_TOKENS,
+    SELF_MOA_MIN_TOKENS,
     SELF_MOA_SAMPLES,
     SELF_MOA_STREAM_SECONDS,
     SELF_MOA_TAIL_CHARS,
@@ -22,6 +23,7 @@ from .config import (
 )
 from .loop_guard import LOOP_GUARD_DEFAULTS
 from .openrouter import (
+    prompt_token_estimate,
     get_api_key,
     model_family,
     query_model,
@@ -1272,12 +1274,37 @@ def self_moa_model() -> str:
     return str(models[0]).strip() if models else ''
 
 
-def self_moa_request_options() -> Dict[str, Any]:
-    """What every Self-MoA call sends besides its messages."""
-    return {
-        'max_tokens': SELF_MOA_MAX_TOKENS,
-        'temperature': SELF_MOA_TEMPERATURE,
-        'top_p': SELF_MOA_TOP_P,
+def self_moa_max_tokens(messages: List[Dict[str, Any]], info: Optional[Dict[str, Any]] = None) -> int:
+    """The completion cap of one call, as selfMoaMaxTokens in selfMoa.js.
+
+    The runs used only routes that could take the full cap; the product
+    cannot pick routes, so it lowers the cap to the model's own output limit
+    and to the room its context leaves after the prompt, never below
+    SELF_MOA_MIN_TOKENS.
+    """
+    info = info if isinstance(info, dict) else {}
+    cap = SELF_MOA_MAX_TOKENS
+    max_out = info.get('max_completion_tokens')
+    if isinstance(max_out, (int, float)) and not isinstance(max_out, bool) and max_out > 0:
+        cap = min(cap, max_out)
+    context = info.get('context_length')
+    if isinstance(context, (int, float)) and not isinstance(context, bool) and context > 0:
+        cap = min(cap, context - prompt_token_estimate(messages))
+    return max(SELF_MOA_MIN_TOKENS, int(cap // 1))
+
+
+def self_moa_request_options(
+    messages: List[Dict[str, Any]], info: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """What a Self-MoA call sends besides its messages.
+
+    As in the runs, the sampling settings go only to a model whose catalogue
+    entry lists them; otherwise the provider default applies.
+    """
+    params = info.get('supported_parameters') if isinstance(info, dict) else None
+    supported = set(params) if isinstance(params, list) else set()
+    options = {
+        'max_tokens': self_moa_max_tokens(messages, info),
         'stream': True,
         'loop_guard': dict(LOOP_GUARD_DEFAULTS),
         'max_retries': SELF_MOA_MAX_ATTEMPTS,
@@ -1285,6 +1312,21 @@ def self_moa_request_options() -> Dict[str, Any]:
         'timeout': SELF_MOA_IDLE_SECONDS,
         'total_seconds': SELF_MOA_STREAM_SECONDS,
     }
+    if 'temperature' in supported:
+        options['temperature'] = SELF_MOA_TEMPERATURE
+    if 'top_p' in supported:
+        options['top_p'] = SELF_MOA_TOP_P
+    return options
+
+
+async def self_moa_catalogue_info(model: str) -> Optional[Dict[str, Any]]:
+    """The catalogue entry of a model, or None when the catalogue is unavailable."""
+    from . import openrouter as _openrouter
+    try:
+        pricing = await _openrouter.get_models_pricing()
+    except Exception:
+        return None
+    return (pricing or {}).get(catalogue_id(model))
 
 
 def is_cut_reasoning(result: Dict[str, Any]) -> bool:
@@ -1384,7 +1426,7 @@ async def collect_self_moa_samples(
         yield ('model_failed', {**failure, 'existing': True})
 
     messages = [{'role': 'user', 'content': user_query}]
-    options = self_moa_request_options()
+    options = self_moa_request_options(messages, await self_moa_catalogue_info(model))
     fresh: List[Optional[Dict[str, Any]]] = [None] * len(pending)
     if pending:
         async def query_slot(slot, slot_model):
@@ -1429,8 +1471,10 @@ async def self_moa_synthesize(
     if not model or model_unavailable(model):
         raise Exception(MODELS_UNAVAILABLE)
     prompt = build_self_moa_prompt(query_text, samples)
+    messages = [{'role': 'user', 'content': prompt}]
     result = await query_model_result(
-        model, [{'role': 'user', 'content': prompt}], **self_moa_request_options()
+        model, messages,
+        **self_moa_request_options(messages, await self_moa_catalogue_info(model)),
     )
     if result.get('skipped'):
         raise Exception(MODELS_UNAVAILABLE)

@@ -68,8 +68,19 @@ def check_case(case):
         )
         return
 
+    if kind == 'self_moa_request':
+        messages = [{'role': 'user', 'content': 'x' * case['prompt_chars']}]
+        options = self_moa_request_options(messages, case['info'])
+        assert {
+            'max_tokens': options['max_tokens'],
+            'temperature': options.get('temperature'),
+            'top_p': options.get('top_p'),
+        } == case['expected']
+        return
+
     if kind == 'self_moa_settings':
-        options = self_moa_request_options()
+        messages = [{'role': 'user', 'content': 'x' * case['prompt_chars']}]
+        options = self_moa_request_options(messages, case['info'])
         assert SELF_MOA_SAMPLES == case['samples']
         assert options['max_tokens'] == case['max_tokens']
         assert options['temperature'] == case['temperature']

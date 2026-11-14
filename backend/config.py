@@ -54,6 +54,8 @@ SELF_MOA_SAMPLES = 5
 # and the tail rule for a sample cut before it wrote an answer. Must match
 # frontend/src/engine/browser/selfMoa.js.
 SELF_MOA_MAX_TOKENS = 32768
+# A call never asks for less, whatever the model limits leave.
+SELF_MOA_MIN_TOKENS = 1024
 SELF_MOA_TEMPERATURE = 0.7
 SELF_MOA_TOP_P = 1
 SELF_MOA_STREAM_SECONDS = -(-SELF_MOA_MAX_TOKENS // 8) + 120
