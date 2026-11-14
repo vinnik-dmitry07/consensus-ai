@@ -4,8 +4,12 @@ import json
 import unittest
 from pathlib import Path
 
+from backend.config import SELF_MOA_SAMPLES, SELF_MOA_TAIL_CHARS, SELF_MOA_TAIL_MARKER
+from backend.loop_guard import detect_loop, repeat_share
 from backend.council import (
     build_self_moa_prompt,
+    forward_sample_text,
+    self_moa_request_options,
     calculate_aggregate_rankings,
     compute_consensus,
     parse_correctness_scores,
@@ -56,7 +60,54 @@ def check_case(case):
         assert build_self_moa_prompt(case['query'], case['samples']) == case['expected']
         return
 
+    if kind == 'self_moa_forward':
+        text = build_text(case['text'])
+        row = {'response': text, 'cut_reasoning': case['cut_reasoning']}
+        assert forward_sample_text(row) == (
+            case['expected_prefix'] + text[-case['expected_tail_chars']:]
+        )
+        return
+
+    if kind == 'self_moa_settings':
+        options = self_moa_request_options()
+        assert SELF_MOA_SAMPLES == case['samples']
+        assert options['max_tokens'] == case['max_tokens']
+        assert options['temperature'] == case['temperature']
+        assert options['top_p'] == case['top_p']
+        assert options['total_seconds'] == case['stream_seconds']
+        assert options['timeout'] == case['idle_seconds']
+        assert options['max_retries'] == case['max_attempts']
+        assert options['loop_guard'] == case['loop_guard']
+        assert options['stream'] is True and options['annotate'] is True
+        assert SELF_MOA_TAIL_CHARS == case['tail_chars']
+        assert SELF_MOA_TAIL_MARKER == case['tail_marker']
+        return
+
+    if kind == 'loop_guard':
+        assert detect_loop(build_text(case['text'])) == case['expected']
+        return
+
+    if kind == 'loop_guard_share':
+        assert repeat_share(build_text(case['text']), case['end'], True) == case['expected']
+        return
+
     raise AssertionError(f'unknown fixture kind {kind}')
+
+
+def build_text(parts):
+    """Long fixture texts, written as parts. Same rules as parity.test.js."""
+    out = []
+    for part in parts:
+        kind = part[0]
+        if kind == 'repeat':
+            out.append(part[1] * part[2])
+        elif kind == 'numbers':
+            out.append(' '.join(str(i) for i in range(part[1], part[2])))
+        elif kind == 'counted':
+            out.append(''.join(f'{part[1]}{i}{part[2]}' for i in range(part[3])))
+        else:
+            raise AssertionError(f'unknown text part {kind}')
+    return ''.join(out)
 
 
 class ParityFixtureTests(unittest.TestCase):

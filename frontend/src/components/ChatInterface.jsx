@@ -862,18 +862,35 @@ export default function ChatInterface({
                       <div className="error-content">
                         <span className="error-icon">⚠️</span>
                         <div className="error-details">
-                          <strong>Stage 1 Failed</strong>
+                          <strong>
+                            {isSelfMoaMessage(msg) && stage1AnswerCount(msg) > 0
+                              ? 'Not all samples arrived'
+                              : 'Stage 1 Failed'}
+                          </strong>
                           <p>{msg.error.message}</p>
                         </div>
                       </div>
                       {showRetry && (
-                        <button
-                          className="retry-button"
-                          onClick={() => onRetryStage(index, 1)}
-                          disabled={runBlocked}
-                        >
-                          Retry Stage 1
-                        </button>
+                        <div className="interrupted-buttons">
+                          <button
+                            className="retry-button"
+                            onClick={() => onRetryStage(index, 1)}
+                            disabled={runBlocked}
+                          >
+                            {isSelfMoaMessage(msg) && stage1AnswerCount(msg) > 0
+                              ? 'Resume Stage 1'
+                              : 'Retry Stage 1'}
+                          </button>
+                          {isSelfMoaMessage(msg) && stage1AnswerCount(msg) > 0 && (
+                            <button
+                              className="retry-button secondary"
+                              onClick={() => onRetryStage(index, 3)}
+                              disabled={runBlocked}
+                            >
+                              Combine {stage1AnswerCount(msg)} sample{stage1AnswerCount(msg) === 1 ? '' : 's'}
+                            </button>
+                          )}
+                        </div>
                       )}
                     </div>
                   )}

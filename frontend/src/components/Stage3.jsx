@@ -62,6 +62,11 @@ export default function Stage3({
               Combined from {count} sample{count === 1 ? '' : 's'} of the same model
             </div>
           )}
+          {finalResponse.cut === true && (
+            <div className="based-on-label">
+              This answer stopped early, at the token limit or on repetition.
+            </div>
+          )}
           <div className="final-text markdown-content">
             <ReactMarkdown remarkPlugins={[remarkGfmPlugin]} components={components}>
               {answer}

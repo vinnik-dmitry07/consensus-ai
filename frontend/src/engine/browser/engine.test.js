@@ -28,6 +28,7 @@ import {
   getConversation,
   updateStreamingMessage,
 } from './storage.js';
+import { SELF_MOA_TAIL_MARKER } from './selfMoa.js';
 
 function finalAnswer(text) {
   return { model: 'chair', response: text, usage: {} };
@@ -1387,17 +1388,18 @@ describe('self-moa mode', () => {
     settings.mode = 'self_moa';
   }
 
-  function selfMoaQuery({ failSynthesis = false } = {}) {
+  function selfMoaQuery({ failSynthesis = false, sample = null } = {}) {
     const calls = [];
     vi.spyOn(openrouter, 'queryModel').mockResolvedValue({ content: 'Title', usage: {} });
-    vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model, messages) => {
+    vi.spyOn(openrouter, 'queryModelResult').mockImplementation(async (model, messages, options) => {
       const content = messages?.[0]?.content;
       const text = typeof content === 'string' ? content : JSON.stringify(content);
-      calls.push({ model, text });
+      calls.push({ model, text, options });
       if (text.startsWith(SYNTH_LEAD)) {
         if (failSynthesis) return { ok: false, error: { status: 500, message: 'down', detail: '' } };
         return { ok: true, content: 'final', usage: {} };
       }
+      if (sample) return sample(calls.length);
       return { ok: true, content: `sample ${calls.length}`, usage: {} };
     });
     return calls;
@@ -1421,8 +1423,22 @@ describe('self-moa mode', () => {
     expect(calls.every((call) => call.model === 'x/model')).toBe(true);
     const synth = calls.filter((call) => call.text.startsWith(SYNTH_LEAD));
     expect(synth).toHaveLength(1);
-    expect(synth[0].text).toContain('Original Question: What is 2 + 2?');
-    expect(synth[0].text).toContain('Sample slot 5:');
+    expect(synth[0].text).toBe(
+      `${SYNTH_LEAD}\nThe samples may repeat the same mistake. Do not treat agreement as proof.\n`
+      + 'Give your own final answer.\n\nWhat is 2 + 2?\n\n'
+      + [1, 2, 3, 4, 5].map((n) => `Sample slot ${n}:\nsample ${n}`).join('\n\n'),
+    );
+    for (const call of calls) {
+      expect(call.options).toMatchObject({
+        maxTokens: 32768,
+        temperature: 0.7,
+        topP: 1,
+        timeout: 4216,
+        maxRetries: 2,
+        evalAnnotations: true,
+      });
+      expect(call.options.loopGuard).toBeTruthy();
+    }
 
     const message = (await getConversation(created.id)).messages[1];
     expect(message.stage1).toHaveLength(5);
@@ -1497,5 +1513,95 @@ describe('self-moa mode', () => {
     expect(settings.mode).toBe('self_moa');
     settings.updateFromDict({ mode: 'nonsense' });
     expect(settings.mode).toBe('council');
+  });
+
+  it('rejects an unknown mode in settings, as the local backend does', async () => {
+    await expect(browserEngine.updateSettings({ mode: 'mystery' })).rejects.toThrow(/Unknown mode/);
+  });
+
+  it('stops at stage 1 without a full set and combines on request', async () => {
+    useSelfMoa('x/model');
+    let calls = selfMoaQuery({
+      sample: (n) => (n === 2
+        ? { ok: false, error: { status: 500, message: 'down', detail: '' } }
+        : { ok: true, content: `sample ${n}`, usage: {} }),
+    });
+    const created = await browserEngine.createConversation();
+    const { events, onEvent } = collectEvents();
+    await browserEngine.sendMessageStream(created.id, 'q', [], [], onEvent);
+    const types = events.map((item) => item.type);
+    expect(types).toContain('stage1_complete');
+    expect(types).toContain('stage1_error');
+    expect(types).not.toContain('stage3_start');
+    expect(calls.some((call) => call.text.startsWith(SYNTH_LEAD))).toBe(false);
+    let message = (await getConversation(created.id)).messages[1];
+    expect(message.error).toEqual({
+      stage: 1,
+      message: 'Only 4 of 5 samples arrived. Resume Stage 1 to fetch the rest, or combine the 4 you have.',
+    });
+    expect(message.metadata).toEqual({ mode: 'self_moa', model: 'x/model' });
+
+    vi.restoreAllMocks();
+    calls = selfMoaQuery();
+    await browserEngine.retryStage(created.id, 3, 1, () => {});
+    expect(calls).toHaveLength(1);
+    message = (await getConversation(created.id)).messages[1];
+    expect(message.stage3).toMatchObject({ response: 'final', sample_count: 4 });
+    expect(message.error).toBeUndefined();
+  });
+
+  it('passes only the marked tail of a sample cut before its answer', async () => {
+    useSelfMoa('x/model');
+    const reasoning = `${'head '.repeat(2000)}${'z'.repeat(8000)}`;
+    const calls = selfMoaQuery({
+      sample: (n) => (n === 1
+        ? {
+          ok: true, content: reasoning, usage: {}, contentFromReasoning: true, providerFinishReason: 'length',
+        }
+        : { ok: true, content: `sample ${n}`, usage: {}, providerFinishReason: 'stop' }),
+    });
+    const created = await browserEngine.createConversation();
+    await browserEngine.sendMessageStream(created.id, 'q', [], [], () => {});
+    const message = (await getConversation(created.id)).messages[1];
+    expect(message.stage1[0]).toMatchObject({ response: reasoning, cut_reasoning: true });
+    expect(message.stage1.slice(1).some((row) => 'cut_reasoning' in row)).toBe(false);
+    const synth = calls.find((call) => call.text.startsWith(SYNTH_LEAD)).text;
+    expect(synth).toContain(`Sample slot 1:\n${SELF_MOA_TAIL_MARKER}\n${'z'.repeat(8000)}\n\nSample slot 2:`);
+    expect(synth).not.toContain('head head');
+  });
+
+  it('keeps samples in slot order, not in the order calls finish', async () => {
+    useSelfMoa('x/model');
+    selfMoaQuery({
+      sample: async (n) => {
+        await new Promise((resolve) => { setTimeout(resolve, (6 - n) * 40); });
+        return { ok: true, content: `sample ${n}`, usage: {} };
+      },
+    });
+    const created = await browserEngine.createConversation();
+    const { events, onEvent } = collectEvents();
+    await browserEngine.sendMessageStream(created.id, 'q', [], [], onEvent);
+    const finished = events
+      .filter((item) => item.type === 'stage1_model_complete')
+      .map((item) => item.event.data.result.response);
+    expect(finished).toEqual(['sample 5', 'sample 4', 'sample 3', 'sample 2', 'sample 1']);
+    const message = (await getConversation(created.id)).messages[1];
+    expect(message.stage1.map((row) => row.response)).toEqual([
+      'sample 1', 'sample 2', 'sample 3', 'sample 4', 'sample 5',
+    ]);
+  });
+
+  it('retries a local-backend S8 message with the model it recorded', async () => {
+    settings.councilModels = ['y/other'];
+    settings.chairmanModel = 'y/other';
+    settings.mode = 'council';
+    const id = crypto.randomUUID();
+    await createConversation(id);
+    await addUserMessage(id, 'q');
+    const samples = [1, 2, 3, 4, 5].map((n) => ({ model: 'x/model', response: `s${n}` }));
+    await addAssistantMessage(id, samples, [], null, { mode: 'self_moa', model: 'x/model' });
+    const calls = selfMoaQuery();
+    await browserEngine.retryStage(id, 3, 1, () => {});
+    expect(calls.map((call) => call.model)).toEqual(['x/model']);
   });
 });

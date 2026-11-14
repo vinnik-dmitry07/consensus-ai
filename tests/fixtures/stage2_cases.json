@@ -144,8 +144,134 @@
       "name": "self-moa synthesis prompt",
       "kind": "self_moa_prompt",
       "query": "What is 2 + 2?",
-      "samples": ["4", "Four."],
-      "expected": "You are aggregating independent answers from one model.\nThe samples may repeat the same mistake. Do not treat agreement as proof.\n\nOriginal Question: What is 2 + 2?\n\nSAMPLES:\n\nSample slot 1:\n4\n\nSample slot 2:\nFour.\n\nYour task:\n- Check the reasoning of every sample. Keep what is correct and fix what is wrong.\n- Where the samples disagree, work out which answer is right instead of following the majority.\n- Do not mention the samples, the aggregation, or model names.\n\nProvide a clear, well-reasoned final answer:"
+      "samples": [
+        "4",
+        "Four."
+      ],
+      "expected": "You are aggregating independent answers from one model.\nThe samples may repeat the same mistake. Do not treat agreement as proof.\nGive your own final answer.\n\nWhat is 2 + 2?\n\nSample slot 1:\n4\n\nSample slot 2:\nFour."
+    },
+    {
+      "name": "self-moa cut sample keeps the marked tail",
+      "kind": "self_moa_forward",
+      "text": [
+        [
+          "repeat",
+          "0123456789",
+          1000
+        ]
+      ],
+      "cut_reasoning": true,
+      "expected_prefix": "[This answer was cut off before a final answer. Last 8000 characters of its unfinished reasoning:]\n",
+      "expected_tail_chars": 8000
+    },
+    {
+      "name": "self-moa finished sample passes whole",
+      "kind": "self_moa_forward",
+      "text": [
+        [
+          "repeat",
+          "0123456789",
+          1000
+        ]
+      ],
+      "cut_reasoning": false,
+      "expected_prefix": "",
+      "expected_tail_chars": 10000
+    },
+    {
+      "name": "self-moa request settings from the a8 runs",
+      "kind": "self_moa_settings",
+      "samples": 5,
+      "max_tokens": 32768,
+      "temperature": 0.7,
+      "top_p": 1,
+      "stream_seconds": 4216,
+      "idle_seconds": 120,
+      "max_attempts": 2,
+      "tail_chars": 8000,
+      "tail_marker": "[This answer was cut off before a final answer. Last 8000 characters of its unfinished reasoning:]",
+      "loop_guard": {
+        "tailChars": 4000,
+        "historyChars": 24000,
+        "shingleChars": 40,
+        "stride": 8,
+        "threshold": 0.8,
+        "checkEvery": 2000,
+        "consecutive": 2
+      }
+    },
+    {
+      "name": "loop guard fires on a repeated sentence",
+      "kind": "loop_guard",
+      "text": [
+        [
+          "repeat",
+          "The model keeps saying the same thing. ",
+          400
+        ]
+      ],
+      "expected": {
+        "position": 8000,
+        "share": 1
+      }
+    },
+    {
+      "name": "loop guard stays quiet on counting text",
+      "kind": "loop_guard",
+      "text": [
+        [
+          "numbers",
+          0,
+          3000
+        ]
+      ],
+      "expected": null
+    },
+    {
+      "name": "loop guard fires once a long answer starts looping",
+      "kind": "loop_guard",
+      "text": [
+        [
+          "numbers",
+          0,
+          2500
+        ],
+        [
+          "repeat",
+          "Let me check this step again carefully. ",
+          300
+        ]
+      ],
+      "expected": {
+        "position": 18000,
+        "share": 1
+      }
+    },
+    {
+      "name": "loop guard needs more text than its tail and one check",
+      "kind": "loop_guard",
+      "text": [
+        [
+          "repeat",
+          "abc ",
+          1000
+        ]
+      ],
+      "expected": null
+    },
+    {
+      "name": "loop guard share on numbered steps",
+      "kind": "loop_guard_share",
+      "text": [
+        [
+          "counted",
+          "Step ",
+          ": check the value again before moving on. ",
+          300
+        ]
+      ],
+      "end": 8000,
+      "expected": 0.22782258064516128
     }
   ]
 }

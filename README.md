@@ -11,7 +11,7 @@ Fork of [karpathy/llm-council](https://github.com/karpathy/llm-council) with a s
 3. **Red team** — A reviewer tries to refute the leading answer (`REFUTED` / `CONTESTED` / `UPHELD`). Failure of this pass is non-fatal, but confidence is then capped at `MEDIUM`: peer agreement alone never earns `HIGH`.
 4. **Stage 3: Final answer** — The Chairman starts from the top-ranked answer as a base draft, applies corrections from the remaining top-K, and must address disputed claims and the red-team verdict.
 
-**Self-MoA mode (S8, optional).** Settings → Answer Mode switches to the S8 arm of the a8 evaluations: the model chosen as chairman answers the question 5 times on its own, then the same model combines its answers. There is no peer ranking and no red team, so a question costs 6 calls. The council stays the default. In a8-open-v5e (149 questions) equivalence with the council within ±5 pp was supported; on the 46 ArXivMath questions of a8-open-v7 the council scored 10.9% and S8 4.3%, direction not established. Both measured open-weight models with a fixed route, not the product defaults.
+**Self-MoA mode (S8, optional).** Settings → Answer Mode switches to the S8 arm of the a8 evaluations: the model chosen as chairman answers the question 5 times on its own, then the same model combines its answers. There is no peer ranking and no red team, so a question costs 6 calls. Each call is made as in the a8-open v5+ runs: up to 32,768 tokens, temperature 0.7, top_p 1, a stream deadline of 4216 s, the repetition guard with two attempts, and only the last 8000 characters of a sample that was cut before it wrote an answer. The answer is combined only from a full set of 5; with fewer, the run stops and offers to fetch the rest or combine what arrived. What still differs from the runs: the model is yours and OpenRouter picks its provider, the question carries no `ANSWER:` format, and the five samples are five calls rather than one council answer plus four. The council stays the default. In a8-open-v5e (149 questions) equivalence with the council within ±5 pp was supported; on the 46 ArXivMath questions of a8-open-v7 the council scored 10.9% and S8 4.3%, direction not established. Both measured open-weight models with a fixed route, not the product defaults.
 
 ## Screenshots
 
@@ -140,7 +140,7 @@ N_SAMPLES = 3
 CHAIRMAN_MODEL = "~anthropic/claude-fable-latest-reasoning-high"
 
 MODE = "council"  # or "self_moa": CHAIRMAN_MODEL answers SELF_MOA_SAMPLES times and combines them
-SELF_MOA_SAMPLES = 5
+SELF_MOA_SAMPLES = 5  # Self-MoA call settings (SELF_MOA_MAX_TOKENS etc.) follow the a8 runs
 ```
 
 ## Running the application

@@ -20,7 +20,11 @@ import {
   DEFAULT_COUNCIL_MODELS,
   DEFAULT_N_SAMPLES,
 } from '../engine/browser/settings.js';
-import { SELF_MOA_SAMPLES } from '../engine/browser/selfMoa.js';
+import {
+  SELF_MOA_MAX_TOKENS,
+  SELF_MOA_SAMPLES,
+  SELF_MOA_TEMPERATURE,
+} from '../engine/browser/selfMoa.js';
 import {
   forgetGithubToken,
   getGithubToken,
@@ -762,7 +766,7 @@ export default function Settings({
                 <h3>Answer Mode</h3>
                 <p className="settings-description">
                   {mode === 'self_moa'
-                    ? `Self-MoA (S8): the model chosen below answers ${SELF_MOA_SAMPLES} times on its own, then the same model combines those answers. No peer ranking and no red team; ${SELF_MOA_SAMPLES + 1} calls per question. The council list is kept for council mode.`
+                    ? `Self-MoA (S8): the model chosen below answers ${SELF_MOA_SAMPLES} times on its own, then the same model combines those answers. No peer ranking and no red team; ${SELF_MOA_SAMPLES + 1} calls per question, each up to ${SELF_MOA_MAX_TOKENS.toLocaleString('en-US')} tokens at temperature ${SELF_MOA_TEMPERATURE}, with a repetition guard, as in the a8 runs. It combines only a full set of ${SELF_MOA_SAMPLES}. The council list is kept for council mode.`
                     : 'Council: every council model answers, the models rank each other anonymously, a red team checks the leader, and the chairman writes the final answer.'}
                 </p>
                 <div className="engine-options">

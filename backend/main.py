@@ -24,9 +24,12 @@ from .council import (
     retained_stage1_failures,
     run_full_council,
     run_post_ranking,
+    collect_self_moa_samples,
+    incomplete_samples_message,
     run_self_moa,
     self_moa_metadata,
     self_moa_model,
+    self_moa_start_metadata,
     self_moa_synthesize,
     stage1_collect_responses_streaming,
     stage2_collect_rankings_streaming,
@@ -332,19 +335,20 @@ async def _emit_stage1_sse(
         stage1_skipped=[],
     )
     collected['skipped'] = []
-    stage1_options = {}
     if self_moa_model_id:
-        stage1_options = {
-            'n': SELF_MOA_SAMPLES,
-            'council_models': council_models,
-            'cap_samples': False,
-        }
-    async for event_type, event_data in stage1_collect_responses_streaming(
-        user_message,
-        existing_results=existing_results,
-        existing_failures=existing_failures,
-        **stage1_options,
-    ):
+        stage1_events = collect_self_moa_samples(
+            user_message,
+            self_moa_model_id,
+            existing_results=existing_results,
+            existing_failures=existing_failures,
+        )
+    else:
+        stage1_events = stage1_collect_responses_streaming(
+            user_message,
+            existing_results=existing_results,
+            existing_failures=existing_failures,
+        )
+    async for event_type, event_data in stage1_events:
         if event_type == 'init':
             yield f"data: {json.dumps({'type': 'stage1_init', 'data': event_data})}\n\n"
         elif event_type == 'model_complete':
@@ -401,17 +405,25 @@ async def _emit_stage1_sse(
 def _stored_self_moa_model(assistant: Dict[str, Any]) -> Optional[str]:
     """The Self-MoA model a stored message ran with, or None for a council run.
 
-    A message with rankings or council metadata is a council run. Only a
-    message with no record of its run follows the current setting.
+    Reads what either engine wrote: this backend records the mode and model
+    in metadata, the in-browser engine in metadata and run_roster. A message
+    with rankings or council metadata is a council run. Only a message with
+    no record of its run follows the current setting.
     """
     metadata = assistant.get('metadata') or {}
-    if metadata.get('mode') == MODE_SELF_MOA:
-        model = metadata.get('model')
-        if not model:
-            samples = assistant.get('stage1') or []
-            model = samples[0].get('model') if samples else None
-        return model or self_moa_model()
-    if metadata or assistant.get('stage2'):
+    roster = assistant.get('run_roster') or {}
+    if not isinstance(roster, dict):
+        roster = {}
+    roster_self_moa = roster.get('mode') == MODE_SELF_MOA
+    if metadata.get('mode') == MODE_SELF_MOA or roster_self_moa:
+        samples = assistant.get('stage1') or []
+        return (
+            metadata.get('model')
+            or (roster.get('chairmanModel') if roster_self_moa else None)
+            or (samples[0].get('model') if samples else None)
+            or self_moa_model()
+        )
+    if metadata or assistant.get('stage2') or roster:
         return None
     if settings.mode == MODE_SELF_MOA:
         return self_moa_model()
@@ -425,9 +437,25 @@ async def _emit_self_moa_stage3_sse(
     stage1_results: List[Dict[str, Any]],
     model: str,
     outcome: Dict[str, Any],
+    require_full_set: bool = True,
 ):
-    """Self-MoA synthesis. Sets outcome['stopped'] when it fails."""
+    """Self-MoA synthesis. Sets outcome['stopped'] when the run stops.
+
+    As in the runs, a run combines only a full set of samples. With fewer it
+    stops at Stage 1; a Stage 2 or 3 retry is the user's choice to combine
+    what is there and passes require_full_set=False.
+    """
     outcome['stopped'] = False
+    if require_full_set and len(stage1_results) < SELF_MOA_SAMPLES:
+        message = incomplete_samples_message(len(stage1_results))
+        storage.update_streaming_message(
+            conversation_id, msg_index,
+            error={'stage': 1, 'message': message},
+            streaming=False,
+        )
+        outcome['stopped'] = True
+        yield f"data: {json.dumps({'type': 'stage1_error', 'stage': 1, 'message': message})}\n\n"
+        return
     metadata = self_moa_metadata(stage1_results, model)
     storage.update_streaming_message(conversation_id, msg_index, metadata=metadata)
     yield f"data: {json.dumps({'type': 'stage3_start', 'metadata': metadata})}\n\n"
@@ -903,6 +931,8 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
             else MODELS_UNAVAILABLE
         )
         error = {'stage': 1, 'message': message}
+    elif settings.mode == MODE_SELF_MOA and stage3_result is None:
+        error = {'stage': 1, 'message': incomplete_samples_message(len(stage1_results))}
     storage.add_assistant_message(
         conversation_id,
         stage1_results,
@@ -976,7 +1006,7 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
                 # Recorded first, so a retry of an interrupted run keeps the mode.
                 storage.update_streaming_message(
                     conversation_id, msg_index,
-                    metadata={'mode': MODE_SELF_MOA, 'model': moa_model},
+                    metadata=self_moa_start_metadata(moa_model),
                 )
 
             # Start title generation in parallel (don't await yet)
@@ -1162,7 +1192,7 @@ async def retry_stage1_stream(conversation_id: str, request: RetryStageRequest):
             if moa_model:
                 storage.update_streaming_message(
                     conversation_id, msg_index,
-                    metadata={'mode': MODE_SELF_MOA, 'model': moa_model},
+                    metadata=self_moa_start_metadata(moa_model),
                 )
 
             # Stage 1: Collect responses with streaming progress (resume from existing)
@@ -1276,6 +1306,7 @@ def _self_moa_retry_stream(
             async for chunk in _emit_self_moa_stage3_sse(
                 conversation_id, msg_index, query_text,
                 stage1_results, model, outcome,
+                require_full_set=False,
             ):
                 yield chunk
             if not outcome.get('stopped'):

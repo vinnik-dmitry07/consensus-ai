@@ -12,7 +12,27 @@ import {
   parseRankingFromText,
   pyFixed,
 } from './engine/browser/council.js';
-import { buildSelfMoaPrompt } from './engine/browser/selfMoa.js';
+import { detectLoop, repeatShare } from './engine/browser/loopGuard.js';
+import { IDLE_WAIT_SECONDS } from './engine/browser/openrouter.js';
+import {
+  buildSelfMoaPrompt,
+  forwardSampleText,
+  SELF_MOA_SAMPLES,
+  SELF_MOA_TAIL_CHARS,
+  SELF_MOA_TAIL_MARKER,
+  selfMoaRequestOptions,
+} from './engine/browser/selfMoa.js';
+
+// Long fixture texts are written as parts: ['repeat', text, times],
+// ['numbers', from, to] (joined by spaces), ['counted', prefix, suffix, n].
+function buildText(parts) {
+  return parts.map(([kind, a, b, c]) => {
+    if (kind === 'repeat') return a.repeat(b);
+    if (kind === 'numbers') return Array.from({ length: b - a }, (_, i) => String(a + i)).join(' ');
+    if (kind === 'counted') return Array.from({ length: c }, (_, i) => `${a}${i}${b}`).join('');
+    throw new Error(`unknown text part ${kind}`);
+  }).join('');
+}
 
 const fixturePath = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -65,6 +85,34 @@ function checkCase(testCase) {
   }
   if (testCase.kind === 'self_moa_prompt') {
     expect(buildSelfMoaPrompt(testCase.query, testCase.samples)).toBe(testCase.expected);
+    return;
+  }
+  if (testCase.kind === 'self_moa_forward') {
+    const text = buildText(testCase.text);
+    const forwarded = forwardSampleText({ response: text, cut_reasoning: testCase.cut_reasoning });
+    expect(forwarded).toBe(testCase.expected_prefix + text.slice(-testCase.expected_tail_chars));
+    return;
+  }
+  if (testCase.kind === 'self_moa_settings') {
+    const options = selfMoaRequestOptions();
+    expect(SELF_MOA_SAMPLES).toBe(testCase.samples);
+    expect(options.maxTokens).toBe(testCase.max_tokens);
+    expect(options.temperature).toBe(testCase.temperature);
+    expect(options.topP).toBe(testCase.top_p);
+    expect(options.timeout).toBe(testCase.stream_seconds);
+    expect(IDLE_WAIT_SECONDS).toBe(testCase.idle_seconds);
+    expect(options.maxRetries).toBe(testCase.max_attempts);
+    expect(options.loopGuard).toEqual(testCase.loop_guard);
+    expect(SELF_MOA_TAIL_CHARS).toBe(testCase.tail_chars);
+    expect(SELF_MOA_TAIL_MARKER).toBe(testCase.tail_marker);
+    return;
+  }
+  if (testCase.kind === 'loop_guard') {
+    expect(detectLoop(buildText(testCase.text))).toEqual(testCase.expected);
+    return;
+  }
+  if (testCase.kind === 'loop_guard_share') {
+    expect(repeatShare(buildText(testCase.text), testCase.end, true)).toBe(testCase.expected);
     return;
   }
   throw new Error(`unknown fixture kind ${testCase.kind}`);

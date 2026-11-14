@@ -15,7 +15,7 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 - Contains `CHAIRMAN_MODEL` (model that synthesizes final answer)
 - Contains `N_SAMPLES` (independent Stage 1 answers collected per model)
 - Contains `TOP_K`, `RED_TEAM_MODEL` (None = chairman), `SELF_EXCLUSION`
-- Contains `MODE` (`'council'` default, or `'self_moa'`) and `SELF_MOA_SAMPLES` (5)
+- Contains `MODE` (`'council'` default, or `'self_moa'`), `SELF_MOA_SAMPLES` (5) and the Self-MoA call settings taken from the a8-open v5+ runs: `SELF_MOA_MAX_TOKENS` 32768, temperature 0.7, top_p 1, `SELF_MOA_STREAM_SECONDS` 4216 (a full cap at 8 tok/s plus 120 s), idle 120 s, `SELF_MOA_MAX_ATTEMPTS` 2, tail rule 8000 characters with `SELF_MOA_TAIL_MARKER`
 - Uses environment variable `OPENROUTER_API_KEY` from `.env`
 - Backend runs on **port 8001** (NOT 8000 - user had another app on 8000)
 
@@ -28,6 +28,10 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
   self-exclusion and red-team selection — never compare raw model ids for this
 - `parse_retry_after()`: 429 backoff from the header; seconds or HTTP-date, and
   clamped to `MAX_RETRY_AFTER_SECONDS` so one header cannot stall a run
+- Council calls stay non-streaming. Self-MoA calls pass `stream`/`loop_guard`, which reads the SSE stream (port of the browser reader: same reasoning channel, same `loop_cut` result) with `timeout` as the idle limit and `total_seconds` for the whole stream; `max_retries` sets the attempts (default 5). `annotate` adds `finish_reason` and `content_from_reasoning`
+
+**`loop_guard.py`**
+- Port of `engine/browser/loopGuard.js`; shared `loop_guard` cases in `tests/fixtures/stage2_cases.json` keep them equal
 
 **`council.py`** - The Core Logic
 - `stage1_collect_responses()`: Parallel queries to all council models
@@ -43,7 +47,7 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 - `run_post_ranking()`: Aggregation + red team + consensus used by every entry point
 - `stage3_synthesize_final()`: Chairman sees anonymized top-K only; Candidate #1 is the base draft
 - `parse_ranking_from_text()` / `parse_correctness_scores()` / `parse_issues()` / `parse_disputed_claims()`
-- Self-MoA (S8): `self_moa_model()` is the chairman. Stage 1 asks it `SELF_MOA_SAMPLES` times (`council_models=[model]`, `cap_samples=False`, so a free model is not cut to one sample), then `self_moa_synthesize()` has the same model combine them with `build_self_moa_prompt()`. No Stage 2, no red team, no fallback synthesizer. The prompt text is pinned in `tests/fixtures/stage2_cases.json` (`self_moa_prompt`) and must match `engine/browser/selfMoa.js`
+- Self-MoA (S8) follows the a8-open v5+ runs. `self_moa_model()` is the chairman. `collect_self_moa_samples()` asks it `SELF_MOA_SAMPLES` times (no free-model cap) and stores the samples in slot order, not finish order. Every call uses `self_moa_request_options()`. A sample that ended at its cap or the loop guard with only reasoning is stored with `cut_reasoning: true` and `forward_sample_text()` passes only its marked last 8000 characters. `self_moa_synthesize()` has the same model combine them with `build_self_moa_prompt()` (lead + the question + `Sample slot N:` blocks, as the runs, without the ANSWER line). A run combines only a full set; with fewer samples it stops at Stage 1 (`incomplete_samples_message`). No Stage 2, no red team, no fallback synthesizer. Prompt, settings and tail rule are pinned in `tests/fixtures/stage2_cases.json` and must match `engine/browser/selfMoa.js`
 
 **`storage.py`**
 - JSON-based conversation storage in `data/conversations/`
@@ -62,8 +66,8 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 - Retry Stage 3 recomputes post-ranking (including red team)
 - `_rebuild_council_query()`: every retry endpoint rebuilds the *original* query. A message stored with `follow_up_to` is recomposed against that earlier final answer; if it is gone, the retry is refused with 400 rather than silently re-asking a bare fragment
 - Each retry clears the stages it replaces (Stage 1 retry clears stage2/stage3/metadata, Stage 2 retry clears stage3, Stage 3 retry clears stage3), so a failed retry never leaves the previous run's answer on the message
-- A Self-MoA run writes `metadata = {mode: 'self_moa', model}` before Stage 1, so a retry keeps the mode and model it ran with (`_stored_self_moa_model`). A message with rankings or council metadata is a council run; only a message with no record follows the current `mode`. A Stage 2 or Stage 3 retry of a Self-MoA message re-runs its synthesis from the stored samples
-- Self-MoA events: `stage1_*`, then `stage3_start` (carrying `metadata`), `stage3_complete` / `stage3_error`, `title_complete`, `complete`. No `stage2_*` or `redteam_*`. `stage3` carries `mode` and `sample_count`
+- A Self-MoA run writes `metadata = {mode: 'self_moa', model}` before Stage 1 (both engines), so a retry keeps the mode and model it ran with. `_stored_self_moa_model` reads metadata, then a browser `run_roster`. A message with rankings, council metadata or a council roster is a council run; only a message with no record follows the current `mode`. A Stage 2 or Stage 3 retry of a Self-MoA message is the user's choice to combine the stored samples, full set or not
+- Self-MoA events: `stage1_*`, then `stage3_start` (carrying `metadata`), `stage3_complete` / `stage3_error`, `title_complete`, `complete`. An incomplete set ends with `stage1_complete` then `stage1_error`. No `stage2_*` or `redteam_*`. `stage3` carries `mode`, `sample_count`, and `cut` when the synthesis stopped at its cap or the loop guard
 
 ### Frontend Structure (`frontend/src/`)
 
@@ -87,7 +91,8 @@ LLM Council is a 3-stage deliberation system where multiple LLMs collaboratively
 - Port of `council.py`, `openrouter.py`, `storage.py`, and `settings.py`
 - IndexedDB conversations (same JSON as `data/conversations/`). Each update is one readwrite transaction, so two tabs cannot clobber each other. localStorage settings reload when another tab writes them
 - `catalogueModelId` / `catalogue_model_id` strip only a trailing `-reasoning` or `-reasoning-high`. A name like `phi-4-reasoning-plus` is a real catalogue id
-- Settings `mode` (`council` default, `self_moa`) is stored with the other settings and copied into `run_roster.mode` by `captureRunRoster`. `selfMoa.js` holds the Self-MoA run; the Self-MoA model is the run's `chairmanModel`, so the Top 10 Free preset gives a new visitor one free model for it. A retry keeps the stored `run_roster.mode`; old rosters without a mode are council runs. `frontend/src/runMode.js` `isSelfMoaMessage()` drives the UI (Stage 3 label, resume buttons, cost estimate)
+- Settings `mode` (`council` default, `self_moa`) is stored with the other settings and copied into `run_roster.mode` by `captureRunRoster`. `selfMoa.js` holds the whole Self-MoA run (its own Stage 1 collector, request options, tail rule, synthesis); the Self-MoA model is the run's `chairmanModel`, so the Top 10 Free preset gives a new visitor one free model for it. A retry keeps the recorded mode and model (`metadata.model`, else `run_roster`); old rosters without a mode are council runs. `frontend/src/runMode.js` `isSelfMoaMessage()` drives the UI (Stage 3 label, resume and combine buttons, cost estimate)
+- The eval method hash (`frontend/eval/a8.js` `SOURCE_FILES`) covers `council.js`, `openrouter.js`, `loopGuard.js`, `roster.js`, `settings.js` and `freeRoster.js`, and probes freeze it. Product-only behaviour belongs in files outside that list (`selfMoa.js`, `engine.js`) where it can
 - Stage 2 `Response N` labels are case-sensitive, matching Python. Headings such as `FINAL RANKING` stay case-insensitive
 - Displayed scores use `pyFixed`, which matches Python `format` (half to even on an exact tie). `round()` is `Number(pyFixed(...))`
 - `label_to_index` is stored per judge. The seeded shuffle does not need to match Python's RNG

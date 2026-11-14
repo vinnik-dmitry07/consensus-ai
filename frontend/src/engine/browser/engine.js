@@ -23,10 +23,13 @@ import {
   rebuildCouncilQuery,
 } from './query.js';
 import {
+  collectSelfMoaSamples,
+  incompleteSamplesMessage,
   isSelfMoaRoster,
+  SELF_MOA_SAMPLES,
   selfMoaMetadata,
   selfMoaModel,
-  selfMoaStage1Roster,
+  selfMoaStartMetadata,
   selfMoaSynthesize,
 } from './selfMoa.js';
 import { MODE_COUNCIL, MODE_SELF_MOA, settings } from './settings.js';
@@ -227,11 +230,14 @@ async function* emitStage1(
   existingFailures = null,
   roster = null,
 ) {
+  // Self-MoA collects its own samples: one model, a fixed count, no free cap.
   const selfMoa = isSelfMoaRoster(roster);
-  const stageRoster = selfMoa ? selfMoaStage1Roster(roster) : roster;
-  const councilModels = [...(stageRoster?.councilModels || settings.councilModels)];
-  const requested = stageRoster?.nSamples ?? settings.nSamples;
-  const sampleLimit = selfMoa ? requested : stage1SampleLimit(councilModels, requested);
+  const councilModels = selfMoa
+    ? [selfMoaModel(roster)]
+    : [...(roster?.councilModels || settings.councilModels)];
+  const sampleLimit = selfMoa
+    ? SELF_MOA_SAMPLES
+    : stage1SampleLimit(councilModels, roster?.nSamples ?? settings.nSamples);
   const pending = council.pendingStage1Slots(
     councilModels,
     sampleLimit,
@@ -251,10 +257,11 @@ async function* emitStage1(
 
   let results = [];
   let failures = null;
-  for await (const [eventType, eventData] of council.stage1CollectResponsesStreaming(
-    userMessage,
-    { existingResults, existingFailures, roster: stageRoster, uncappedSamples: selfMoa },
-  )) {
+  const stage1Options = { existingResults, existingFailures, roster };
+  const stage1Events = selfMoa
+    ? collectSelfMoaSamples(userMessage, stage1Options)
+    : council.stage1CollectResponsesStreaming(userMessage, stage1Options);
+  for await (const [eventType, eventData] of stage1Events) {
     if (eventType === 'init') {
       yield { type: 'stage1_init', data: eventData };
     } else if (eventType === 'model_complete') {
@@ -473,10 +480,21 @@ async function* runFromStage2(ctx) {
 }
 
 // After Stage 1: the council ranks and red-teams, Self-MoA goes straight to
-// its own synthesis.
+// its own synthesis. As in the runs, Self-MoA combines only a full set; with
+// fewer samples it stops at Stage 1 and the user resumes or combines them.
 async function* runAfterStage1(ctx) {
-  if (isSelfMoaRoster(ctx.roster)) return yield* emitSelfMoaStage3(ctx);
-  return yield* runFromStage2(ctx);
+  if (!isSelfMoaRoster(ctx.roster)) return yield* runFromStage2(ctx);
+  const count = ctx.stage1Results.length;
+  if (count < SELF_MOA_SAMPLES) {
+    const message = incompleteSamplesMessage(count);
+    await storage.updateStreamingMessage(ctx.conversationId, ctx.msgIndex, {
+      error: { stage: 1, message },
+      streaming: false,
+    });
+    yield { type: 'stage1_error', stage: 1, message };
+    return true;
+  }
+  return yield* emitSelfMoaStage3(ctx);
 }
 
 async function* emitSelfMoaStage3(ctx) {
@@ -602,6 +620,9 @@ export const browserEngine = {
   },
 
   async updateSettings(data) {
+    if ('mode' in data && data.mode !== MODE_COUNCIL && data.mode !== MODE_SELF_MOA) {
+      throw new Error(`Unknown mode: ${data.mode}`);
+    }
     const councilModels = data.council_models ?? settings.councilModels;
     const chairman = data.chairman_model ?? settings.chairmanModel;
     if (!councilModels?.length) {
@@ -705,6 +726,9 @@ export const browserEngine = {
     await storage.updateStreamingMessage(conversationId, msgIndex, {
       run_roster: roster,
       streaming: true,
+      // Recorded first, as the local backend does, so a retry in either
+      // engine keeps the mode and the model.
+      ...(isSelfMoaRoster(roster) ? { metadata: selfMoaStartMetadata(roster) } : {}),
     });
     await runEvents(sendEvents({
       conversationId,
@@ -737,11 +761,19 @@ export const browserEngine = {
       await ensureServableRoster({ replaceManaged: false });
     }
     const roster = { ...(storedRoster || captureRunRoster()) };
-    // A retry keeps the mode the message ran in. Messages saved before the
-    // mode existed, and any message with rankings, are council runs. Only a
+    // A retry keeps the mode and the model the message ran with, whichever
+    // engine wrote it: the local backend records them in metadata, this
+    // engine in run_roster and metadata. Messages saved before the mode
+    // existed, and any message with rankings, are council runs. Only a
     // message with no record of its run follows the current setting.
-    if (assistant.metadata?.mode === MODE_SELF_MOA || storedRoster?.mode === MODE_SELF_MOA) {
+    const storedSelfMoa = assistant.metadata?.mode === MODE_SELF_MOA
+      || storedRoster?.mode === MODE_SELF_MOA;
+    if (storedSelfMoa) {
       roster.mode = MODE_SELF_MOA;
+      roster.chairmanModel = assistant.metadata?.model
+        || (storedRoster?.mode === MODE_SELF_MOA ? storedRoster.chairmanModel : '')
+        || assistant.stage1?.[0]?.model
+        || roster.chairmanModel;
     } else if (storedRoster || assistant.stage2?.length) {
       roster.mode = MODE_COUNCIL;
     }
@@ -882,7 +914,7 @@ async function* retryStage1Events(input) {
     await storage.updateStreamingMessage(input.conversationId, input.msgIndex, {
       stage2: null,
       stage3: null,
-      metadata: null,
+      metadata: isSelfMoaRoster(input.roster) ? selfMoaStartMetadata(input.roster) : null,
       streaming: true,
       stage1_complete: false,
       stage2_failures: [],

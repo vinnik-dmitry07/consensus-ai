@@ -48,6 +48,24 @@ MODE_SELF_MOA = 'self_moa'
 MODE = MODE_COUNCIL
 SELF_MOA_SAMPLES = 5
 
+# Self-MoA calls follow the a8-open v5+ runs (frontend/eval/a8Profile.js):
+# one 32768-token cap, temperature 0.7 and top_p 1, a stream deadline that
+# lets a full cap finish at 8 tokens a second, the loop guard with two attempts,
+# and the tail rule for a sample cut before it wrote an answer. Must match
+# frontend/src/engine/browser/selfMoa.js.
+SELF_MOA_MAX_TOKENS = 32768
+SELF_MOA_TEMPERATURE = 0.7
+SELF_MOA_TOP_P = 1
+SELF_MOA_STREAM_SECONDS = -(-SELF_MOA_MAX_TOKENS // 8) + 120
+SELF_MOA_IDLE_SECONDS = 120.0
+# Two attempts per call, as the runs allowed per slot.
+SELF_MOA_MAX_ATTEMPTS = 2
+SELF_MOA_TAIL_CHARS = 8000
+SELF_MOA_TAIL_MARKER = (
+    '[This answer was cut off before a final answer. '
+    'Last 8000 characters of its unfinished reasoning:]'
+)
+
 # OpenRouter API endpoint
 OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions'
 OPENROUTER_CREDITS_URL = 'https://openrouter.ai/api/v1/credits'

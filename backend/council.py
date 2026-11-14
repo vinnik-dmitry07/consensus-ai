@@ -7,7 +7,20 @@ import re
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from .config import MODE_SELF_MOA, SELF_MOA_SAMPLES, TITLE_MODEL
+from .config import (
+    MODE_SELF_MOA,
+    SELF_MOA_IDLE_SECONDS,
+    SELF_MOA_MAX_ATTEMPTS,
+    SELF_MOA_MAX_TOKENS,
+    SELF_MOA_SAMPLES,
+    SELF_MOA_STREAM_SECONDS,
+    SELF_MOA_TAIL_CHARS,
+    SELF_MOA_TAIL_MARKER,
+    SELF_MOA_TEMPERATURE,
+    SELF_MOA_TOP_P,
+    TITLE_MODEL,
+)
+from .loop_guard import LOOP_GUARD_DEFAULTS
 from .openrouter import (
     get_api_key,
     model_family,
@@ -529,28 +542,20 @@ async def stage1_collect_responses_streaming(
     n: int = None,
     existing_results: List[Dict] = None,
     existing_failures: List[Dict] = None,
-    council_models: List[str] = None,
-    cap_samples: bool = True,
 ):
     """
     Stage 1 with streaming: Collect responses and yield progress events.
 
     Resume counts successes per model against n_samples. Prior failures for
     models still being queried are dropped; the rest are replayed.
-    Self-MoA passes its one model and cap_samples=False, so a free model
-    still gets every sample.
     """
     if n is None:
         n = settings.n_samples
 
     await ensure_servable_roster()
-    if council_models is None:
-        council_models = list(settings.council_models)
-    else:
-        council_models = list(council_models)
-    if cap_samples:
-        n = stage1_sample_limit(council_models, n)
+    n = stage1_sample_limit(settings.council_models, n)
     messages = [{'role': 'user', 'content': user_query}]
+    council_models = list(settings.council_models)
     total_slots = len(council_models) * n
     all_results = usable_stage1_results(council_models, n, existing_results)
     pending_models = pending_stage1_slots(council_models, n, all_results)
@@ -1243,6 +1248,21 @@ Provide a clear, well-reasoned final answer:'''
     }
 
 
+# Self-MoA (the S8 arm of the a8 evaluations). One model answers the question
+# SELF_MOA_SAMPLES times on its own, then the same model combines its
+# answers: no Stage 2, no red team, no fallback synthesizer. The method
+# follows the a8-open v5+ runs; the product drops the ANSWER: line format and
+# the user's own question takes the place of the graded task prompt. Port of
+# frontend/src/engine/browser/selfMoa.js; the prompt, the constants and the
+# tail rule are pinned in tests/fixtures/stage2_cases.json.
+
+SELF_MOA_LEAD = '\n'.join([
+    'You are aggregating independent answers from one model.',
+    'The samples may repeat the same mistake. Do not treat agreement as proof.',
+    'Give your own final answer.',
+])
+
+
 def self_moa_model() -> str:
     """The one model of a Self-MoA run: the chairman."""
     chairman = str(settings.chairman_model or '').strip()
@@ -1252,13 +1272,55 @@ def self_moa_model() -> str:
     return str(models[0]).strip() if models else ''
 
 
-def self_moa_sample_texts(stage1_results: List[Dict[str, Any]]) -> List[str]:
-    texts = []
-    for row in stage1_results or []:
-        text = row.get('response') if isinstance(row, dict) else None
-        if isinstance(text, str) and text.strip():
-            texts.append(text)
-    return texts
+def self_moa_request_options() -> Dict[str, Any]:
+    """What every Self-MoA call sends besides its messages."""
+    return {
+        'max_tokens': SELF_MOA_MAX_TOKENS,
+        'temperature': SELF_MOA_TEMPERATURE,
+        'top_p': SELF_MOA_TOP_P,
+        'stream': True,
+        'loop_guard': dict(LOOP_GUARD_DEFAULTS),
+        'max_retries': SELF_MOA_MAX_ATTEMPTS,
+        'annotate': True,
+        'timeout': SELF_MOA_IDLE_SECONDS,
+        'total_seconds': SELF_MOA_STREAM_SECONDS,
+    }
+
+
+def is_cut_reasoning(result: Dict[str, Any]) -> bool:
+    """Ended at its cap or at the loop guard, with only reasoning as content."""
+    if not result.get('ok') or result.get('content_from_reasoning') is not True:
+        return False
+    return result.get('finish_reason') in ('loop', 'length')
+
+
+def self_moa_sample_result(model: str, response: Dict[str, Any]) -> Dict[str, Any]:
+    result = {
+        'model': model,
+        'response': response.get('content', '') or '',
+        'usage': response.get('usage', {}) or {},
+    }
+    if is_cut_reasoning(response):
+        result['cut_reasoning'] = True
+    return result
+
+
+def forward_sample_text(row: Dict[str, Any]) -> str:
+    """What the synthesis sees of one sample: a cut one gives only its tail."""
+    text = row.get('response') if isinstance(row, dict) else None
+    text = text if isinstance(text, str) else ''
+    if not (isinstance(row, dict) and row.get('cut_reasoning') is True):
+        return text
+    return f'{SELF_MOA_TAIL_MARKER}\n{text[-SELF_MOA_TAIL_CHARS:]}'
+
+
+def usable_self_moa_samples(stage1_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        row for row in stage1_results or []
+        if isinstance(row, dict)
+        and isinstance(row.get('response'), str)
+        and row['response'].strip()
+    ]
 
 
 def build_self_moa_prompt(query_text: str, samples: List[str]) -> str:
@@ -1267,21 +1329,12 @@ def build_self_moa_prompt(query_text: str, samples: List[str]) -> str:
         f'Sample slot {index}:\n{text}'
         for index, text in enumerate(samples, start=1)
     )
-    return f'''You are aggregating independent answers from one model.
-The samples may repeat the same mistake. Do not treat agreement as proof.
+    return f'{SELF_MOA_LEAD}\n\n{query_text}\n\n{blocks}'
 
-Original Question: {query_text}
 
-SAMPLES:
-
-{blocks}
-
-Your task:
-- Check the reasoning of every sample. Keep what is correct and fix what is wrong.
-- Where the samples disagree, work out which answer is right instead of following the majority.
-- Do not mention the samples, the aggregation, or model names.
-
-Provide a clear, well-reasoned final answer:'''
+def self_moa_start_metadata(model: str) -> Dict[str, Any]:
+    """Written before Stage 1, so a retry keeps the mode and the model."""
+    return {'mode': MODE_SELF_MOA, 'model': model}
 
 
 def self_moa_metadata(
@@ -1290,9 +1343,78 @@ def self_moa_metadata(
     return {
         'mode': MODE_SELF_MOA,
         'model': model,
-        'sample_count': len(self_moa_sample_texts(stage1_results)),
+        'sample_count': len(usable_self_moa_samples(stage1_results)),
         'label_to_model': canonical_label_to_model(stage1_results or []),
     }
+
+
+def incomplete_samples_message(count: int) -> str:
+    return (
+        f'Only {count} of {SELF_MOA_SAMPLES} samples arrived. '
+        f'Resume Stage 1 to fetch the rest, or combine the {count} you have.'
+    )
+
+
+async def collect_self_moa_samples(
+    user_query: Union[str, List[Dict]],
+    model: str,
+    existing_results: List[Dict] = None,
+    existing_failures: List[Dict] = None,
+):
+    """Stage 1 of a Self-MoA run, with the council's Stage 1 events.
+
+    One model, SELF_MOA_SAMPLES slots, no free-model cap. Kept samples come
+    first; new ones follow in slot order, not in the order calls finished.
+    """
+    await ensure_servable_roster()
+    models = [model]
+    n = SELF_MOA_SAMPLES
+    kept = usable_stage1_results(models, n, existing_results)
+    pending = pending_stage1_slots(models, n, kept)
+    failures = retained_stage1_failures(existing_failures, pending, models)
+
+    yield ('init', {
+        'total_models': n,
+        'pending_models': len(pending),
+        'existing_count': len(kept) + len(failures),
+    })
+    for result in kept:
+        yield ('model_complete', {'result': result, 'existing': True})
+    for failure in failures:
+        yield ('model_failed', {**failure, 'existing': True})
+
+    messages = [{'role': 'user', 'content': user_query}]
+    options = self_moa_request_options()
+    fresh: List[Optional[Dict[str, Any]]] = [None] * len(pending)
+    if pending:
+        async def query_slot(slot, slot_model):
+            return slot, await query_model_result(slot_model, messages, **options)
+
+        # Created in slot order, so calls start in slot order (as_completed
+        # alone would start them in set order).
+        tasks = [
+            asyncio.ensure_future(query_slot(slot, slot_model))
+            for slot, slot_model in enumerate(pending)
+        ]
+        for coro in asyncio.as_completed(tasks):
+            slot, response = await coro
+            if response.get('ok'):
+                result = self_moa_sample_result(model, response)
+                fresh[slot] = result
+                yield ('model_complete', {'result': result, 'existing': False})
+            elif response.get('skipped'):
+                yield ('model_failed', {
+                    'model': model,
+                    'error': response['error'],
+                    'skipped': True,
+                })
+            else:
+                failure = {'model': model, 'error': response['error']}
+                failures.append(failure)
+                yield ('model_failed', failure)
+
+    results = kept + [row for row in fresh if row is not None]
+    yield ('all_complete', {'results': results, 'failures': failures})
 
 
 async def self_moa_synthesize(
@@ -1301,49 +1423,52 @@ async def self_moa_synthesize(
     model: str,
 ) -> Dict[str, Any]:
     """The Self-MoA model combines its own samples. No fallback model."""
-    samples = self_moa_sample_texts(stage1_results)
+    samples = [forward_sample_text(row) for row in usable_self_moa_samples(stage1_results)]
     if not samples:
         raise Exception('No samples to combine. Retry Stage 1 first.')
     if not model or model_unavailable(model):
         raise Exception(MODELS_UNAVAILABLE)
     prompt = build_self_moa_prompt(query_text, samples)
-    result = await query_model_result(model, [{'role': 'user', 'content': prompt}])
+    result = await query_model_result(
+        model, [{'role': 'user', 'content': prompt}], **self_moa_request_options()
+    )
     if result.get('skipped'):
         raise Exception(MODELS_UNAVAILABLE)
     if not result.get('ok'):
         err = result.get('error') or {}
         detail = err.get('message') or 'failed to generate response'
         raise Exception(f'Self-MoA model ({model}) failed: {detail}')
-    return {
+    final = {
         'model': model,
         'response': result.get('content', ''),
         'usage': result.get('usage', {}),
         'mode': MODE_SELF_MOA,
         'sample_count': len(samples),
     }
+    if result.get('finish_reason') in ('loop', 'length'):
+        final['cut'] = True
+    return final
 
 
 async def run_self_moa(
     user_query: Union[str, List[Dict]],
     query_text: str,
 ) -> Tuple[List, Optional[Dict], Dict]:
-    """Non-streaming Self-MoA run: (samples, final answer, metadata)."""
+    """Non-streaming Self-MoA run: (samples, final answer, metadata).
+
+    The final answer is None when fewer than SELF_MOA_SAMPLES samples arrived.
+    """
     model = self_moa_model()
     results: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
-    async for event_type, data in stage1_collect_responses_streaming(
-        user_query,
-        n=SELF_MOA_SAMPLES,
-        council_models=[model],
-        cap_samples=False,
-    ):
+    async for event_type, data in collect_self_moa_samples(user_query, model):
         if event_type == 'all_complete':
             results = data['results']
             failures = data['failures']
     metadata = self_moa_metadata(results, model)
     metadata['stage1_failures'] = failures
-    if not results:
-        return [], None, metadata
+    if len(results) < SELF_MOA_SAMPLES:
+        return results, None, metadata
     stage3 = await self_moa_synthesize(query_text, results, model)
     return results, stage3, metadata
 

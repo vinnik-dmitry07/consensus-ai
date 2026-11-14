@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createLoopDetector, detectLoop, LOOP_GUARD_DEFAULTS, loopGuardConfig, repeatShare } from './loopGuard.js';
 import { canonicalCompletionRequest, promptTokenEstimate, queryModelResult } from './openrouter.js';
+import { selfMoaRequestOptions } from './selfMoa.js';
 import { settings } from './settings.js';
 
 // Deterministic prose with no repeated 40-character run.
@@ -143,6 +144,20 @@ describe('loop guard in the engine', () => {
     expect(result.loop.channel).toBe('reasoning');
     expect(result.content.length).toBeLessThan(24000);
     expect(result.content.length).toBeGreaterThanOrEqual(result.loop.position);
+  });
+
+  it('gives a Self-MoA call two attempts when it keeps looping', async () => {
+    settings.apiKey = 'sk-test';
+    const loop = chunks(looping(24000), 400).map((reasoning) => ({ reasoning }));
+    const fetchMock = vi.fn(async () => sseResponse(loop));
+    vi.stubGlobal('fetch', fetchMock);
+    const result = await queryModelResult('openai/gpt-4.1', messages, selfMoaRequestOptions());
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(result.loopCut).toBe(true);
+    expect(result.finishReason).toBe('loop');
+    expect(result.contentFromReasoning).toBe(true);
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    expect(body).toMatchObject({ max_tokens: 32768, temperature: 0.7, top_p: 1, stream: true });
   });
 
   it('reads one reasoning channel when the provider sends the text twice', async () => {
