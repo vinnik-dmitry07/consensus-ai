@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import { interpretV5 } from './a8Report.js';
 import {
-  captureCall, cellsToSend, cleanReading, cleanRedTeam, measuredPrefix, primaryState, productRedTeam, productState,
-  requestHash, routeProblems, rtOutcome, seededOrder,
+  captureCall, cellsToSend, cleanReading, cleanRedTeam, gateOf, measuredPrefix, policyArm, primaryState, productRedTeam, productState,
+  renderDiscordant, requestHash, routeProblems, rtOutcome, SECONDARY, secondaryFamily, seededOrder,
 } from './redTeamProbe.js';
 
 const completed = (content, finishReason = 'stop', extra = {}) => ({ state: 'completed', result: { ok: true, content, finishReason, ...extra } });
@@ -124,6 +124,69 @@ describe('redteam probe: cells, aliases and the prefix', () => {
     const ids = ['a', 'b', 'c', 'd'];
     expect(seededOrder(ids)).toEqual(seededOrder([...ids].reverse()));
     expect([...seededOrder(ids)].sort()).toEqual(ids);
+  });
+});
+
+describe('redteam probe: policy G', () => {
+  const task = { kind: 'integer', stem: 'Q?', goldCanon: '5' };
+  const models = ['a/one', 'b/two', 'c/three'];
+  const stage1 = (...texts) => texts.map((response, index) => ({ model: models[index], response }));
+
+  it('skips the red team only when all three answers are read and equal', () => {
+    expect(gateOf(task, stage1('x\nANSWER: 7', 'ANSWER: 7', 'y\nANSWER: 007'), models)).toEqual({ g: 0, answers: ['7', '7', '7'] });
+    expect(gateOf(task, stage1('ANSWER: 7', 'ANSWER: 8', 'ANSWER: 7'), models)).toEqual({ g: 1, answers: ['7', '8', '7'] });
+  });
+
+  it('does not count a missing, cut or unread answer as agreement', () => {
+    expect(gateOf(task, stage1('ANSWER: 7', 'ANSWER: 7'), models)).toEqual({ g: 1, answers: ['7', '7', null] });
+    expect(gateOf(task, stage1('ANSWER: 7', 'ANSWER: 7', 'reasoning cut before the end'), models).g).toBe(1);
+    expect(gateOf(task, stage1('ANSWER: 7', 'ANSWER: 7', 'ANSWER: seven'), models)).toEqual({ g: 1, answers: ['7', '7', null] });
+    expect(gateOf(task, stage1('ANSWER: 7', 'ANSWER: 7', ''), models).g).toBe(1);
+    expect(gateOf(task, [], []).g).toBe(1);
+  });
+
+  it('takes C where g = 0 and Rc where g = 1', () => {
+    const c = { correct: 1 };
+    const rc = { correct: 0 };
+    expect(policyArm(0, c, rc)).toBe(c);
+    expect(policyArm(1, c, rc)).toBe(rc);
+  });
+
+  it('puts G - C seventh in one Holm family over all rows', () => {
+    const grade = (correct) => ({ correct, status: 'graded' });
+    const row = (id, C, Rc, g, block = 'new') => ({ id, block, status: 'complete', arms: { C: grade(C), Rc: grade(Rc), G: policyArm(g, grade(C), grade(Rc)), A8: grade(C) } });
+    const rows = [row('a', 1, 0, 0), row('b', 0, 1, 1), row('c', 1, 1, 0, 'old'), row('d', 0, 1, 0)];
+    const family = secondaryFamily(rows, { isLegacy: (item) => item.block === 'old', isChanged: () => true });
+    expect(family.map((item) => item.name)).toEqual([...SECONDARY]);
+    expect(SECONDARY).toHaveLength(7);
+    const g = family[6];
+    expect(g).toMatchObject({ name: 'G - C', n: 4, wins: 1, losses: 0 });
+    expect(family[0].n).toBe(0);
+    for (const item of family) expect(item.holm).toBeGreaterThanOrEqual(item.n ? item.p : 1);
+  });
+});
+
+describe('redteam probe: review packet', () => {
+  const entry = {
+    id: 'test:x:1', block: 'x', gold: '5', g: 1,
+    stage1: [{ model: 'a/one', answer: '5' }, { model: 'b/two', answer: null }],
+    leaderModel: 'a/one', leaderCut: false, rtModel: 'b/two', rtEnding: 'stop', admitted: true, cleanReason: 'admitted',
+    verdict: 'REFUTED', confidence: 7, c: { correct: 1, extracted: '5', status: 'graded' }, rc: { correct: 0, extracted: '6', status: 'graded' },
+    texts: { question: 'Q?', leader: 'Leader\n```js\ncode\n```', redTeam: 'R\nVERDICT: REFUTED', c: 'ANSWER: 5', rc: 'ANSWER: 6' },
+  };
+  const meta = { measured: 1, planned: 269, complete: false };
+
+  it('is the same every time and keeps texts with fences inside their own fence', () => {
+    const text = renderDiscordant([entry], meta);
+    expect(renderDiscordant([entry], meta)).toBe(text);
+    expect(text).toContain('````text\nLeader\n```js\ncode\n```\n````');
+    expect(text).toContain('- Decisive argument: right / wrong / unclear');
+    expect(text).toContain('b/two not read');
+    expect(text.match(/^## /gm)).toHaveLength(1);
+  });
+
+  it('says so when no question differs', () => {
+    expect(renderDiscordant([], meta)).toContain('No measured question has C and Rc of different correctness.');
   });
 });
 

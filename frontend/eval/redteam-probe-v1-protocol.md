@@ -17,6 +17,19 @@ extra call, whether its result is admitted, its critique and verdict, and the
 change of the council confidence and reasons that follow from it). The probe
 does not split the part of the critique from the part of the confidence.
 
+On the 269 scoring questions, Rc − C = (errors of the fresh C that Rc fixes −
+right answers of C that Rc breaks) / 269. The stored A8 is not part of it.
+
+## Amendment before the first paid call (2026-11-14)
+
+Added after commit `c6ba1c4` and before any paid call of this probe; no probe
+data existed. Reason: published work on LLM critique suggests a one-sided
+critic on every question, with a chairman told to follow REFUTED, can break
+right answers. The amendment adds policy G, a seventh secondary comparison,
+two caveats on the verdict table and a review packet. Nothing else changes:
+the conditions, the calls, the primary pair and the reading rules stay as
+committed in `c6ba1c4`.
+
 ## Why
 
 The red team was measured once, in campaign `main` (free models, 120
@@ -113,6 +126,40 @@ not "unavailable", so such an Rp may need its own call.
 Rp − Rc is the difference of the two policies as a whole (verdict reading,
 cut replies, failures), not of one regular expression.
 
+## Conditional red team, policy G (amendment)
+
+The rule `g` reads only the stored Stage 1, before any red team:
+
+- `g = 0` (the red team is skipped) when all three expected Stage 1 answers
+  exist, `gradeResponse` reads a canonical final answer in each, and the three
+  are equal.
+- `g = 1` (the red team is called) otherwise. A missing, cut or unread answer
+  is not agreement.
+- The answer of G is Rc where `g = 1` and C where `g = 0`. G makes no call of
+  its own.
+
+It reads the raw Stage 1 texts with the same extraction as the stored
+`diagnostics.councilAnswers`; `inspect` requires the two to be equal on every
+test and pilot question. From those stored answers, before this amendment:
+`g = 0` on 233 and `g = 1` on 36 of the 269 scoring questions (12 with
+different answers, 24 with an unread answer); 234 and 37 of all 271.
+
+Limits:
+
+1. The rule uses only what is known before the red team. The verdict is not
+   part of it.
+2. The rule and the list of `g` per question are fixed now; the digest of the
+   list is in the manifest. No threshold is tuned on wins or losses.
+3. The effect is counted on the whole set: G − C on the 269 questions. Where
+   `g = 0`, G equals C. A gain inside the selected group is not shown alone.
+4. The cost of G is an estimate: C where `g = 0`, RT plus the chairman where
+   `g = 1`, from calls that were all made. Its latency is not measured.
+
+The rule misses every question where the council agreed on a wrong answer.
+
+In the report: Rc − C = (G − C) + (Rc − G). G − C is the Rc − C of the
+questions with `g = 1`; Rc − G is the Rc − C of the questions with `g = 0`.
+
 ## Routes and calls
 
 - Hosts: the snapshot `a8-routes-v7` (`stepfun/fp8`, `gmicloud/bf16` for hy4,
@@ -170,15 +217,39 @@ Secondary family, one Holm correction, fixed now:
 4. Rc − C on the 149 new-block questions.
 5. Rc − C on the 120 legacy-block questions.
 6. Rc − C where Rc's request differs from C's.
+7. G − C on the 269 questions (amendment).
+
+Rc − G is shown as numbers, without a test.
 
 Diagnostics, no new calls: RT endings by model and the reasons for falling
 back to C; replies without a verdict, with the template, with duplicates;
-verdict against the leader being right; what the red team fixed and broke by
-verdict; confidence levels; the 12 questions with a cut leader; blocks, with
-LiveMathBench apart; the primary pair under the wider corrections file
+verdict against the leader being right, wrong, and wrong with C right; what
+the red team fixed and broke by verdict, against the fresh C; confidence
+levels; the 12 questions with a cut leader; blocks, with LiveMathBench apart;
+the primary pair under the wider corrections file
 `gold-corrections-a8-open-v5e-all.json`; cost and time of RT and chairman
 calls; the cost of the policy itself (RT plus one chairman per question) apart
 from the cost of the probe.
+
+Two caveats on the verdict table (amendment), printed with it:
+
+- A wrong leader is not a wrong final answer: the chairman without a red team
+  can already correct it, so a sound refutation of such a leader need not
+  improve the final answer.
+- The verdict against the leader being right does not measure whether the
+  critique is sound: a right answer can rest on a wrong argument, and a wrong
+  answer can get a false refutation.
+
+## Review packet (amendment)
+
+The `report` phase also writes `discordant.md`: every measured question where
+C and Rc differ in correctness, in the seeded order. For each: id, block,
+gold, `g`, the three Stage 1 answers, the leader and red-team models, how RT
+ended, the clean verdict and confidence, C's and Rc's extracted answers; then
+the question, the leader text, the stored red-team reply, and C's and Rc's
+answers; and empty fields for the decisive argument (right / wrong / unclear)
+and a comment. A person fills the fields. No model judges these arguments,
+and the code does not either.
 
 ## Freeze
 
@@ -187,8 +258,13 @@ phase, holds: the hash of the probe files and this protocol, of
 `campaignData.js`, the git head, the current a8 method hash and v5e's recorded
 one, the hashes of the v5e test and pilot journals, the bank, selection,
 campaign, both corrections files and the route snapshot, the order seed and
-order digest, the digest of the G0 messages, and the limits. Live phases
-refuse when any of them changed.
+order digest, the digest of the list of `g` in that order, the digest of the
+G0 messages, and the limits. Live phases refuse when any of them changed.
+
+The probe runs from a separate git worktree at its frozen commit, with the
+shared `.runs` and `.cache` folders linked in. Other sessions edit engine
+files in the main checkout; the worktree keeps their uncommitted changes out
+of the measured code.
 
 ## Limits of the probe
 
@@ -203,3 +279,9 @@ refuse when any of them changed.
   money can still depend on how hard the questions are.
 - The engine's verdict reading is only measured here. Changing `council.js`
   would change the a8 method hash and the product.
+- Policy G is computed from calls made for every question, so it measures
+  the accuracy of a conditional red team, not its cost or latency in use.
+- With C right on most questions, the probe has more room to see harm than
+  gain. Other red-team designs (an independent second solution, a chairman
+  who checks the argument instead of following the verdict, several yes/no
+  verifiers, checks by code) are not part of this probe.

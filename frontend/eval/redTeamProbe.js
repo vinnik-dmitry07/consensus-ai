@@ -72,6 +72,7 @@ export function probePaths(root = RUNS_ROOT) {
     inspect: path.join(dir, 'inspect.json'),
     report: path.join(dir, 'report.json'),
     reportMd: path.join(dir, 'report.md'),
+    discordant: path.join(dir, 'discordant.md'),
   };
 }
 
@@ -126,6 +127,28 @@ export function rosterOf(source) {
   };
 }
 
+// Policy G (protocol "Conditional red team, policy G"): the red team is skipped
+// (g = 0) only when every expected Stage 1 answer was read and all are equal.
+// A missing, cut or unread answer is not agreement. It reads the same raw
+// Stage 1 text and the same extraction (gradeResponse) as councilAnswers in
+// a8Variants.js, and nothing that comes after Stage 1.
+export function gateOf(task, stage1, councilModels) {
+  const answers = councilModels.map((model) => {
+    const row = stage1.find((item) => item.model === model);
+    if (!row) return null;
+    const grade = gradeResponse(task, row.response || '');
+    return grade.status === 'graded' && grade.extracted != null ? grade.extracted : null;
+  });
+  const agreed = answers.length > 0 && answers.every((answer) => answer != null) && new Set(answers).size === 1;
+  return { g: agreed ? 0 : 1, answers };
+}
+
+// The answer of policy G for one question: C when the red team is skipped,
+// Rc when it is called.
+export function policyArm(g, c, rc) {
+  return g === 0 ? c : rc;
+}
+
 // Rebuilds, from the stored slots, what runA8 of a8Variants.js built for one
 // question: Stage 1 in canonical order, the tail-forwarded Stage 1, the judges
 // (each judge slot picked by equality with the rebuilt prompt), the rankings.
@@ -170,6 +193,7 @@ export async function rebuildQuestion(source, row) {
   return {
     id: row.id, block: row.block, task, prompt, roster, stage1, forwarded, stage2, ranked, topK,
     leaderIndex, leaderModel: stage1[leaderIndex].model, leaderCut: cutStage1[leaderIndex], stored,
+    gate: gateOf(task, stage1, roster.councilModels),
   };
 }
 
@@ -464,10 +488,19 @@ async function listingOf(id) {
 // Inspect: the rebuild of every question, gate G0, and the money (no POST).
 
 export async function inspectSource(source, preflight) {
-  const out = { phase: source.phase, questions: source.rows.length, g0: { equal: 0, differ: [] }, redTeam: {}, leaderCut: 0, levels: {}, prompts: [] };
+  const out = {
+    phase: source.phase, questions: source.rows.length, g0: { equal: 0, differ: [] }, redTeam: {}, leaderCut: 0, levels: {}, prompts: [],
+    gate: { skip: 0, call: 0, mismatch: [] }, gates: {},
+  };
   const digest = [];
   for (const row of source.rows) {
     const question = await rebuildQuestion(source, row);
+    // Policy G must read the answers the campaign stored for the same texts.
+    const storedAnswers = row.diagnostics?.councilAnswers;
+    if (stableStringify(question.gate.answers) !== stableStringify(storedAnswers)) out.gate.mismatch.push(row.id);
+    out.gates[row.id] = question.gate.g;
+    if (question.gate.g === 0) out.gate.skip += 1;
+    else out.gate.call += 1;
     const c = await chairmanCall(question, null);
     const stored = question.stored;
     const equal = Boolean(stored) && c.model === stored.meta.model && stableStringify(c.messages) === stableStringify(stored.request?.messages);
@@ -520,6 +553,7 @@ export function freezeRecord(test, pilot, inspected) {
     },
     orderSeed: ORDER_SEED,
     orderDigest: sha256(inspected.order.join('\n')),
+    gateDigest: inspected.gateDigest,
     g0: { test: inspected.test.g0Digest, pilot: inspected.pilot.g0Digest },
     limits: LIMITS,
     cap: RT_CAP,
@@ -640,6 +674,7 @@ export async function runLive(kind, { paths = probePaths(), argv = [] } = {}) {
   const prepare = probePrepare(preflight, test.campaign);
   const inspected = await inspectAll(test, pilot, preflight);
   if (inspected.test.g0.differ.length || inspected.pilot.g0.differ.length) throw new Error('Gate G0 failed; see inspect.');
+  if (inspected.test.gate.mismatch.length || inspected.pilot.gate.mismatch.length) throw new Error('Policy G does not read the stored council answers; see inspect.');
   const manifest = freezeProbe(paths, freezeRecord(test, pilot, inspected));
   const source = kind === 'smoke' ? pilot : test;
   const routes = preflight.routes.filter((route) => test.selection.council.includes(route.id));
@@ -725,7 +760,10 @@ export async function inspectAll(test, pilot, preflight) {
   // The smoke set holds a question where hy4 is the red team: it is the slowest host.
   const firstHy4 = pilotOrder.find((id) => modelFamily(rtOf.get(id)) === 'tencent');
   const smokeIds = [firstHy4, ...pilotOrder.filter((id) => id !== firstHy4)].filter(Boolean).slice(0, SMOKE_SIZE);
-  return { test: inspectedTest, pilot: inspectedPilot, ids, order, smokeIds };
+  // Policy G is fixed per question before the first paid call.
+  const gateDigest = sha256(order.map((id) => `${id}\t${inspectedTest.gates[id]}`).join('\n'));
+  const gateScoring = { skip: order.filter((id) => inspectedTest.gates[id] === 0).length, call: order.filter((id) => inspectedTest.gates[id] === 1).length };
+  return { test: inspectedTest, pilot: inspectedPilot, ids, order, smokeIds, gateDigest, gateScoring };
 }
 
 // Report (no POST).
@@ -746,6 +784,28 @@ function tally(list, keyOf) {
     const key = keyOf(item);
     out[key] = (out[key] || 0) + 1;
   }
+  return out;
+}
+
+// The secondary family, fixed before the data, with one Holm correction.
+// "G - C" was added on 2026-11-14, before the first paid call.
+export const SECONDARY = Object.freeze([
+  'Rp - C', 'Rp - Rc', 'C - stored A8', 'Rc - C, new blocks', 'Rc - C, legacy blocks', 'Rc - C, changed requests', 'G - C',
+]);
+
+export function secondaryFamily(scored, { isLegacy, isChanged }) {
+  const lists = [
+    [scored, 'Rp', 'C'],
+    [scored, 'Rp', 'Rc'],
+    [scored, 'C', 'A8'],
+    [scored.filter((row) => !isLegacy(row)), 'Rc', 'C'],
+    [scored.filter(isLegacy), 'Rc', 'C'],
+    [scored.filter(isChanged), 'Rc', 'C'],
+    [scored, 'G', 'C'],
+  ];
+  const out = lists.map(([list, left, right], index) => ({ name: SECONDARY[index], ...comparePair(list, left, right) }));
+  const adjusted = holm(out.map((item) => (item.n ? item.p : 1)));
+  out.forEach((item, index) => { item.holm = adjusted[index]; });
   return out;
 }
 
@@ -771,6 +831,7 @@ export async function buildReport(paths = probePaths()) {
     if (primaryState(plan) === 'measured') {
       arms.C = gradeOf(task, goldOf, plan.c.slot);
       arms.Rc = plan.rc.alias ? arms.C : gradeOf(task, goldOf, plan.rc.slot);
+      arms.G = policyArm(plan.question.gate.g, arms.C, arms.Rc);
     }
     if (plan.rp && productState(plan) === 'measured') arms.Rp = plan.rp.alias === 'C' ? arms.C : plan.rp.alias === 'Rc' ? arms.Rc : gradeOf(task, goldOf, plan.rp.slot);
     const a8 = stored.get(id)?.arms?.A8;
@@ -781,17 +842,28 @@ export async function buildReport(paths = probePaths()) {
   const primary = comparePair(scored, 'Rc', 'C');
   const constructionTies = prefix.filter((id) => plans.get(id).rc.alias).length;
   const legacy = new Set(LEGACY_BLOCKS);
-  const changed = (row) => !plans.get(row.id).rc.alias;
-  const secondary = [
-    ['Rp - C', scored, 'Rp', 'C'],
-    ['Rp - Rc', scored, 'Rp', 'Rc'],
-    ['C - stored A8', scored, 'C', 'A8'],
-    ['Rc - C, new blocks', scored.filter((row) => !legacy.has(row.block)), 'Rc', 'C'],
-    ['Rc - C, legacy blocks', scored.filter((row) => legacy.has(row.block)), 'Rc', 'C'],
-    ['Rc - C, changed requests', scored.filter(changed), 'Rc', 'C'],
-  ].map(([name, list, left, right]) => ({ name, ...comparePair(list, left, right) }));
-  const adjusted = holm(secondary.map((item) => (item.n ? item.p : 1)));
-  secondary.forEach((item, index) => { item.holm = adjusted[index]; });
+  const secondary = secondaryFamily(scored, { isLegacy: (row) => legacy.has(row.block), isChanged: (row) => !plans.get(row.id).rc.alias });
+
+  // Policy G: numbers apart from the family, and its estimated cost.
+  const gateOfId = (id) => plans.get(id).question.gate.g;
+  const pairNumbers = (pair) => ({ n: pair.n, wins: pair.wins, losses: pair.losses, delta: pair.delta });
+  const policyG = {
+    call: prefix.filter((id) => gateOfId(id) === 1).length,
+    skip: prefix.filter((id) => gateOfId(id) === 0).length,
+    accuracy: rateOf(scored, 'G'),
+    rcMinusG: pairNumbers(comparePair(scored, 'Rc', 'G')),
+    calledLayer: pairNumbers(comparePair(scored.filter((row) => gateOfId(row.id) === 1), 'Rc', 'C')),
+    skippedLayer: pairNumbers(comparePair(scored.filter((row) => gateOfId(row.id) === 0), 'Rc', 'C')),
+    cost: prefix.reduce((sum, id) => {
+      const plan = plans.get(id);
+      const always = costOf(plan.rt.slot) + costOf(plan.rc.alias ? plan.c.slot : plan.rc.slot);
+      return {
+        cOnly: sum.cOnly + costOf(plan.c.slot),
+        always: sum.always + always,
+        g: sum.g + (gateOfId(id) === 1 ? always : costOf(plan.c.slot)),
+      };
+    }, { cOnly: 0, always: 0, g: 0 }),
+  };
 
   // Diagnostics.
   const all = order.map((id) => plans.get(id));
@@ -810,9 +882,13 @@ export async function buildReport(paths = probePaths()) {
   const byVerdict = {};
   for (const row of scored) {
     const key = verdictOf(plans.get(row.id));
-    const entry = byVerdict[key] ||= { n: 0, leaderRight: 0, cRight: 0, rcRight: 0, fixed: 0, broke: 0 };
+    const entry = byVerdict[key] ||= { n: 0, leaderRight: 0, leaderWrong: 0, leaderWrongCRight: 0, cRight: 0, rcRight: 0, fixed: 0, broke: 0 };
     entry.n += 1;
     if (leaderRight(row.id)) entry.leaderRight += 1;
+    else {
+      entry.leaderWrong += 1;
+      if (row.arms.C.correct === 1) entry.leaderWrongCRight += 1;
+    }
     if (row.arms.C.correct === 1) entry.cRight += 1;
     if (row.arms.Rc.correct === 1) entry.rcRight += 1;
     if (row.arms.C.correct !== 1 && row.arms.Rc.correct === 1) entry.fixed += 1;
@@ -854,6 +930,25 @@ export async function buildReport(paths = probePaths()) {
   budget.applyJournal(readJsonl(paths.budget));
   const states = tally(order, (id) => primaryState(plans.get(id)));
   const productCoverage = tally(prefix, (id) => productState(plans.get(id)));
+  // The review packet: every measured question where C and Rc differ in
+  // correctness, in the seeded order, with the texts a reader needs.
+  const packet = scored.filter((row) => (row.arms.C.correct === 1) !== (row.arms.Rc.correct === 1)).map((row) => {
+    const plan = plans.get(row.id);
+    const { question } = plan;
+    const textOf = (slot) => slotResult(slot)?.content ?? '';
+    return {
+      id: row.id, block: row.block, gold: gold.goldOf(row.id), g: question.gate.g,
+      stage1: question.roster.councilModels.map((model, index) => ({ model, answer: question.gate.answers[index] })),
+      leaderModel: question.leaderModel, leaderCut: question.leaderCut, rtModel: plan.rt.call.model, rtEnding: plan.rt.outcome.reason,
+      admitted: Boolean(plan.clean?.object), cleanReason: plan.clean?.reason ?? null,
+      verdict: plan.clean?.object?.verdict ?? null, confidence: plan.clean?.object?.confidence ?? null,
+      c: row.arms.C, rc: row.arms.Rc,
+      texts: {
+        question: question.prompt, leader: question.forwarded[question.leaderIndex].response || '',
+        redTeam: textOf(plan.rt.slot), c: textOf(plan.c.slot), rc: textOf(plan.rc.slot),
+      },
+    };
+  });
   return {
     meta: {
       run: PROBE_RUN, source: SOURCE_RUN, routes: ROUTES_FROM, planned: order.length, measured: prefix.length, complete,
@@ -862,6 +957,8 @@ export async function buildReport(paths = probePaths()) {
     },
     primary: { ...primary, constructionTies, observedTies: primary.ties - constructionTies, changedRequests: prefix.length - constructionTies, accuracy: { C: rateOf(scored, 'C'), Rc: rateOf(scored, 'Rc') }, reading: interpretPair(primary, order.length, complete, 'Rc', 'C') },
     secondary,
+    policyG,
+    packet,
     diagnostics: {
       rtEndings, readings: { replies: readings.length, templates: sum('templates'), duplicates: sum('duplicates'), invalidConfidence: sum('invalidConfidence'), otherVerdictLike: sum('otherVerdictLike'), noVerdict: ended.filter((plan) => plan.clean?.object && !plan.clean.object.verdict).length },
       productVerdicts: tally(ended, productVerdict), cleanVerdicts: tally(ended, verdictOf),
@@ -879,7 +976,8 @@ function rateOf(rows, arm) {
 }
 
 export function renderReport(report) {
-  const { meta, primary, secondary, diagnostics } = report;
+  const { meta, primary, secondary, policyG, diagnostics } = report;
+  const layer = (item) => `n ${item.n}, Rc - C ${pp(item.delta)}, wins / losses ${item.wins} / ${item.losses}`;
   const lines = [
     '# redteam-probe-v1: the red team after a stored Stage 2',
     '',
@@ -902,6 +1000,15 @@ export function renderReport(report) {
     '',
     `Rp coverage on the measured questions: ${Object.entries(meta.productCoverage).map(([key, value]) => `${key} ${value}`).join(', ') || 'none'}.`,
     '',
+    '## Policy G: the red team only when the Stage 1 answers are not all read and equal',
+    '',
+    'Fixed before the first paid call from the stored Stage 1 alone. G takes Rc where g = 1 and C where g = 0, from the same calls; G - C is in the family above.',
+    '',
+    `On the measured questions: g = 1 on ${policyG.call}, g = 0 on ${policyG.skip}. Accuracy of G: ${pct(policyG.accuracy)}.`,
+    `Rc - G (numbers only, no test): ${layer(policyG.rcMinusG)}.`,
+    `Rc - C where g = 1 (equal to G - C): ${layer(policyG.calledLayer)}. Rc - C where g = 0 (equal to Rc - G): ${layer(policyG.skippedLayer)}.`,
+    `Estimated cost on the measured questions: C alone ${usd4(policyG.cost.cOnly)}; G ${usd4(policyG.cost.g)} with ${policyG.call} RT calls; red team always ${usd4(policyG.cost.always)}. The cost of G is computed from calls that were all made; its latency is not measured. G passes by every question where the council agreed on a wrong answer.`,
+    '',
     '## Diagnostics (no new calls)',
     '',
     'How the RT calls ended, by model:',
@@ -912,9 +1019,11 @@ export function renderReport(report) {
     `Clean object: ${Object.entries(diagnostics.cleanVerdicts).map(([key, value]) => `${key} ${value}`).join(', ')}.`,
     `Product object: ${Object.entries(diagnostics.productVerdicts).map(([key, value]) => `${key} ${value}`).join(', ')}. Product and clean verdict differ: ${diagnostics.firstLastDiffer}.`,
     '',
-    '| Clean red team | Questions | Leader right | C right | Rc right | Fixed | Broke |',
-    '| --- | --- | --- | --- | --- | --- | --- |',
-    ...Object.entries(diagnostics.byVerdict).sort().map(([key, entry]) => `| ${key} | ${entry.n} | ${entry.leaderRight} | ${entry.cRight} | ${entry.rcRight} | ${entry.fixed} | ${entry.broke} |`),
+    '| Clean red team | Questions | Leader right | Leader wrong | Leader wrong, C right | C right | Rc right | Fixed | Broke |',
+    '| --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+    ...Object.entries(diagnostics.byVerdict).sort().map(([key, entry]) => `| ${key} | ${entry.n} | ${entry.leaderRight} | ${entry.leaderWrong} | ${entry.leaderWrongCRight} | ${entry.cRight} | ${entry.rcRight} | ${entry.fixed} | ${entry.broke} |`),
+    '',
+    'Fixed and Broke are counted against the fresh C. A wrong leader is not a wrong final answer: the chairman without a red team can already correct it. The verdict against the leader being right does not measure whether the critique is sound: a right answer can rest on a wrong argument, and a wrong one can get a false refutation.',
     '',
     `Council confidence on the measured questions: C ${Object.entries(diagnostics.levels.C).map(([key, value]) => `${key} ${value}`).join(', ')}; Rc ${Object.entries(diagnostics.levels.Rc).map(([key, value]) => `${key} ${value}`).join(', ')}.`,
     '',
@@ -937,11 +1046,73 @@ export function renderReport(report) {
   return lines.join('\n');
 }
 
+// A text in a fence longer than any backtick run inside it.
+function fenced(text) {
+  const value = String(text ?? '');
+  const longest = Math.max(0, ...[...value.matchAll(/`+/g)].map((match) => match[0].length));
+  const fence = '`'.repeat(Math.max(3, longest + 1));
+  return [`${fence}text`, value, fence].join('\n');
+}
+
+const gradeLabel = (grade) => `${grade?.correct === 1 ? 'right' : 'wrong'} (answer ${grade?.extracted ?? 'not read'}, ${grade?.status ?? 'n/a'})`;
+
+// The review packet for a person (protocol "Review packet"). The code fills
+// the facts and texts; the review fields stay empty.
+export function renderDiscordant(packet, meta) {
+  const lines = [
+    '# redteam-probe-v1: questions where C and Rc differ in correctness',
+    '',
+    `Built by \`redTeamProbe.js\` from ${meta.measured} of ${meta.planned} measured questions (${meta.complete ? 'complete' : 'interim'}), in the seeded order. ${packet.length} question(s).`,
+    'For each one, check the decisive argument of the red-team reply and of the answer that changed. The review fields are for the reader; the code does not judge arguments.',
+    '',
+  ];
+  if (!packet.length) lines.push('No measured question has C and Rc of different correctness.', '');
+  packet.forEach((entry, index) => {
+    lines.push(
+      `## ${index + 1}. ${entry.id}`,
+      '',
+      `- Block: ${entry.block}; gold: \`${entry.gold}\`; policy G: g = ${entry.g}.`,
+      `- Stage 1 answers: ${entry.stage1.map((item) => `${item.model} ${item.answer ?? 'not read'}`).join('; ')}.`,
+      `- Leader: ${entry.leaderModel}${entry.leaderCut ? ' (cut in its reasoning, forwarded by the tail rule)' : ''}. Red team: ${entry.rtModel}, ended ${entry.rtEnding}.`,
+      `- Clean red team: ${entry.admitted ? `verdict ${entry.verdict ?? 'none'}, confidence ${entry.confidence ?? 'none'}` : `unavailable (${entry.cleanReason})`}.`,
+      `- C: ${gradeLabel(entry.c)}. Rc: ${gradeLabel(entry.rc)}.`,
+      '',
+      '### Question as the models saw it',
+      '',
+      fenced(entry.texts.question),
+      '',
+      '### Leader answer as the red team and the chairman saw it',
+      '',
+      fenced(entry.texts.leader),
+      '',
+      '### Red-team reply as stored (Rc got the cleaned critique)',
+      '',
+      fenced(entry.texts.redTeam),
+      '',
+      '### C answer',
+      '',
+      fenced(entry.texts.c),
+      '',
+      '### Rc answer',
+      '',
+      fenced(entry.texts.rc),
+      '',
+      '### Review',
+      '',
+      '- Decisive argument: right / wrong / unclear',
+      '- Comment:',
+      '',
+    );
+  });
+  return lines.join('\n');
+}
+
 export async function runReport(paths = probePaths()) {
-  const report = await buildReport(paths);
+  const { packet, ...report } = await buildReport(paths);
   writeJson(paths.report, report);
   writeFileSync(paths.reportMd, `${renderReport(report)}\n`, 'utf8');
-  console.log(`report written: ${paths.reportMd}`);
+  writeFileSync(paths.discordant, renderDiscordant(packet, report.meta), 'utf8');
+  console.log(`report written: ${paths.reportMd}; review packet: ${packet.length} question(s) in ${paths.discordant}`);
   console.log(`primary: ${report.meta.measured} of ${report.meta.planned} measured; Rc - C ${pp(report.primary.delta)}, ${report.primary.wins} / ${report.primary.losses}`);
   return 0;
 }
@@ -955,12 +1126,17 @@ export async function runInspect(paths = probePaths()) {
   const storedA8 = applyGoldOverrides(test.rows.filter((row) => ids.includes(row.id)), Object.fromEntries(gold.gold)).rows
     .filter((row) => row.arms?.A8?.correct === 1).length;
   const record = {
-    test: { ...inspected.test, prompts: undefined }, pilot: { ...inspected.pilot, prompts: undefined },
-    scoring: { ids: ids.length, excluded: [...gold.excluded], storedA8Right: storedA8, legacy: test.rows.filter((row) => ids.includes(row.id) && LEGACY_BLOCKS.includes(row.block)).length },
-    smokeIds: inspected.smokeIds, orderDigest: sha256(inspected.order.join('\n')),
+    test: { ...inspected.test, prompts: undefined, gates: undefined }, pilot: { ...inspected.pilot, prompts: undefined, gates: undefined },
+    scoring: {
+      ids: ids.length, excluded: [...gold.excluded], storedA8Right: storedA8, legacy: test.rows.filter((row) => ids.includes(row.id) && LEGACY_BLOCKS.includes(row.block)).length,
+      gate: inspected.gateScoring,
+    },
+    smokeIds: inspected.smokeIds, orderDigest: sha256(inspected.order.join('\n')), gateDigest: inspected.gateDigest,
     worstUsd: inspected.test.worstUsd,
   };
   writeJson(paths.inspect, record);
   console.log(JSON.stringify(record, null, 2));
-  return inspected.test.g0.differ.length || inspected.pilot.g0.differ.length ? 3 : 0;
+  const failed = inspected.test.g0.differ.length || inspected.pilot.g0.differ.length
+    || inspected.test.gate.mismatch.length || inspected.pilot.gate.mismatch.length;
+  return failed ? 3 : 0;
 }
